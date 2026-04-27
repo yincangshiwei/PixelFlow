@@ -4,6 +4,35 @@
 
 ---
 
+## 界面截图
+
+### 主界面
+
+![主页面.png](resources/screenshots/%E4%B8%BB%E9%A1%B5%E9%9D%A2.png)
+
+### 图像处理 — 透明图处理
+
+![透明图处理.png](resources/screenshots/%E9%80%8F%E6%98%8E%E5%9B%BE%E5%A4%84%E7%90%86.png)
+
+### 图像处理 — 基础处理
+
+![基础处理.png](resources/screenshots/%E5%9F%BA%E7%A1%80%E5%A4%84%E7%90%86.png)
+
+### 图像处理 — 图片排版导出
+
+![图像排版导出.png](resources/screenshots/%E5%9B%BE%E5%83%8F%E6%8E%92%E7%89%88%E5%AF%BC%E5%87%BA.png)
+
+### 图像处理 — 图片叠加
+
+![图片叠加.png](resources/screenshots/%E5%9B%BE%E7%89%87%E5%8F%A0%E5%8A%A0.png)
+
+### 后台日志
+
+![后台日志.png](resources/screenshots/%E5%90%8E%E5%8F%B0%E6%97%A5%E5%BF%97.png)
+
+---
+
+
 ## 界面设计
 
 采用 **毛玻璃（Frosted Glass）深色主题**，左右双栏布局，整体风格追求科技感与通透质感，适配未来 AI 功能扩展。
@@ -282,7 +311,8 @@ PixelFlow/
 │   ├── app.ico
 │   ├── check_on.svg / check_off.svg
 │   ├── radio_on.svg / radio_off.svg
-│   └── CHANGELOG.md                    # 版本日志（Markdown，供「版本日志」Tab 渲染展示）
+│   ├── CHANGELOG.md                    # 版本日志（Markdown，供「版本日志」Tab 渲染展示）
+│   └── screenshots/                    # 界面截图（用于 README 展示）
 ├── presets/                            # 预设文件目录（运行时自动生成）
 │   ├── transparent_image/
 │   ├── basic_process/

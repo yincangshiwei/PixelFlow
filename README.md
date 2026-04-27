@@ -14,6 +14,14 @@
 
 ![透明图处理.png](resources/screenshots/%E9%80%8F%E6%98%8E%E5%9B%BE%E5%A4%84%E7%90%86.png)
 
+#### 裁剪透明边缘
+
+![透明图裁剪透明边缘.png](resources/screenshots/%E9%80%8F%E6%98%8E%E5%9B%BE%E8%A3%81%E5%89%AA%E9%80%8F%E6%98%8E%E8%BE%B9%E7%BC%98.png)
+
+#### 裁剪加白底生成
+
+![裁剪+白底生成.png](resources/screenshots/%E8%A3%81%E5%89%AA%2B%E7%99%BD%E5%BA%95%E7%94%9F%E6%88%90.png)
+
 ### 图像处理 — 基础处理
 
 ![基础处理.png](resources/screenshots/%E5%9F%BA%E7%A1%80%E5%A4%84%E7%90%86.png)

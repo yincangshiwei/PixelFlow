@@ -1,0 +1,11 @@
+{
+  "enable_compress": false,
+  "quality": 85,
+  "enable_format": true,
+  "output_format": "png",
+  "enable_rename": false,
+  "prefix_mode": "custom",
+  "prefix": "",
+  "start_index": 1,
+  "digits": 3
+}

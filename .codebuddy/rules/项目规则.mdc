@@ -1,0 +1,29 @@
+---
+description: 
+alwaysApply: true
+enabled: true
+updatedAt: 2026-04-27T09:06:53.766Z
+provider: 
+---
+
+# 项目开发规则
+
+## CHANGELOG 维护规则
+
+- 每次对功能进行**新增、修复、调整**后，必须同步更新 `resources/CHANGELOG.md`
+- 在文件中找到**当天日期**对应的区块追加内容；若当天日期区块不存在，则在文件顶部（`# PixelFlow 版本日志` 标题下方）新建一个，格式如下：
+  ```markdown
+  ## YYYY-MM-DD
+
+  ### 模块名 — 改动简述
+
+  - 具体改动描述
+  ```
+- 描述要简洁准确，体现**改动的功能点和效果**，不涉及实现细节
+- **规则文件、配置文件、样式调整等非功能性改动不需要记录**
+
+## 文件浏览对话框默认路径规则
+
+- 所有调用 `QFileDialog`（`getOpenFileName`、`getOpenFileNames`、`getExistingDirectory`、`getSaveFileName`）的地方，**默认目录参数必须设置为当前用户的桌面路径**
+- 统一使用 `str(Path.home() / "Desktop")` 或已定义的 `_get_desktop_path()` 函数获取桌面路径，**禁止传入空字符串 `""` 或省略该参数**
+- 例外：加载预设文件的对话框默认目录应为对应功能的预设目录（`mgr.preset_dir`），不适用本规则

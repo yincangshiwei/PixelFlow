@@ -1,0 +1,9 @@
+{
+  "direction": "docx2pdf",
+  "page_size": "A4",
+  "enable_rename": false,
+  "prefix_mode": "custom",
+  "prefix": "",
+  "start_index": 1,
+  "digits": 3
+}

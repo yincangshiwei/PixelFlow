@@ -1,0 +1,13 @@
+{
+  "enable_trim": true,
+  "alpha_threshold": 0,
+  "enable_resize": false,
+  "resize_w": 800,
+  "resize_h": 800,
+  "resize_mode": "contain",
+  "enable_canvas": false,
+  "canvas_w": 1500,
+  "canvas_h": 1500,
+  "canvas_color": "#FFFFFF",
+  "output_format": "png"
+}

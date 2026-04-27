@@ -1,0 +1,11 @@
+{
+  "format": "PPTX",
+  "width_cm": 33,
+  "height_cm": 19,
+  "count_per_page": 1,
+  "keep_ratio": true,
+  "sort_mode": "default",
+  "excel_path": "",
+  "col_name": "A",
+  "col_val": "B"
+}

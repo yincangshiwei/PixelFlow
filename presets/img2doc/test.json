@@ -1,0 +1,29 @@
+{
+  "format": "PPTX",
+  "width_cm": 33,
+  "height_cm": 19,
+  "count_per_page": 2,
+  "max_cols": 4,
+  "keep_ratio": true,
+  "sort_mode": "default",
+  "excel_path": "",
+  "col_name": "A",
+  "col_val": "B",
+  "start_row": 2,
+  "compress_enabled": true,
+  "compress_target_kb": 100,
+  "compress_format": "JPEG",
+  "overlay_layers": [
+    {
+      "type": "image",
+      "name": "货号",
+      "placement": "overlay",
+      "path": "//10.0.10.2/数字中心（对外）/自研工具集/素材/logoRed.png",
+      "x_cm": 26.0,
+      "y_cm": 0.5,
+      "w_cm": 5.0,
+      "h_cm": 3.0
+    }
+  ],
+  "custom_fonts": {}
+}

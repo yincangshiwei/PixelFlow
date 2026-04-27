@@ -1,0 +1,60 @@
+; PixelFlow Inno Setup 安装脚本（由 build.py 自动生成，请勿手动编辑）
+; 模板文件为 installer.iss.template
+
+#define MyAppName "{APP_NAME}"
+#define MyAppVersion "{APP_VERSION}"
+#define MyAppPublisher "{APP_PUBLISHER}"
+#define MyAppExeName "{APP_NAME}.exe"
+#define MyAppDescription "{APP_DESCRIPTION}"
+
+[Setup]
+AppId={{A3F2B8C1-5D4E-4F6A-9B7C-1E2D3F4A5B6C}
+AppName={#MyAppName}
+AppVersion={#MyAppVersion}
+AppVerName={#MyAppName} {#MyAppVersion}
+AppPublisher={#MyAppPublisher}
+AppPublisherURL=https://github.com/pixelflow
+DefaultDirName={autopf}\{#MyAppName}
+DefaultGroupName={#MyAppName}
+AllowNoIcons=yes
+; 安装包输出目录和文件名
+OutputDir=dist\installer
+OutputBaseFilename={#MyAppName}_Setup_{#MyAppVersion}
+; 压缩设置
+Compression=lzma2/ultra64
+SolidCompression=yes
+; UI 设置
+WizardStyle=modern
+SetupIconFile=resources\app.ico
+UninstallDisplayIcon={app}\{#MyAppExeName}
+; 权限（不强制管理员权限，允许当前用户安装）
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
+; 最低 Windows 版本
+MinVersion=10.0
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+; 如需中文安装界面，从 https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/ChineseSimplified.isl
+; 下载 ChineseSimplified.isl 放到 Inno Setup 安装目录的 Languages 文件夹下，然后取消下行注释：
+Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+[Files]
+; 从 PyInstaller 输出目录复制所有文件
+Source: "dist\{APP_NAME}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 单独复制图标文件到安装根目录，供快捷方式使用
+Source: "resources\app.ico"; DestDir: "{app}"; Flags: ignoreversion
+
+[Icons]
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"; IconIndex: 0; Comment: "{#MyAppDescription}"
+Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app.ico"; IconIndex: 0; Tasks: desktopicon; Comment: "{#MyAppDescription}"
+
+[Run]
+Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}\presets"

@@ -15,6 +15,7 @@ presets/
 # ── IDE / 工具 ──
 .codebuddy/*
 !.codebuddy/rules/
+.qwen/
 .idea/
 .vscode/
 *.sublime-project

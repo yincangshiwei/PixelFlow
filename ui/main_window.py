@@ -32,6 +32,7 @@ import core.processors.img2doc_processor      # noqa: F401
 import core.processors.overlay_processor      # noqa: F401
 from core.worker import ProcessWorker
 from core.file_worker import FileProcessWorker
+from core.log_manager import AppLogManager
 
 # 图片格式
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif', '.gif'}
@@ -152,6 +153,7 @@ class MainWindow(QMainWindow):
         self._current_file_processor: BaseFileProcessor | None = None
         # 预设管理器（两套体系共用 PresetManager，按 preset_id 区分）
         self._preset_managers: dict[str, PresetManager] = {}
+        self._log_manager = AppLogManager()
 
         self._init_processors()
         self._build_ui()
@@ -445,7 +447,7 @@ class MainWindow(QMainWindow):
         self.btn_tab_process.clicked.connect(lambda: self._switch_tab(0))
         self.btn_tab_log.clicked.connect(lambda: self._switch_tab(1))
         self.btn_tab_changelog.clicked.connect(lambda: self._switch_tab(2))
-        self.btn_clear_log.clicked.connect(lambda: self.log_text.clear())
+        self.btn_clear_log.clicked.connect(self._clear_current_log)
 
         # 初始状态
         if self._processors:
@@ -753,11 +755,13 @@ class MainWindow(QMainWindow):
             self._current_file_processor = None
             self.panel_stack.setCurrentIndex(idx)
             self.lbl_proc_desc.setText(self._current_processor.description)
+            self._log_manager.switch_feature(self._current_processor.preset_id, clear_current=True)
         else:
             self._current_processor = None
             self._current_file_processor = self._file_processors[idx]
             self.panel_stack.setCurrentIndex(len(self._processors) + idx)
             self.lbl_proc_desc.setText(self._current_file_processor.description)
+            self._log_manager.switch_feature(self._current_file_processor.preset_id, clear_current=True)
         # 重置滚动条到顶部
         self._scroll_to_top()
         self._refresh_preset_list()
@@ -973,6 +977,9 @@ class MainWindow(QMainWindow):
         file_list = [self.file_list.item(i).data(Qt.UserRole) for i in range(count)]
         output_dir, is_overwrite = self._resolve_output_dir(file_list[0])
 
+        proc_for_log = self._current_processor or self._current_file_processor
+        if proc_for_log is not None:
+            self._log_manager.switch_feature(proc_for_log.preset_id, clear_current=True)
         self.log_text.clear()
         self._switch_tab(1)
         mode_names = ["桌面路径", "自定义路径", "原图路径(覆盖)", "原图路径(副本)"]
@@ -998,6 +1005,7 @@ class MainWindow(QMainWindow):
             self.worker.progress.connect(self._on_progress)
             self.worker.image_done.connect(self._on_image_done)
             self.worker.all_done.connect(self._on_all_done)
+            self.worker.debug.connect(self._on_worker_debug)
             self.worker.start()
         else:
             # ── 文件处理 Worker ──
@@ -1014,6 +1022,7 @@ class MainWindow(QMainWindow):
             self.worker.progress.connect(self._on_progress)
             self.worker.file_done.connect(self._on_file_done)
             self.worker.all_done.connect(self._on_all_done)
+            self.worker.debug.connect(self._on_worker_debug)
             self.worker.start()
 
     def _cancel_process(self):
@@ -1054,7 +1063,10 @@ class MainWindow(QMainWindow):
                 parts.append(f"格式→{d['output_format'].upper()}")
             self._log("  ".join(parts))
         else:
-            self._log(f"✗ {name}  错误: {result.error}")
+            error = str(result.error)
+            self._log(f"✗ {name}  错误: {error.splitlines()[0] if error else ''}")
+            if "\n" in error:
+                self._on_worker_debug(f"{name} 完整错误信息:\n{error}")
 
     def _on_file_done(self, result):
         name = Path(result.input_path).name
@@ -1071,7 +1083,16 @@ class MainWindow(QMainWindow):
                 parts.append(f"字符数: {d['chars']}")
             self._log("  ".join(parts))
         else:
-            self._log(f"✗ {name}  错误: {result.error}")
+            error = str(result.error)
+            self._log(f"✗ {name}  错误: {error.splitlines()[0] if error else ''}")
+            if "\n" in error:
+                self._on_worker_debug(f"{name} 完整错误信息:\n{error}")
+
+    def _on_worker_debug(self, text: str):
+        try:
+            self._log_manager.write(text)
+        except Exception:
+            pass
 
     def _on_all_done(self, results):
         success = sum(1 for r in results if r.success)
@@ -1088,6 +1109,17 @@ class MainWindow(QMainWindow):
 
     def _log(self, text: str):
         self.log_text.append(text)
+        try:
+            self._log_manager.write(text)
+        except Exception:
+            pass
+
+    def _clear_current_log(self):
+        self.log_text.clear()
+        try:
+            self._log_manager.clear_current()
+        except Exception:
+            pass
 
     # ─── 预设管理 ───
 

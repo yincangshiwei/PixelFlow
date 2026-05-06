@@ -13,6 +13,7 @@ import io
 import math
 import copy
 import json
+import traceback
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
@@ -235,6 +236,18 @@ class Img2DocProcessor(BaseProcessor):
         self.chk_keep_ratio = QCheckBox("保持图片比例 (不拉伸)")
         self.chk_keep_ratio.setChecked(True)
         l_row2.addWidget(self.chk_keep_ratio)
+        l_row2.addWidget(QLabel("行内排列方向:"))
+        self.combo_row_align = QComboBox()
+        self.combo_row_align.addItem("从左到右", "left")
+        self.combo_row_align.addItem("居中对齐", "center")
+        self.combo_row_align.addItem("从右到左", "right")
+        self.combo_row_align.setToolTip(
+            "从左到右：图片紧靠左侧排列\n"
+            "居中对齐：图片在行内水平居中\n"
+            "从右到左：图片紧靠右侧，顺序仍从左到右"
+        )
+        self.combo_row_align.setStyleSheet(config.COMBOBOX_STYLE)
+        l_row2.addWidget(self.combo_row_align)
         l_row2.addStretch()
         l_lay.addLayout(l_row2)
 
@@ -1000,6 +1013,7 @@ class Img2DocProcessor(BaseProcessor):
             "count_per_page": self.spin_count.value(),
             "max_cols": self.spin_max_cols.value(),
             "keep_ratio": self.chk_keep_ratio.isChecked(),
+            "row_align": self.combo_row_align.currentData(),
             "sort_mode": self.combo_sort.currentData(),
             "excel_path": self.txt_excel.text(),
             "col_name": self.txt_col_name.text().upper(),
@@ -1022,6 +1036,7 @@ class Img2DocProcessor(BaseProcessor):
             "count_per_page": 1,
             "max_cols": 4,
             "keep_ratio": True,
+            "row_align": "left",
             "sort_mode": "default",
             "excel_path": "",
             "col_name": "A",
@@ -1045,6 +1060,9 @@ class Img2DocProcessor(BaseProcessor):
         self.spin_count.setValue(options.get("count_per_page", 1))
         self.spin_max_cols.setValue(options.get("max_cols", 4))
         self.chk_keep_ratio.setChecked(options.get("keep_ratio", True))
+        align_idx = self.combo_row_align.findData(options.get("row_align", "left"))
+        if align_idx >= 0:
+            self.combo_row_align.setCurrentIndex(align_idx)
 
         mode = options.get("sort_mode", "default")
         midx = self.combo_sort.findData(mode)
@@ -1133,19 +1151,22 @@ class Img2DocProcessor(BaseProcessor):
                 raise ValueError(f"Excel 文件不存在: {excel_path}")
 
             openpyxl = _import_openpyxl()
-            wb = openpyxl.load_workbook(excel_path, data_only=True)
-            ws = wb.active
+            wb = openpyxl.load_workbook(excel_path, data_only=True, read_only=True)
+            try:
+                ws = wb.active
 
-            c_name = _col2idx(options.get("col_name", "A"))
-            c_val = _col2idx(options.get("col_val", "B"))
-            start_row = options.get("start_row", 2)
+                c_name = _col2idx(options.get("col_name", "A"))
+                c_val = _col2idx(options.get("col_val", "B"))
+                start_row = options.get("start_row", 2)
 
-            mapping = {}
-            for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
-                if row_idx < start_row:
-                    continue
-                if row[c_name] is not None:
-                    mapping[str(row[c_name]).strip()] = row[c_val]
+                mapping = {}
+                for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                    if row_idx < start_row:
+                        continue
+                    if row[c_name] is not None:
+                        mapping[str(row[c_name]).strip()] = row[c_val]
+            finally:
+                wb.close()
 
             def get_sort_val(fpath):
                 name = Path(fpath).stem
@@ -1170,26 +1191,29 @@ class Img2DocProcessor(BaseProcessor):
 
             if excel_file and os.path.exists(excel_file):
                 openpyxl = _import_openpyxl()
-                wb2 = openpyxl.load_workbook(excel_file, data_only=True)
-                ws2 = wb2.active
+                wb2 = openpyxl.load_workbook(excel_file, data_only=True, read_only=True)
+                try:
+                    ws2 = wb2.active
 
-                match_col = layer.get("match_column", 1)
-                data_col = layer.get("data_column", 2)
-                start_row2 = layer.get("excel_row_start", 2)
+                    match_col = layer.get("match_column", 1)
+                    data_col = layer.get("data_column", 2)
+                    start_row2 = layer.get("excel_row_start", 2)
 
-                # 构建文件名到数据列的映射
-                data_map = {}
-                for row_idx, row in enumerate(ws2.iter_rows(values_only=True), start=1):
-                    if row_idx < start_row2:
-                        continue
-                    match_val = row[match_col - 1] if match_col - 1 < len(row) else None
-                    data_val = row[data_col - 1] if data_col - 1 < len(row) else None
-                    if match_val is not None:
-                        match_str = str(match_val).strip()
-                        # 去除扩展名
-                        if '.' in match_str:
-                            match_str = Path(match_str).stem
-                        data_map[match_str.lower()] = str(data_val) if data_val is not None else ""
+                    # 构建文件名到数据列的映射
+                    data_map = {}
+                    for row_idx, row in enumerate(ws2.iter_rows(values_only=True), start=1):
+                        if row_idx < start_row2:
+                            continue
+                        match_val = row[match_col - 1] if match_col - 1 < len(row) else None
+                        data_val = row[data_col - 1] if data_col - 1 < len(row) else None
+                        if match_val is not None:
+                            match_str = str(match_val).strip()
+                            # 去除扩展名
+                            if '.' in match_str:
+                                match_str = Path(match_str).stem
+                            data_map[match_str.lower()] = str(data_val) if data_val is not None else ""
+                finally:
+                    wb2.close()
 
                 overlay_excel_data[layer_idx] = data_map
 
@@ -1218,8 +1242,9 @@ class Img2DocProcessor(BaseProcessor):
                         img_conv.save(buf, format=fmt_save, quality=quality)
                         buf.seek(0)
                         _compressed_cache[fpath] = buf
-                except Exception:
-                    pass  # 压缩失败则使用原图
+                except Exception as e:
+                    if progress_cb:
+                        progress_cb(fi, len(all_files), f"压缩失败，使用原图: {Path(fpath).name} ({e})")
 
         # 4. 导出处理
         fmt = options.get("format", "PPTX")
@@ -1291,7 +1316,7 @@ class Img2DocProcessor(BaseProcessor):
                 results.append(ProcessResult(
                     input_path=f"分组: {group_name}",
                     success=False,
-                    error=str(e)
+                    error=f"{e}\n{traceback.format_exc()}"
                 ))
 
         if progress_cb:
@@ -1364,14 +1389,14 @@ class Img2DocProcessor(BaseProcessor):
         参数:
             w_cm, h_cm: 页面尺寸 (cm)
             img_sizes: [(img_w_px, img_h_px), ...] 每张图的像素尺寸
-            options: 包含 max_cols, overlay_layers 等
+            options: 包含 max_cols, row_align, overlay_layers 等
 
         排版规则：
             - 自动根据叠加层位置计算安全边距，图片排版只在安全区域内
             - 宽度按列均分，高度按每张图实际比例计算
             - 逐行计算行高，整体垂直居中
             - 超高时等比缩小
-            - 每行从左到右排列
+            - row_align: 'left'(从左到右) / 'center'(居中) / 'right'(从右到左)
 
         返回: (layouts, rows, cols)
         """
@@ -1382,6 +1407,7 @@ class Img2DocProcessor(BaseProcessor):
         m_top, m_bottom, m_left, m_right = self._calc_overlay_margins(w_cm, h_cm, overlay_layers)
 
         max_cols = options.get("max_cols", 4)
+        row_align = options.get("row_align", "left")
         gap = 0.3
 
         count = len(img_sizes)
@@ -1433,6 +1459,18 @@ class Img2DocProcessor(BaseProcessor):
         current_y = m_top + v_offset
         for r, (start, end) in enumerate(row_groups):
             row_h = row_heights[r]
+            row_count = end - start  # 本行实际图片数（最后行可能不满）
+
+            # 计算本行实际总宽度（用于居中/右对齐）
+            row_total_w = row_count * cell_w + (row_count - 1) * gap
+
+            if row_align == "center":
+                row_x_start = m_left + (aw - row_total_w) / 2
+            elif row_align == "right":
+                row_x_start = m_left + (aw - row_total_w)
+            else:  # left（默认）
+                row_x_start = m_left
+
             for idx in range(start, end):
                 c = idx - start
                 iw, ih = img_sizes[idx]
@@ -1441,7 +1479,7 @@ class Img2DocProcessor(BaseProcessor):
                 img_w_cm = cell_w
                 img_h_cm = cell_w * ih / iw
 
-                x = m_left + c * (cell_w + gap)
+                x = row_x_start + c * (cell_w + gap)
                 y = current_y + (row_h - img_h_cm) / 2
                 layouts.append((x, y, img_w_cm, img_h_cm))
 
@@ -1617,7 +1655,13 @@ class Img2DocProcessor(BaseProcessor):
                 if f in compressed_cache:
                     compressed_cache[f].seek(0)
                     from reportlab.lib.utils import ImageReader
-                    c.drawImage(ImageReader(compressed_cache[f]), bx * cm, pdf_y * cm, width=bw * cm, height=bh * cm)
+                    reader = ImageReader(compressed_cache[f])
+                    try:
+                        c.drawImage(reader, bx * cm, pdf_y * cm, width=bw * cm, height=bh * cm)
+                    finally:
+                        image = getattr(reader, "_image", None)
+                        if image is not None:
+                            image.close()
                 else:
                     c.drawImage(f, bx * cm, pdf_y * cm, width=bw * cm, height=bh * cm)
 

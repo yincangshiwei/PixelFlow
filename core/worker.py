@@ -2,6 +2,8 @@
 PixelFlow 通用工作线程
 基于 BaseProcessor 插件架构的批量处理
 """
+import traceback
+
 from PySide6.QtCore import QThread, Signal
 from PIL import Image
 from pathlib import Path
@@ -34,6 +36,7 @@ class ProcessWorker(QThread):
     progress = Signal(int, int, str)   # current, total, filename
     image_done = Signal(object)        # ProcessResult
     all_done = Signal(list)            # list[ProcessResult]
+    debug = Signal(str)                # 详细调试/异常信息
 
     def __init__(self, file_list: list[str], output_dir: str,
                  processor: BaseProcessor, options: dict,
@@ -62,9 +65,11 @@ class ProcessWorker(QThread):
                     self.progress.emit(current, total, msg)
 
             try:
+                self.debug.emit(f"开始批量合并处理: {self.processor.name}，文件数: {len(self.file_list)}，输出目录: {out_dir}")
                 results = self.processor.process_batch(self.file_list, self.options, str(out_dir), _progress_cb)
             except Exception as e:
                 # 发生严重异常时返回单个失败结果
+                self.debug.emit("批量处理发生未捕获异常:\n" + traceback.format_exc())
                 res = ProcessResult(input_path="批量处理", success=False, error=str(e))
                 results = [res]
             
@@ -153,6 +158,7 @@ class ProcessWorker(QThread):
             except Exception as e:
                 result.success = False
                 result.error = str(e)
+                self.debug.emit(f"处理失败: {fpath}\n" + traceback.format_exc())
 
             results.append(result)
             self.image_done.emit(result)

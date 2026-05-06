@@ -2,6 +2,8 @@
 PixelFlow 文件处理工作线程
 用于 BaseFileProcessor 体系（文档转换等非图片处理任务）。
 """
+import traceback
+
 from PySide6.QtCore import QThread, Signal
 from pathlib import Path
 
@@ -13,6 +15,7 @@ class FileProcessWorker(QThread):
     progress = Signal(int, int, str)   # current, total, filename
     file_done = Signal(object)         # FileProcessResult
     all_done = Signal(list)            # list[FileProcessResult]
+    debug = Signal(str)                # 详细调试/异常信息
 
     def __init__(self, file_list: list[str], output_dir: str,
                  processor: BaseFileProcessor, options: dict,
@@ -54,6 +57,7 @@ class FileProcessWorker(QThread):
                     success=False,
                     error=str(e)
                 )
+                self.debug.emit(f"文件处理失败: {fpath}\n" + traceback.format_exc())
 
             results.append(result)
             self.file_done.emit(result)

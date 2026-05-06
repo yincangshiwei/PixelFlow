@@ -24,6 +24,7 @@ else:
 RESOURCES_DIR = BASE_DIR / "resources"
 ICON_PATH = RESOURCES_DIR / "app.ico"
 PRESETS_DIR = DATA_DIR / "presets"
+LOGS_DIR = DATA_DIR / "logs"
 
 # ─── UI 样式常量 ───
 # 全局下拉框样式（QComboBox），确保背景色不透明，字体清晰可见

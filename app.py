@@ -4,22 +4,24 @@ PixelFlow - 图像处理工作台
 """
 import sys
 import traceback
-from pathlib import Path
-from config import APP_NAME, DATA_DIR, ICON_PATH
+from datetime import datetime
+from config import APP_NAME, ICON_PATH, LOGS_DIR
 
 
 def _setup_crash_log():
-    """打包后将未捕获异常写入 crash.log"""
-    if not getattr(sys, 'frozen', False):
-        return
-
-    log_path = DATA_DIR / "crash.log"
+    """将未捕获异常写入 logs/app，便于排查闪退。"""
+    log_dir = LOGS_DIR / "app" / "history"
+    current_path = LOGS_DIR / "app" / "current.log"
 
     def exception_hook(exc_type, exc_value, exc_tb):
         msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        header = f"\n{'=' * 60}\n[{datetime.now():%Y-%m-%d %H:%M:%S}] 未捕获异常\n"
         try:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"\n{'=' * 60}\n{msg}\n")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            current_path.parent.mkdir(parents=True, exist_ok=True)
+            for path in (current_path, log_dir / f"{datetime.now():%Y-%m-%d}.log"):
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(f"{header}{msg}\n")
         except Exception:
             pass
         sys.__excepthook__(exc_type, exc_value, exc_tb)

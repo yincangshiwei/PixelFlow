@@ -5,6 +5,13 @@ build/
 # ── 生成文件（由 build.py 从模板生成）──
 installer.iss
 
+# ── 运行时日志 ──
+logs/
+crash.log
+
+# ── 运行时预设 ──
+presets/
+
 # ── IDE / 工具 ──
 .codebuddy/*
 !.codebuddy/rules/

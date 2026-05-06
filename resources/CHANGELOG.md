@@ -2,6 +2,15 @@
 
 ---
 
+## 2026-05-06
+
+### 打包配置 — 修复 exe 运行时 `No module named 'email'` 错误
+
+- 从 PyInstaller `excludes` 列表中移除 `email` 模块，并在 `hiddenimports` 中显式补充 `email`、`email.mime.text`、`email.mime.multipart`
+- 根因：`python-pptx` 内部依赖 `email` 模块解析 OOXML 包结构，原配置将其排除导致图片排版导出添加固定文本叠加层时崩溃
+
+---
+
 ## 2026-04-27
 
 ### 主窗口 — Tab 标签栏合并优化

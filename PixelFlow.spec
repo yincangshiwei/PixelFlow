@@ -33,12 +33,17 @@ a = Analysis(
         'xml.etree.ElementTree',
         'xml.etree',
         'xml',
+        # python-pptx / python-docx 内部依赖
+        'email',
+        'email.mime',
+        'email.mime.text',
+        'email.mime.multipart',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        'tkinter', 'unittest', 'email', 'html', 'http',
+        'tkinter', 'unittest', 'html', 'http',
         'pydoc', 'doctest', 'difflib',
     ],
     noarchive=False,

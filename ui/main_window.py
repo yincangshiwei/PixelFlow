@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QListWidget, QListWidgetItem, QProgressBar,
     QSplitter, QTextEdit, QTextBrowser, QAbstractItemView, QMessageBox,
     QStackedWidget, QSizePolicy, QRadioButton, QButtonGroup,
-    QInputDialog, QMenu, QScrollArea
+    QInputDialog, QMenu, QScrollArea, QWidgetAction
 )
 from PySide6.QtCore import Qt, QSize, QThread, Signal
 from PySide6.QtGui import (
@@ -21,7 +21,7 @@ from PySide6.QtGui import (
     QPainter, QLinearGradient, QColor, QPaintEvent
 )
 
-from config import APP_TITLE, RESOURCES_DIR, APP_COPYRIGHT, APP_COPYRIGHT_URL
+from config import APP_TITLE, APP_NAME, APP_VERSION, RESOURCES_DIR, APP_COPYRIGHT, APP_COPYRIGHT_URL
 from core.base_processor import get_all_processors, BaseProcessor
 from core.base_file_processor import get_all_file_processors, BaseFileProcessor
 from core.preset_manager import PresetManager
@@ -437,6 +437,9 @@ class MainWindow(QMainWindow):
 
         root.addWidget(right, 1)
 
+        # ─── 菜单栏（关于）───
+        self._build_menubar()
+
         # ─── 信号 ───
         self.btn_add_files.clicked.connect(self._add_files)
         self.btn_add_folder.clicked.connect(self._add_folder)
@@ -562,6 +565,42 @@ class MainWindow(QMainWindow):
             QPushButton#tab_inactive:hover {{
                 color: #bbb;
                 background: rgba(55, 55, 90, 140);
+            }}
+
+            /* ═══ 菜单栏 ═══ */
+            QMenuBar {{
+                background: rgba(22, 22, 40, 200);
+                color: #b8bcd0;
+                border-bottom: 1px solid rgba(100, 110, 170, 0.12);
+                padding: 2px 8px;
+                font-size: 12px;
+            }}
+            QMenuBar::item {{
+                padding: 4px 10px;
+                border-radius: 5px;
+            }}
+            QMenuBar::item:hover {{
+                background: rgba(60, 65, 110, 100);
+                color: #e0e4f0;
+            }}
+            QMenu {{
+                background-color: rgba(30, 30, 55, 230);
+                border: 1px solid rgba(100, 110, 170, 0.3);
+                border-radius: 8px;
+                padding: 4px;
+                color: #e0e4f0;
+            }}
+            QMenu::item {{
+                padding: 6px 24px;
+                border-radius: 5px;
+            }}
+            QMenu::item:hover {{
+                background-color: rgba(60, 65, 110, 100);
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background: rgba(100, 110, 170, 0.2);
+                margin: 4px 8px;
             }}
 
             /* Tab 内容区 — 与 Tab 按钮无缝衔接的卡片 */
@@ -787,6 +826,35 @@ class MainWindow(QMainWindow):
             btn.setObjectName("tab_active" if i == idx else "tab_inactive")
             btn.style().unpolish(btn)
             btn.style().polish(btn)
+
+    # ─── 菜单栏 ───
+    def _build_menubar(self):
+        """构建顶部菜单栏（关于在最右侧）"""
+        menubar = self.menuBar()
+
+        # 用伸缩控件把"关于"推到最右边
+        stretch = QWidget()
+        stretch.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        stretch_action = QWidgetAction(menubar)
+        stretch_action.setDefaultWidget(stretch)
+        menubar.addAction(stretch_action)
+
+        about_menu = menubar.addMenu("关于")
+
+        act_update = about_menu.addAction("系统更新")
+        act_update.triggered.connect(lambda: QMessageBox.information(
+            self, "系统更新", "系统更新（开发中）"))
+
+        about_menu.addSeparator()
+
+        act_about = about_menu.addAction("版本信息")
+        act_about.triggered.connect(lambda: QMessageBox.about(
+            self, f"关于 {APP_NAME}",
+            f"<b>{APP_TITLE}</b><br><br>"
+            f"版本: {APP_VERSION}<br>"
+            f"版权: {APP_COPYRIGHT}<br>"
+            f"<a href='{APP_COPYRIGHT_URL}'>{APP_COPYRIGHT_URL}</a>"
+        ))
 
     # ─── 版本日志加载 ───
     def _load_changelog(self):

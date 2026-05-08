@@ -639,7 +639,12 @@ class OverlayProcessor(BaseProcessor):
         self._text_y.setValue(element.y)
         self._text_y.setToolTip("相对于图片左上角的Y坐标（像素值）")
 
-        # 宫格坐标定位器（行首）
+        pos_layout.addWidget(QLabel("X坐标(px):"))
+        pos_layout.addWidget(self._text_x)
+        pos_layout.addWidget(QLabel("Y坐标(px):"))
+        pos_layout.addWidget(self._text_y)
+        pos_layout.addSpacing(8)
+        # 宫格坐标定位器
         grid = GridPositionWidget(
             x_spin=self._text_x,
             y_spin=self._text_y,
@@ -647,11 +652,6 @@ class OverlayProcessor(BaseProcessor):
             element_type='text'
         )
         pos_layout.addWidget(grid)
-        pos_layout.addSpacing(8)
-        pos_layout.addWidget(QLabel("X坐标(px):"))
-        pos_layout.addWidget(self._text_x)
-        pos_layout.addWidget(QLabel("Y坐标(px):"))
-        pos_layout.addWidget(self._text_y)
         pos_layout.addStretch()
         page_layout.addLayout(pos_layout)
 
@@ -701,8 +701,13 @@ class OverlayProcessor(BaseProcessor):
         self._image_height.setValue(element.height)
         self._image_height.setToolTip("叠加图片的高度（像素值）")
 
-        # 位置设置（宫格在行首）
+        # 位置设置（宫格在行尾）
         pos_layout = QHBoxLayout()
+        pos_layout.addWidget(QLabel("X坐标(px):"))
+        pos_layout.addWidget(self._image_x)
+        pos_layout.addWidget(QLabel("Y坐标(px):"))
+        pos_layout.addWidget(self._image_y)
+        pos_layout.addSpacing(8)
         grid = GridPositionWidget(
             x_spin=self._image_x,
             y_spin=self._image_y,
@@ -712,11 +717,6 @@ class OverlayProcessor(BaseProcessor):
             overlay_h_spin=self._image_height
         )
         pos_layout.addWidget(grid)
-        pos_layout.addSpacing(8)
-        pos_layout.addWidget(QLabel("X坐标(px):"))
-        pos_layout.addWidget(self._image_x)
-        pos_layout.addWidget(QLabel("Y坐标(px):"))
-        pos_layout.addWidget(self._image_y)
         pos_layout.addStretch()
         page_layout.addLayout(pos_layout)
 

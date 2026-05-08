@@ -21,7 +21,7 @@ from PySide6.QtGui import (
     QPainter, QLinearGradient, QColor, QPaintEvent
 )
 
-from config import APP_TITLE, RESOURCES_DIR
+from config import APP_TITLE, RESOURCES_DIR, APP_COPYRIGHT, APP_COPYRIGHT_URL
 from core.base_processor import get_all_processors, BaseProcessor
 from core.base_file_processor import get_all_file_processors, BaseFileProcessor
 from core.preset_manager import PresetManager
@@ -421,6 +421,19 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setMinimumHeight(38)
         bottom.addWidget(self.btn_cancel)
         right_lay.addLayout(bottom)
+
+        # ── 版权信息 ──
+        copyright_label = QLabel(
+            f'软件版权归：'
+            f'<a href="{APP_COPYRIGHT_URL}" style="color:#5a6080;text-decoration:none;font-size:11px;">'
+            f'@{APP_COPYRIGHT}</a>'
+            f'  所有'
+        )
+        copyright_label.setAlignment(Qt.AlignCenter)
+        copyright_label.setOpenExternalLinks(True)
+        copyright_label.setToolTip(APP_COPYRIGHT_URL)
+        copyright_label.setCursor(Qt.PointingHandCursor)
+        right_lay.addWidget(copyright_label)
 
         root.addWidget(right, 1)
 

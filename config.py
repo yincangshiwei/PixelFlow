@@ -12,6 +12,10 @@ APP_VERSION = "1.0.4"
 APP_DESCRIPTION = "图像处理工作台"
 APP_PUBLISHER = "PixelFlow"
 
+# ─── 版权信息 ───
+APP_COPYRIGHT = "SEQL"
+APP_COPYRIGHT_URL = "https://github.com/yincangshiwei"
+
 # ─── 路径 ───
 # 项目/安装根目录
 if getattr(sys, 'frozen', False):

@@ -2,6 +2,15 @@
 
 ---
 
+## 2026-05-08
+
+### 打包配置 — 修复 exe 运行时 `No module named 'http'` 错误
+
+- 从 PyInstaller `excludes` 列表中移除 `http` 模块
+- 根因：`python-pptx` 内部依赖 `http.client` 模块处理 OPC/XML 打包，原配置将其排除导致图片排版导出功能完全无法使用
+
+---
+
 ## 2026-05-06
 
 ### 后台日志 — 新增按功能落盘与异常追踪

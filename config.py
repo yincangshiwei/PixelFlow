@@ -6,11 +6,11 @@ import sys
 from pathlib import Path
 
 # ─── 应用基本信息 ───
-APP_NAME = "PixelFlow"
-APP_TITLE = "PixelFlow - 图像处理工作台"
-APP_VERSION = "1.0.3"
-APP_DESCRIPTION = "图像处理工作台"
-APP_PUBLISHER = "PixelFlow"
+APP_NAME = "YHPixelFlow"
+APP_TITLE = "YHPixelFlow - 盈浩图像处理工作台"
+APP_VERSION = "1.0.4"
+APP_DESCRIPTION = "盈浩图像处理工作台"
+APP_PUBLISHER = "YHPixelFlow"
 
 # ─── 路径 ───
 # 项目/安装根目录

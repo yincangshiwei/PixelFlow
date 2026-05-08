@@ -27,3 +27,18 @@ provider:
 - 所有调用 `QFileDialog`（`getOpenFileName`、`getOpenFileNames`、`getExistingDirectory`、`getSaveFileName`）的地方，**默认目录参数必须设置为当前用户的桌面路径**
 - 统一使用 `str(Path.home() / "Desktop")` 或已定义的 `_get_desktop_path()` 函数获取桌面路径，**禁止传入空字符串 `""` 或省略该参数**
 - 例外：加载预设文件的对话框默认目录应为对应功能的预设目录（`mgr.preset_dir`），不适用本规则
+
+## PyInstaller 打包排除依赖规则
+
+- `PixelFlow.spec` 中 `excludes` 列表用于排除**确认不需要**的标准库模块，以减小打包体积
+- **严禁**将项目功能实际依赖的模块加入 `excludes`，包括：
+  - 功能代码直接 `import` 的模块
+  - 第三方库（如 `python-pptx`、`python-docx`、`reportlab`、`openpyxl` 等）**内部间接依赖**的标准库模块
+- 添加新排除项前，必须确认：所有处理器（`core/processors/` 下所有文件）及其依赖的第三方库**均不依赖**该模块
+- 已知不可排除的模块及其使用者：
+  | 模块 | 依赖方 | 用途 |
+  |------|--------|------|
+  | `http` | `python-pptx`（PPTX 导出） | OPC/XML 打包内部使用 |
+  | `email` | `python-pptx` / `python-docx` | MIME 类型处理 |
+  | `xml` | `python-pptx` / `python-docx` / `openpyxl` | XML 解析 |
+- 若不确定某个模块是否被间接依赖，**宁可保留、不排除**，避免打包后运行时出现 `ModuleNotFoundError`

@@ -12,8 +12,8 @@ from PySide6.QtWidgets import (
     QFileDialog, QDoubleSpinBox, QTextEdit, QMessageBox,
     QStackedWidget
 )
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QRectF
+from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont
 
 from core.base_processor import BaseProcessor, register_processor
 from core.image_processor import hex_to_rgba
@@ -73,6 +73,146 @@ class ElementListItem(QListWidgetItem):
             self.setText(f"🖼️ 图片 {self.index + 1} | {label}")
 
 
+class GridPositionWidget(QWidget):
+    """3x3 宫格坐标定位器 — 点击格点自动填充 X/Y 坐标值"""
+
+    # 9宫格定义：(箭头符号, X比例, Y比例)
+    CELLS = [
+        ("↖", 0.0, 0.0),  # 左上
+        ("↑", 0.5, 0.0),  # 中上
+        ("↗", 1.0, 0.0),  # 右上
+        ("←", 0.0, 0.5),  # 左
+        ("⊙", 0.5, 0.5),  # 中
+        ("→", 1.0, 0.5),  # 右
+        ("↙", 0.0, 1.0),  # 左下
+        ("↓", 0.5, 1.0),  # 中下
+        ("↘", 1.0, 1.0),  # 右下
+    ]
+
+    def __init__(self, x_spin, y_spin, processor, element_type='text',
+                 overlay_w_spin=None, overlay_h_spin=None, parent=None):
+        super().__init__(parent)
+        self._x_spin = x_spin
+        self._y_spin = y_spin
+        self._processor = processor  # 用于获取基础图片尺寸
+        self._element_type = element_type  # 'text' 或 'image'
+        self._overlay_w_spin = overlay_w_spin
+        self._overlay_h_spin = overlay_h_spin
+        self._hovered_cell = -1
+
+        self.setFixedSize(90, 90)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("点击格点自动计算并填充 X/Y 坐标\n"
+                        "基于左侧列表选中图片的尺寸定位")
+
+    def _get_base_size(self):
+        """获取基础图片尺寸（优先从处理器读取选中图片的实际尺寸）"""
+        bw = getattr(self._processor, '_base_img_width', 1920)
+        bh = getattr(self._processor, '_base_img_height', 1080)
+        return bw, bh
+
+    def _cell_at(self, pos):
+        """根据鼠标坐标计算所在单元格索引（0~8），不在格内返回 -1"""
+        cw = self.width() / 3.0
+        ch = self.height() / 3.0
+        col = int(pos.x() / cw)
+        row = int(pos.y() / ch)
+        if 0 <= col < 3 and 0 <= row < 3:
+            return row * 3 + col
+        return -1
+
+    def _apply_position(self, idx):
+        """根据格点索引计算并设置 X/Y 坐标值"""
+        if not getattr(self._processor, '_has_base_image', False):
+            QMessageBox.information(
+                self._processor._panel, "提示",
+                "请先在左侧列表选中一张图片，\n宫格定位需要知道底图尺寸。"
+            )
+            return
+        _, px, py = self.CELLS[idx]
+        bw, bh = self._get_base_size()
+        x = int(bw * px)
+        y = int(bh * py)
+
+        # 图片元素：根据叠加图片自身尺寸对居中/靠右/靠下位置进行偏移
+        if self._element_type == 'image':
+            ow = self._overlay_w_spin.value() if self._overlay_w_spin else 0
+            oh = self._overlay_h_spin.value() if self._overlay_h_spin else 0
+            if px == 0.5:
+                x -= ow // 2
+            elif px == 1.0:
+                x -= ow
+            if py == 0.5:
+                y -= oh // 2
+            elif py == 1.0:
+                y -= oh
+
+        self._x_spin.setValue(max(0, x))
+        self._y_spin.setValue(max(0, y))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        w = self.width()
+        h = self.height()
+        cw = w / 3.0
+        ch = h / 3.0
+
+        # 整体背景
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(18, 18, 40, 180)))
+        painter.drawRoundedRect(0, 0, w, h, 8, 8)
+
+        # 绘制 3x3 格线
+        pen = QPen(QColor(100, 110, 170, 60), 1)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        for i in range(4):
+            painter.drawLine(int(i * cw), 0, int(i * cw), h)
+            painter.drawLine(0, int(i * ch), w, int(i * ch))
+
+        # 绘制箭头符号
+        arrow_font = QFont("Segoe UI Symbol", 12)
+        painter.setFont(arrow_font)
+
+        for idx, (arrow, _, _) in enumerate(self.CELLS):
+            row = idx // 3
+            col = idx % 3
+            rect = QRectF(col * cw, row * ch, cw, ch)
+
+            # 悬停高亮
+            if idx == self._hovered_cell:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor(91, 138, 245, 80)))
+                painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 5, 5)
+                painter.setPen(QColor(200, 210, 255))
+            else:
+                painter.setPen(QColor(150, 160, 190))
+
+            painter.drawText(rect, Qt.AlignCenter, arrow)
+
+        painter.end()
+
+    def mouseMoveEvent(self, event):
+        cell = self._cell_at(event.pos())
+        if cell != self._hovered_cell:
+            self._hovered_cell = cell
+            self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            cell = self._cell_at(event.pos())
+            if cell >= 0:
+                self._apply_position(cell)
+
+    def leaveEvent(self, event):
+        if self._hovered_cell != -1:
+            self._hovered_cell = -1
+            self.update()
+
+
 @register_processor
 class OverlayProcessor(BaseProcessor):
     """图片叠加处理器"""
@@ -89,6 +229,16 @@ class OverlayProcessor(BaseProcessor):
         self._config_stack: QStackedWidget | None = None  # 使用 QStackedWidget 管理配置面板
         self._current_file_path = ""  # 当前处理的图片路径
         self._font_cache: dict[str, ImageFont.FreeTypeFont] = {}  # 字体缓存，避免重复加载导致内存泄漏
+        self._base_img_width = 1920   # 选中底图的宽度（像素），用于宫格定位
+        self._base_img_height = 1080  # 选中底图的高度（像素），用于宫格定位
+        self._has_base_image = False  # 是否已选中底图
+
+    def set_base_image_size(self, w: int, h: int):
+        """由主窗口调用，同步当前选中图片的尺寸（像素）"""
+        if w > 0 and h > 0:
+            self._base_img_width = w
+            self._base_img_height = h
+            self._has_base_image = True
 
     def _clear_font_cache(self):
         """清理字体缓存，释放内存"""
@@ -477,18 +627,30 @@ class OverlayProcessor(BaseProcessor):
 
         # 位置设置
         pos_layout = QHBoxLayout()
-        pos_layout.addWidget(QLabel("X坐标(px):"))
+
+        # 先创建坐标 SpinBox（供后续宫格引用）
         self._text_x = QSpinBox()
         self._text_x.setRange(0, 99999)
         self._text_x.setValue(element.x)
         self._text_x.setToolTip("相对于图片左上角的X坐标（像素值）")
-        pos_layout.addWidget(self._text_x)
-        
-        pos_layout.addWidget(QLabel("Y坐标(px):"))
+
         self._text_y = QSpinBox()
         self._text_y.setRange(0, 99999)
         self._text_y.setValue(element.y)
         self._text_y.setToolTip("相对于图片左上角的Y坐标（像素值）")
+
+        # 宫格坐标定位器（行首）
+        grid = GridPositionWidget(
+            x_spin=self._text_x,
+            y_spin=self._text_y,
+            processor=self,
+            element_type='text'
+        )
+        pos_layout.addWidget(grid)
+        pos_layout.addSpacing(8)
+        pos_layout.addWidget(QLabel("X坐标(px):"))
+        pos_layout.addWidget(self._text_x)
+        pos_layout.addWidget(QLabel("Y坐标(px):"))
         pos_layout.addWidget(self._text_y)
         pos_layout.addStretch()
         page_layout.addLayout(pos_layout)
@@ -518,20 +680,42 @@ class OverlayProcessor(BaseProcessor):
         file_layout.addWidget(btn_browse)
         page_layout.addLayout(file_layout)
 
-        # 位置设置
-        pos_layout = QHBoxLayout()
-        pos_layout.addWidget(QLabel("X坐标(px):"))
+        # 先创建坐标和尺寸 SpinBox（供后续宫格引用）
         self._image_x = QSpinBox()
         self._image_x.setRange(0, 99999)
         self._image_x.setValue(element.x)
         self._image_x.setToolTip("相对于底图左上角的X坐标（像素值）")
-        pos_layout.addWidget(self._image_x)
-        
-        pos_layout.addWidget(QLabel("Y坐标(px):"))
+
         self._image_y = QSpinBox()
         self._image_y.setRange(0, 99999)
         self._image_y.setValue(element.y)
         self._image_y.setToolTip("相对于底图左上角的Y坐标（像素值）")
+
+        self._image_width = QSpinBox()
+        self._image_width.setRange(1, 99999)
+        self._image_width.setValue(element.width)
+        self._image_width.setToolTip("叠加图片的宽度（像素值）")
+
+        self._image_height = QSpinBox()
+        self._image_height.setRange(1, 99999)
+        self._image_height.setValue(element.height)
+        self._image_height.setToolTip("叠加图片的高度（像素值）")
+
+        # 位置设置（宫格在行首）
+        pos_layout = QHBoxLayout()
+        grid = GridPositionWidget(
+            x_spin=self._image_x,
+            y_spin=self._image_y,
+            processor=self,
+            element_type='image',
+            overlay_w_spin=self._image_width,
+            overlay_h_spin=self._image_height
+        )
+        pos_layout.addWidget(grid)
+        pos_layout.addSpacing(8)
+        pos_layout.addWidget(QLabel("X坐标(px):"))
+        pos_layout.addWidget(self._image_x)
+        pos_layout.addWidget(QLabel("Y坐标(px):"))
         pos_layout.addWidget(self._image_y)
         pos_layout.addStretch()
         page_layout.addLayout(pos_layout)
@@ -539,17 +723,8 @@ class OverlayProcessor(BaseProcessor):
         # 大小设置
         size_layout = QHBoxLayout()
         size_layout.addWidget(QLabel("宽度(px):"))
-        self._image_width = QSpinBox()
-        self._image_width.setRange(1, 99999)
-        self._image_width.setValue(element.width)
-        self._image_width.setToolTip("叠加图片的宽度（像素值）")
         size_layout.addWidget(self._image_width)
-        
         size_layout.addWidget(QLabel("高度(px):"))
-        self._image_height = QSpinBox()
-        self._image_height.setRange(1, 99999)
-        self._image_height.setValue(element.height)
-        self._image_height.setToolTip("叠加图片的高度（像素值）")
         size_layout.addWidget(self._image_height)
         size_layout.addStretch()
         page_layout.addLayout(size_layout)

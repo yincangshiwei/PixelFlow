@@ -75,7 +75,7 @@ class TextLayer(OverlayLayer):
     def __init__(self, x_cm=1.0, y_cm=17.0, source='fixed', text='',
                  excel_file='', excel_col='C', match_column=1, data_column=2,
                  excel_row_start=2, font_family='Microsoft YaHei', font_size_pt=12,
-                 bold=False, color='#FFFFFF', placement='overlay', name=''):
+                 bold=False, color='#000000', placement='overlay', name=''):
         super().__init__('text', x_cm, y_cm, placement, name)
         self.source = source           # 'fixed', 'excel', 'filename'
         self.text = text               # 固定文本
@@ -1109,7 +1109,7 @@ class Img2DocProcessor(BaseProcessor):
                     font_family=data.get('font_family', 'Microsoft YaHei'),
                     font_size_pt=data.get('font_size_pt', 12),
                     bold=data.get('bold', False),
-                    color=data.get('color', '#FFFFFF'),
+                    color=data.get('color', '#000000'),
                     placement=data.get('placement', 'overlay'),
                 )
             else:
@@ -1599,7 +1599,7 @@ class Img2DocProcessor(BaseProcessor):
                     run = p.add_run()
                     run.text = text
                     run.font.size = PtU(layer.get("font_size_pt", 12))
-                    color_hex = layer.get("color", "#FFFFFF").lstrip("#")
+                    color_hex = layer.get("color", "#000000").lstrip("#")
                     run.font.color.rgb = RGBColor(
                         int(color_hex[0:2], 16),
                         int(color_hex[2:4], 16),
@@ -1675,7 +1675,7 @@ class Img2DocProcessor(BaseProcessor):
                         continue
                     # PDF 坐标原点在左下，y 需要翻转
                     pdf_ty = (h_cm - y_cm_val) * cm
-                    color_hex = layer.get("color", "#FFFFFF")
+                    color_hex = layer.get("color", "#000000")
                     c.setFillColor(HexColor(color_hex))
                     font_size = layer.get("font_size_pt", 12)
                     c.setFont("Helvetica", font_size)

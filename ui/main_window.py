@@ -962,6 +962,10 @@ class MainWindow(QMainWindow):
             self.lbl_preview_info.setText("")
             return
         w, h = pixmap.width(), pixmap.height()
+        # 同步底图尺寸给叠加处理器（用于宫格坐标定位）
+        if (self._current_processor is not None 
+                and hasattr(self._current_processor, 'set_base_image_size')):
+            self._current_processor.set_base_image_size(w, h)
         scaled = pixmap.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.preview_label.setPixmap(scaled)
         self.lbl_preview_info.setText(f"{Path(path).name}  ({w} × {h})")

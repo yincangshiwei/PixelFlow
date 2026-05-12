@@ -13,7 +13,10 @@ import io
 import math
 import copy
 import json
+import re
 import traceback
+import ctypes
+from functools import cmp_to_key
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
@@ -58,6 +61,35 @@ def _col2idx(col_str):
     for c in col_str:
         num = num * 26 + (ord(c.upper()) - ord('A')) + 1
     return num - 1
+
+
+def _natural_parts(text: str):
+    return [(1, int(part)) if part.isdigit() else (0, part.casefold()) for part in re.split(r'(\d+)', text)]
+
+
+def _logical_compare(a: str, b: str):
+    try:
+        return ctypes.windll.shlwapi.StrCmpLogicalW(str(a), str(b))
+    except Exception:
+        a_parts = _natural_parts(str(a))
+        b_parts = _natural_parts(str(b))
+        return (a_parts > b_parts) - (a_parts < b_parts)
+
+
+def _filename_compare(a: str, b: str):
+    return _logical_compare(Path(a).name, Path(b).name)
+
+
+def _directory_sort_key(dir_path: str):
+    return [_natural_parts(part) for part in Path(dir_path).parts]
+
+
+def _excel_sort_key(value):
+    if value is None:
+        return (1, 0, "")
+    if isinstance(value, (int, float)):
+        return (0, 0, value)
+    return (0, 1, str(value).strip().casefold())
 
 
 class OverlayLayer:
@@ -357,6 +389,10 @@ class Img2DocProcessor(BaseProcessor):
         self.chk_keep_ratio = QCheckBox("保持图片比例 (不拉伸)")
         self.chk_keep_ratio.setChecked(True)
         l_row2.addWidget(self.chk_keep_ratio)
+        self.chk_group_by_folder = QCheckBox("按文件夹分组分页")
+        self.chk_group_by_folder.setChecked(False)
+        self.chk_group_by_folder.setToolTip("开启后，同一文件夹内的图片连续排版；不同文件夹之间强制从新页开始。关闭时保持原来的连续排版方式")
+        l_row2.addWidget(self.chk_group_by_folder)
         l_row2.addWidget(QLabel("行内排列方向:"))
         self.combo_row_align = QComboBox()
         self.combo_row_align.addItem("从左到右", "left")
@@ -382,6 +418,7 @@ class Img2DocProcessor(BaseProcessor):
         s_row1.addWidget(QLabel("排序模式:"))
         self.combo_sort = QComboBox()
         self.combo_sort.addItem("按文件名默认排序", "default")
+        self.combo_sort.addItem("按文件夹按文件名排序", "folder_filename")
         self.combo_sort.addItem("按 Excel 指定列排序", "excel_sort")
         self.combo_sort.setStyleSheet(config.COMBOBOX_STYLE)
         s_row1.addWidget(self.combo_sort)
@@ -424,8 +461,18 @@ class Img2DocProcessor(BaseProcessor):
 
         def _on_sort_changed(idx):
             mode = self.combo_sort.currentData()
-            self.widget_excel.setVisible(mode != "default")
+            self.widget_excel.setVisible(mode == "excel_sort")
+
+        def _on_group_by_folder_toggled(checked):
+            target_mode = "folder_filename" if checked else "default"
+            current_mode = self.combo_sort.currentData()
+            if checked or current_mode == "folder_filename":
+                target_idx = self.combo_sort.findData(target_mode)
+                if target_idx >= 0:
+                    self.combo_sort.setCurrentIndex(target_idx)
+
         self.combo_sort.currentIndexChanged.connect(_on_sort_changed)
+        self.chk_group_by_folder.toggled.connect(_on_group_by_folder_toggled)
         _on_sort_changed(0)
         root.addWidget(grp_sort)
 
@@ -1166,6 +1213,7 @@ class Img2DocProcessor(BaseProcessor):
             "keep_ratio": self.chk_keep_ratio.isChecked(),
             "row_align": self.combo_row_align.currentData(),
             "sort_mode": self.combo_sort.currentData(),
+            "group_by_folder": self.chk_group_by_folder.isChecked(),
             "excel_path": self.txt_excel.text(),
             "col_name": self.txt_col_name.text().upper(),
             "col_val": self.txt_col_val.text().upper(),
@@ -1189,6 +1237,7 @@ class Img2DocProcessor(BaseProcessor):
             "keep_ratio": True,
             "row_align": "left",
             "sort_mode": "default",
+            "group_by_folder": False,
             "excel_path": "",
             "col_name": "A",
             "col_val": "B",
@@ -1215,7 +1264,9 @@ class Img2DocProcessor(BaseProcessor):
         if align_idx >= 0:
             self.combo_row_align.setCurrentIndex(align_idx)
 
-        mode = options.get("sort_mode", "default")
+        group_by_folder = options.get("group_by_folder", False)
+        self.chk_group_by_folder.setChecked(group_by_folder)
+        mode = options.get("sort_mode", "folder_filename" if group_by_folder else "default")
         midx = self.combo_sort.findData(mode)
         if midx >= 0: self.combo_sort.setCurrentIndex(midx)
 
@@ -1290,12 +1341,32 @@ class Img2DocProcessor(BaseProcessor):
         if not file_list:
             return []
 
-        # 1. 整理文件列表（排序）
         sort_mode = options.get("sort_mode", "default")
-        groups = {}
+        group_by_folder = options.get("group_by_folder", False)
+        dir_groups = {}
+        for fpath in file_list:
+            group_key = str(Path(fpath).parent)
+            dir_groups.setdefault(group_key, []).append(fpath)
+
+        sorted_group_items = sorted(dir_groups.items(), key=lambda item: _directory_sort_key(item[0]))
+
+        def build_groups(sort_key, force_folder_order=False):
+            if group_by_folder or force_folder_order:
+                folder_groups = [
+                    (Path(group_key).name or group_key, sorted(files, key=sort_key))
+                    for group_key, files in sorted_group_items
+                ]
+                if group_by_folder:
+                    return folder_groups
+                return [(None, [f for _, files in folder_groups for f in files])]
+            return [(None, sorted(file_list, key=sort_key))]
+
+        groups = []
 
         if sort_mode == "default":
-            groups["排版导出"] = sorted(file_list, key=lambda x: Path(x).name)
+            groups = build_groups(cmp_to_key(_filename_compare))
+        elif sort_mode == "folder_filename":
+            groups = build_groups(cmp_to_key(_filename_compare), force_folder_order=True)
         else:
             excel_path = options.get("excel_path", "")
             if not os.path.exists(excel_path):
@@ -1314,18 +1385,18 @@ class Img2DocProcessor(BaseProcessor):
                 for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
                     if row_idx < start_row:
                         continue
-                    if row[c_name] is not None:
-                        mapping[str(row[c_name]).strip()] = row[c_val]
+                    if c_name < len(row) and row[c_name] is not None:
+                        val = row[c_val] if c_val < len(row) else None
+                        mapping[str(row[c_name]).strip()] = val
             finally:
                 wb.close()
 
             def get_sort_val(fpath):
                 name = Path(fpath).stem
-                return mapping.get(name, mapping.get(Path(fpath).name, ""))
+                return mapping.get(name, mapping.get(Path(fpath).name, None))
 
             if sort_mode == "excel_sort":
-                sorted_files = sorted(file_list, key=lambda x: str(get_sort_val(x)))
-                groups["排版导出"] = sorted_files
+                groups = build_groups(lambda x: (_excel_sort_key(get_sort_val(x)), _natural_parts(Path(x).name)))
 
         # 2. 读取叠加层 Excel 数据（如果有文字层需要从 Excel 读取）
         overlay_layers = options.get("overlay_layers", [])
@@ -1376,7 +1447,7 @@ class Img2DocProcessor(BaseProcessor):
         _compressed_cache = {}  # original_path -> compressed_bytes (io.BytesIO)
 
         if compress_enabled:
-            all_files = list({f for grp in groups.values() for f in grp})
+            all_files = list(dict.fromkeys(f for _, grp in groups for f in grp))
             for fi, fpath in enumerate(all_files):
                 if progress_cb:
                     progress_cb(fi, len(all_files), f"压缩中: {Path(fpath).name}")
@@ -1397,78 +1468,82 @@ class Img2DocProcessor(BaseProcessor):
                     if progress_cb:
                         progress_cb(fi, len(all_files), f"压缩失败，使用原图: {Path(fpath).name} ({e})")
 
-        # 4. 导出处理
         fmt = options.get("format", "PPTX")
         results = []
-
-        # 进度以「文件总数」为单位，让进度条与文件列表数量对应
         total_files = len(file_list)
-        processed_files = 0
+        count_per_page = options.get("count_per_page", 1)
+        sorted_files = [f for _, files in groups for f in files]
+        page_batches = None
+        file_positions = {fpath: idx + 1 for idx, fpath in enumerate(sorted_files)}
 
-        for group_name, files in groups.items():
-            count_per_page = options.get("count_per_page", 1)
-            total_pages = math.ceil(len(files) / count_per_page)
+        if group_by_folder:
+            page_batches = []
+            for group_name, files in groups:
+                for i in range(0, len(files), count_per_page):
+                    batch = files[i:i + count_per_page]
+                    page_batches.append((group_name, batch))
 
-            if progress_cb:
-                progress_cb(processed_files, total_files,
-                            f"开始导出: {group_name}（共 {len(files)} 张图，{total_pages} 页）")
+        total_pages = len(page_batches) if page_batches is not None else math.ceil(len(sorted_files) / count_per_page)
+        if progress_cb:
+            group_info = f"，{len(groups)} 个目录组" if group_by_folder else ""
+            progress_cb(0, total_files, f"开始导出: 排版导出（共 {total_files} 张图，{total_pages} 页{group_info}）")
 
-            safe_name = "".join(c for c in group_name if c not in r'\/:*?"<>|')
-            ext = f".{fmt.lower()}"
-            out_path = Path(output_dir) / f"{safe_name}{ext}"
+        safe_name = "排版导出"
+        ext = f".{fmt.lower()}"
+        out_path = Path(output_dir) / f"{safe_name}{ext}"
 
-            counter = 1
-            while out_path.exists():
-                out_path = Path(output_dir) / f"{safe_name}_{counter}{ext}"
-                counter += 1
+        counter = 1
+        while out_path.exists():
+            out_path = Path(output_dir) / f"{safe_name}_{counter}{ext}"
+            counter += 1
 
-            try:
-                # 构造带逐页进度上报的回调
-                _group_base = processed_files  # 本组起始已处理数
-
-                def _page_progress_cb(page_idx, page_count, batch_files, _base=_group_base):
-                    """每页处理完毕后上报进度和日志"""
-                    if progress_cb is None:
-                        return
-                    imgs_done = min(_base + (page_idx + 1) * options.get("count_per_page", 1), total_files)
-                    img_start = _base + page_idx * options.get("count_per_page", 1) + 1
-                    img_end = min(img_start + options.get("count_per_page", 1) - 1, total_files)
-                    names = ", ".join(Path(f).name for f in batch_files)
-                    progress_cb(
-                        imgs_done, total_files,
-                        f"第 {page_idx + 1}/{page_count} 页  [{img_start}~{img_end}]  {names}"
-                    )
-
-                export_kwargs = dict(
-                    files=files,
-                    out_path=str(out_path),
-                    options=options,
-                    compressed_cache=_compressed_cache,
-                    overlay_layers=overlay_layers,
-                    overlay_excel_data=overlay_excel_data,
-                    page_progress_cb=_page_progress_cb,
+        try:
+            def _page_progress_cb(page_idx, page_count, batch_files, group_name=None):
+                if progress_cb is None:
+                    return
+                positions = [file_positions.get(f, 0) for f in batch_files]
+                imgs_done = max(positions) if positions else 0
+                img_start = min(positions) if positions else imgs_done
+                img_end = max(positions) if positions else imgs_done
+                names = ", ".join(Path(f).name for f in batch_files)
+                prefix = f"{group_name} - " if group_name else ""
+                progress_cb(
+                    imgs_done, total_files,
+                    f"{prefix}第 {page_idx + 1}/{page_count} 页  [{img_start}~{img_end}]  {names}"
                 )
-                if fmt == "PPTX":
-                    self._export_pptx(**export_kwargs)
-                elif fmt == "PDF":
-                    self._export_pdf(**export_kwargs)
-                elif fmt == "DOCX":
-                    self._export_docx(**export_kwargs)
 
-                processed_files += len(files)
-                results.append(ProcessResult(
-                    input_path=f"分组: {group_name}",
-                    output_path=str(out_path),
-                    success=True,
-                    details={"files_count": len(files), "pages": total_pages}
-                ))
-            except Exception as e:
-                processed_files += len(files)
-                results.append(ProcessResult(
-                    input_path=f"分组: {group_name}",
-                    success=False,
-                    error=f"{e}\n{traceback.format_exc()}"
-                ))
+            export_kwargs = dict(
+                files=sorted_files,
+                out_path=str(out_path),
+                options=options,
+                compressed_cache=_compressed_cache,
+                overlay_layers=overlay_layers,
+                overlay_excel_data=overlay_excel_data,
+                page_progress_cb=_page_progress_cb,
+                page_batches=page_batches,
+            )
+            if fmt == "PPTX":
+                self._export_pptx(**export_kwargs)
+            elif fmt == "PDF":
+                self._export_pdf(**export_kwargs)
+            elif fmt == "DOCX":
+                self._export_docx(**export_kwargs)
+
+            details = {"files_count": total_files, "pages": total_pages}
+            if group_by_folder:
+                details["groups"] = len(groups)
+            results.append(ProcessResult(
+                input_path="排版导出",
+                output_path=str(out_path),
+                success=True,
+                details=details
+            ))
+        except Exception as e:
+            results.append(ProcessResult(
+                input_path="排版导出",
+                success=False,
+                error=f"{e}\n{traceback.format_exc()}"
+            ))
 
         if progress_cb:
             progress_cb(total_files, total_files, "完成")
@@ -1693,7 +1768,7 @@ class Img2DocProcessor(BaseProcessor):
 
     def _export_pptx(self, files, out_path, options,
                      compressed_cache=None, overlay_layers=None, overlay_excel_data=None,
-                     page_progress_cb=None):
+                     page_progress_cb=None, page_batches=None):
         compressed_cache = compressed_cache or {}
         overlay_layers = overlay_layers or []
         overlay_excel_data = overlay_excel_data or {}
@@ -1711,12 +1786,13 @@ class Img2DocProcessor(BaseProcessor):
 
         count = options["count_per_page"]
         keep_ratio = options["keep_ratio"]
-        total_pages = math.ceil(len(files) / count)
+        if page_batches is None:
+            page_batches = [(None, files[i:i + count]) for i in range(0, len(files), count)]
+        total_pages = len(page_batches)
 
         page_idx = 0
-        for i in range(0, len(files), count):
+        for group_name, batch in page_batches:
             slide = prs.slides.add_slide(blank_layout)
-            batch = files[i:i+count]
 
             # 读取每张图的实际尺寸
             img_sizes = []
@@ -1765,13 +1841,13 @@ class Img2DocProcessor(BaseProcessor):
                     slide.shapes.add_picture(img_path, Cm(x_cm), Cm(y_cm), Cm(ow_cm), Cm(oh_cm))
 
             if page_progress_cb:
-                page_progress_cb(page_idx, total_pages, batch)
+                page_progress_cb(page_idx, total_pages, batch, group_name)
             page_idx += 1
         prs.save(out_path)
 
     def _export_pdf(self, files, out_path, options,
                     compressed_cache=None, overlay_layers=None, overlay_excel_data=None,
-                    page_progress_cb=None):
+                    page_progress_cb=None, page_batches=None):
         compressed_cache = compressed_cache or {}
         overlay_layers = overlay_layers or []
         overlay_excel_data = overlay_excel_data or {}
@@ -1785,11 +1861,12 @@ class Img2DocProcessor(BaseProcessor):
 
         count = options["count_per_page"]
         keep_ratio = options["keep_ratio"]
-        total_pages = math.ceil(len(files) / count)
+        if page_batches is None:
+            page_batches = [(None, files[i:i + count]) for i in range(0, len(files), count)]
+        total_pages = len(page_batches)
 
         page_idx = 0
-        for i in range(0, len(files), count):
-            batch = files[i:i+count]
+        for group_name, batch in page_batches:
 
             # 读取每张图的实际尺寸
             img_sizes = []
@@ -1842,13 +1919,13 @@ class Img2DocProcessor(BaseProcessor):
 
             c.showPage()
             if page_progress_cb:
-                page_progress_cb(page_idx, total_pages, batch)
+                page_progress_cb(page_idx, total_pages, batch, group_name)
             page_idx += 1
         c.save()
 
     def _export_docx(self, files, out_path, options,
                      compressed_cache=None, overlay_layers=None, overlay_excel_data=None,
-                     page_progress_cb=None):
+                     page_progress_cb=None, page_batches=None):
         """DOCX 导出（注：DOCX 不支持绝对坐标叠加，文字层以页脚/段落形式追加）"""
         compressed_cache = compressed_cache or {}
         overlay_layers = overlay_layers or []
@@ -1867,11 +1944,12 @@ class Img2DocProcessor(BaseProcessor):
 
         count = options["count_per_page"]
         keep_ratio = options["keep_ratio"]
-        total_pages = math.ceil(len(files) / count)
+        if page_batches is None:
+            page_batches = [(None, files[i:i + count]) for i in range(0, len(files), count)]
+        total_pages = len(page_batches)
 
         page_idx = 0
-        for i in range(0, len(files), count):
-            batch = files[i:i+count]
+        for group_name, batch in page_batches:
 
             # 读取每张图的实际尺寸
             img_sizes = []
@@ -1924,10 +2002,10 @@ class Img2DocProcessor(BaseProcessor):
                         width=Cm(layer.get("w_cm", 5))
                     )
 
-            if i + count < len(files):
+            if page_idx + 1 < total_pages:
                 doc.add_page_break()
             if page_progress_cb:
-                page_progress_cb(page_idx, total_pages, batch)
+                page_progress_cb(page_idx, total_pages, batch, group_name)
             page_idx += 1
 
         doc.save(out_path)

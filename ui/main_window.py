@@ -30,6 +30,7 @@ import core.processors.transparent_processor  # noqa: F401
 import core.processors.basic_processor        # noqa: F401
 import core.processors.img2doc_processor      # noqa: F401
 import core.processors.overlay_processor      # noqa: F401
+import core.processors.metadata_processor     # noqa: F401
 from core.worker import ProcessWorker
 from core.file_worker import FileProcessWorker
 from core.log_manager import AppLogManager
@@ -402,6 +403,28 @@ class MainWindow(QMainWindow):
         self.chk_auto_folder.setChecked(True)
         out_lay.addWidget(self.chk_auto_folder)
 
+        # 处理范围（全局：所有功能共用）
+        scope_row = QHBoxLayout()
+        scope_row.setSpacing(12)
+        scope_row.addWidget(QLabel("处理范围:"))
+        self.rb_scope_all = QRadioButton("全部文件")
+        self.rb_scope_selected = QRadioButton("仅选中")
+        self.rb_scope_all.setChecked(True)
+        self.rb_scope_all.setToolTip("处理左侧列表中的全部文件")
+        self.rb_scope_selected.setToolTip(
+            "只处理左侧当前选中的文件（可多选）。\n"
+            "适合单张微调；元数据编辑在选中单图时会自动回读属性。"
+        )
+        self.scope_group = QButtonGroup(self)
+        self.scope_group.addButton(self.rb_scope_all, 0)
+        self.scope_group.addButton(self.rb_scope_selected, 1)
+        scope_row.addWidget(self.rb_scope_all)
+        scope_row.addWidget(self.rb_scope_selected)
+        self.lbl_scope_hint = QLabel("")
+        self.lbl_scope_hint.setStyleSheet("color:#8a90b0;font-size:11px;")
+        scope_row.addWidget(self.lbl_scope_hint, 1)
+        out_lay.addLayout(scope_row)
+
         right_lay.addWidget(out_group)
         right_lay.addSpacing(8)
 
@@ -449,11 +472,13 @@ class MainWindow(QMainWindow):
         self.btn_start.clicked.connect(self._start_process)
         self.btn_cancel.clicked.connect(self._cancel_process)
         self.file_list.currentItemChanged.connect(self._on_file_selected)
+        self.file_list.itemSelectionChanged.connect(self._on_selection_changed)
         self.file_list.model().rowsInserted.connect(self._update_file_count)
         self.file_list.model().rowsRemoved.connect(self._update_file_count)
         self.file_list.model().modelReset.connect(self._update_file_count)
         self.combo_processor.currentIndexChanged.connect(self._on_processor_changed)
         self.path_group.idToggled.connect(self._on_path_mode_changed)
+        self.scope_group.idToggled.connect(self._on_scope_changed)
         self.combo_preset.currentIndexChanged.connect(self._on_preset_selected)
         self.btn_load_preset_file.clicked.connect(self._load_preset_file)
         self.btn_save_preset.clicked.connect(self._save_preset)
@@ -817,6 +842,10 @@ class MainWindow(QMainWindow):
         # 重置滚动条到顶部
         self._scroll_to_top()
         self._refresh_preset_list()
+        # 切换功能后，把当前选中图推给新处理器（元数据回读等）
+        cur = self.file_list.currentItem()
+        path = cur.data(Qt.UserRole) if cur is not None else None
+        self._notify_processor_selection(path)
 
     # ─── Tab 切换 ───
     def _switch_tab(self, idx):
@@ -1009,10 +1038,56 @@ class MainWindow(QMainWindow):
         self._update_file_count()
 
     def _update_file_count(self):
-        self.lbl_file_count.setText(f"共 {self.file_list.count()} 个文件")
+        total = self.file_list.count()
+        selected = len(self.file_list.selectedItems())
+        self.lbl_file_count.setText(f"共 {total} 个文件" + (f"，已选 {selected}" if selected else ""))
+        self._update_scope_hint()
+
+    def _on_scope_changed(self, *_args):
+        self._update_scope_hint()
+
+    def _update_scope_hint(self):
+        if not hasattr(self, "lbl_scope_hint"):
+            return
+        if self.rb_scope_selected.isChecked():
+            n = len(self.file_list.selectedItems())
+            self.lbl_scope_hint.setText(f"将处理选中的 {n} 个文件" if n else "请先在左侧选中文件")
+        else:
+            n = self.file_list.count()
+            self.lbl_scope_hint.setText(f"将处理全部 {n} 个文件")
+
+    def _collect_process_files(self) -> list[str]:
+        """按处理范围收集待处理文件路径。"""
+        if self.rb_scope_selected.isChecked():
+            items = self.file_list.selectedItems()
+            return [it.data(Qt.UserRole) for it in items if it.data(Qt.UserRole)]
+        return [
+            self.file_list.item(i).data(Qt.UserRole)
+            for i in range(self.file_list.count())
+            if self.file_list.item(i).data(Qt.UserRole)
+        ]
+
+    def _notify_processor_selection(self, path: str | None):
+        """通知当前图片处理器：选中项变化（用于单图回读等）。"""
+        proc = self._current_processor
+        if proc is None:
+            return
+        if hasattr(proc, "on_selected_image"):
+            try:
+                # 文档不传给图片处理器回读
+                if path and Path(path).suffix.lower() in DOC_EXTS:
+                    proc.on_selected_image(None)
+                else:
+                    proc.on_selected_image(path)
+            except Exception:
+                pass
+
+    def _on_selection_changed(self):
+        self._update_file_count()
 
     def _on_file_selected(self, current, _prev):
         if current is None:
+            self._notify_processor_selection(None)
             return
         path = current.data(Qt.UserRole)
         # 文档文件不做图片预览
@@ -1023,11 +1098,13 @@ class MainWindow(QMainWindow):
             self.preview_label.setText(f"{icon_char}\n{ext} 文档")
             size_kb = Path(path).stat().st_size // 1024 if Path(path).exists() else 0
             self.lbl_preview_info.setText(f"{Path(path).name}  ({size_kb} KB)")
+            self._notify_processor_selection(None)
             return
         pixmap = QPixmap(path)
         if pixmap.isNull():
             self.preview_label.setText("无法加载预览")
             self.lbl_preview_info.setText("")
+            self._notify_processor_selection(path)
             return
         w, h = pixmap.width(), pixmap.height()
         # 同步底图尺寸给叠加处理器（用于宫格坐标定位）
@@ -1037,6 +1114,7 @@ class MainWindow(QMainWindow):
         scaled = pixmap.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.preview_label.setPixmap(scaled)
         self.lbl_preview_info.setText(f"{Path(path).name}  ({w} × {h})")
+        self._notify_processor_selection(path)
 
     def _browse_output(self):
         folder = QFileDialog.getExistingDirectory(self, "选择输出目录", _get_desktop_path())
@@ -1045,8 +1123,7 @@ class MainWindow(QMainWindow):
 
     # ─── 处理逻辑 ───
     def _start_process(self):
-        count = self.file_list.count()
-        if count == 0:
+        if self.file_list.count() == 0:
             QMessageBox.warning(self, "提示", "请先添加要处理的文件")
             return
         if self._current_processor is None and self._current_file_processor is None:
@@ -1059,7 +1136,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请选择自定义输出目录")
             return
 
-        file_list = [self.file_list.item(i).data(Qt.UserRole) for i in range(count)]
+        file_list = self._collect_process_files()
+        scope_selected = self.rb_scope_selected.isChecked()
+        if not file_list:
+            if scope_selected:
+                QMessageBox.warning(self, "提示", "「仅选中」模式下请先在左侧列表选中要处理的文件")
+            else:
+                QMessageBox.warning(self, "提示", "请先添加要处理的文件")
+            return
+
+        count = len(file_list)
         output_dir, is_overwrite = self._resolve_output_dir(file_list[0])
 
         proc_for_log = self._current_processor or self._current_file_processor
@@ -1068,6 +1154,7 @@ class MainWindow(QMainWindow):
         self.log_text.clear()
         self._switch_tab(1)
         mode_names = ["桌面路径", "自定义路径", "原图路径(覆盖)", "原图路径(副本)"]
+        scope_name = "仅选中" if scope_selected else "全部文件"
         auto_folder = self.chk_auto_folder.isChecked() and not is_overwrite
 
         self.progress_bar.setMaximum(count)
@@ -1080,12 +1167,13 @@ class MainWindow(QMainWindow):
             proc = self._current_processor
             options = proc.gather_options()
             self._log(f"功能: {proc.icon}  {proc.name}")
-            self._log(f"共 {count} 个文件")
+            self._log(f"处理范围: {scope_name}  共 {count} 个文件")
             self._log(f"输出模式: {mode_names[mode_id]}  →  {output_dir}")
             self._log("─" * 50)
             self.worker = ProcessWorker(
                 file_list, output_dir, proc, options,
-                auto_subfolder=auto_folder
+                auto_subfolder=auto_folder,
+                overwrite=is_overwrite,
             )
             self.worker.progress.connect(self._on_progress)
             self.worker.image_done.connect(self._on_image_done)
@@ -1097,7 +1185,7 @@ class MainWindow(QMainWindow):
             proc = self._current_file_processor
             options = proc.gather_options()
             self._log(f"功能: {proc.icon}  {proc.name}")
-            self._log(f"共 {count} 个文件")
+            self._log(f"处理范围: {scope_name}  共 {count} 个文件")
             self._log(f"输出模式: {mode_names[mode_id]}  →  {output_dir}")
             self._log("─" * 50)
             self.worker = FileProcessWorker(
@@ -1146,6 +1234,22 @@ class MainWindow(QMainWindow):
                 parts.append(f"压缩→{d['compress_info']}")
             if "output_format" in d:
                 parts.append(f"格式→{d['output_format'].upper()}")
+            if d.get("fake_extension") or d.get("format_note"):
+                parts.append(f"格式识别→{d.get('format_note') or d.get('true_format', '?')}")
+            if d.get("converted"):
+                parts.append(f"转换→{(d.get('output_format') or d.get('format', '?')).upper()}")
+            elif d.get("convert_skipped"):
+                parts.append("转换→已是目标格式(跳过重编码)")
+            if d.get("skipped"):
+                parts.append(f"跳过→{d.get('skip_reason', '不支持')}")
+            elif d.get("cleared"):
+                parts.append("元数据→已清除")
+            elif d.get("fields_written"):
+                parts.append("元数据→" + ", ".join(d["fields_written"]))
+            if d.get("fields_dropped"):
+                parts.append("忽略字段→" + "/".join(d["fields_dropped"]))
+            if d.get("warning"):
+                parts.append(f"⚠{d['warning']}")
             self._log("  ".join(parts))
         else:
             error = str(result.error)

@@ -2,10 +2,34 @@
 PixelFlow - 图像处理工作台
 入口文件
 """
+import os
 import sys
 import traceback
 from datetime import datetime
+from pathlib import Path
 from config import APP_NAME, ICON_PATH, LOGS_DIR
+
+
+def _setup_qt_plugin_path():
+    """
+    打包环境下确保 Qt 能找到 platforms/qwindows.dll。
+    开发环境有 site-packages 路径，一般不需要。
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    base = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    for rel in (
+        Path("PySide6") / "plugins",
+        Path("plugins"),
+        Path("qt6") / "plugins",
+    ):
+        plugins = base / rel
+        if (plugins / "platforms").is_dir():
+            os.environ.setdefault("QT_PLUGIN_PATH", str(plugins))
+            os.environ.setdefault(
+                "QT_QPA_PLATFORM_PLUGIN_PATH", str(plugins / "platforms")
+            )
+            break
 
 
 def _setup_crash_log():
@@ -31,6 +55,7 @@ def _setup_crash_log():
 
 def main():
     _setup_crash_log()
+    _setup_qt_plugin_path()
     from PySide6.QtWidgets import QApplication
     from PySide6.QtGui import QIcon
     from ui.main_window import MainWindow

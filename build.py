@@ -55,11 +55,45 @@ def generate_iss():
     print(f"已生成: {ISS_FILE}")
 
 
+def _verify_qt_plugins(output_dir: Path) -> None:
+    """检查打包结果是否包含 Qt 平台插件，避免运行时报 no Qt platform plugin。"""
+    candidates = [
+        output_dir / "_internal" / "PySide6" / "plugins" / "platforms" / "qwindows.dll",
+        output_dir / "PySide6" / "plugins" / "platforms" / "qwindows.dll",
+        output_dir / "_internal" / "plugins" / "platforms" / "qwindows.dll",
+        output_dir / "plugins" / "platforms" / "qwindows.dll",
+    ]
+    found = next((p for p in candidates if p.is_file()), None)
+    if found:
+        print(f"Qt 平台插件检查通过: {found.relative_to(output_dir)}")
+        return
+    print("!" * 50)
+    print("警告: 未找到 qwindows.dll，打包后几乎一定会启动失败!")
+    print("请确认使用项目虚拟环境中的 PyInstaller，并检查 PixelFlow.spec 中的 PySide6 收集配置。")
+    print("期望路径示例: _internal/PySide6/plugins/platforms/qwindows.dll")
+    print("!" * 50)
+
+
 def build_exe():
     """使用 PyInstaller 打包"""
     print("=" * 50)
     print(f"开始 PyInstaller 打包 {APP_NAME} v{APP_VERSION}...")
+    print(f"Python: {sys.executable}")
     print("=" * 50)
+
+    # 打包前确认当前解释器能导入 PySide6 插件
+    try:
+        import PySide6
+        plugins = Path(PySide6.__file__).resolve().parent / "plugins" / "platforms"
+        qwindows = plugins / "qwindows.dll"
+        print(f"PySide6: {PySide6.__version__}")
+        print(f"qwindows.dll: {qwindows}  exists={qwindows.is_file()}")
+        if not qwindows.is_file():
+            print("错误: 当前环境缺少 PySide6 platforms 插件，无法打包可用程序。")
+            sys.exit(1)
+    except ImportError:
+        print("错误: 当前 Python 未安装 PySide6，请先激活项目虚拟环境再打包。")
+        sys.exit(1)
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
@@ -77,6 +111,7 @@ def build_exe():
         print(f"\n打包成功! 输出目录: {output_dir}")
         total = sum(f.stat().st_size for f in output_dir.rglob("*") if f.is_file())
         print(f"总大小: {total / 1024 / 1024:.1f} MB")
+        _verify_qt_plugins(output_dir)
     else:
         print("打包产物目录不存在，请检查错误日志")
         sys.exit(1)

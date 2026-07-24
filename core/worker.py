@@ -40,13 +40,15 @@ class ProcessWorker(QThread):
 
     def __init__(self, file_list: list[str], output_dir: str,
                  processor: BaseProcessor, options: dict,
-                 auto_subfolder: bool = True, parent=None):
+                 auto_subfolder: bool = True, overwrite: bool = False,
+                 parent=None):
         super().__init__(parent)
         self.file_list = file_list
         self.output_dir = output_dir
         self.processor = processor
         self.options = options
         self.auto_subfolder = auto_subfolder
+        self.overwrite = overwrite
         self._cancelled = False
 
     def cancel(self):
@@ -66,7 +68,9 @@ class ProcessWorker(QThread):
 
             try:
                 self.debug.emit(f"开始批量合并处理: {self.processor.name}，文件数: {len(self.file_list)}，输出目录: {out_dir}")
-                results = self.processor.process_batch(self.file_list, self.options, str(out_dir), _progress_cb)
+                batch_options = dict(self.options)
+                batch_options["_overwrite"] = self.overwrite
+                results = self.processor.process_batch(self.file_list, batch_options, str(out_dir), _progress_cb)
             except Exception as e:
                 # 发生严重异常时返回单个失败结果
                 self.debug.emit("批量处理发生未捕获异常:\n" + traceback.format_exc())

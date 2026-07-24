@@ -101,6 +101,18 @@ class BaseProcessor(ABC):
         """返回输出格式: png / jpg / webp"""
         ...
 
+    def on_selected_image(self, path: str | None):
+        """
+        左侧列表当前选中图片变化时由主窗口回调（可选覆盖）。
+        用于单图回读：如元数据编辑读取原图属性填入面板。
+        path 为 None 表示取消选中或非图片项。
+        """
+        return
+
+    def supports_selected_load(self) -> bool:
+        """是否支持从选中图片加载参数到面板（默认否）"""
+        return False
+
 
 # ── 处理器注册表 ──
 _registry: list[type[BaseProcessor]] = []

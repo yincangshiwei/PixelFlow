@@ -1232,6 +1232,8 @@ class MainWindow(QMainWindow):
                 parts.append(f"画布→{d['canvas_size'][0]}×{d['canvas_size'][1]}")
             if "compress_info" in d:
                 parts.append(f"压缩→{d['compress_info']}")
+            if "dpi" in d:
+                parts.append(f"DPI→{d['dpi']}")
             if "output_format" in d:
                 parts.append(f"格式→{d['output_format'].upper()}")
             if d.get("fake_extension") or d.get("format_note"):

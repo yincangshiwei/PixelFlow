@@ -121,7 +121,17 @@ class ProcessWorker(QThread):
                     out_path = out_dir / f"{stem}_{counter}{ext}"
                     counter += 1
 
-                # 保存
+                # 保存参数：DPI 仅写入 density 元数据，不缩放像素；
+                # 未开压缩时 JPG/WEBP 仍用 quality=95（与既有最优质量策略一致）
+                dpi_tuple = None
+                if self.options.get("enable_dpi"):
+                    dpi_val = int(self.options.get("dpi", 300))
+                    dpi_tuple = (dpi_val, dpi_val)
+                    details["dpi"] = dpi_val
+
+                def _dpi_kw():
+                    return {"dpi": dpi_tuple} if dpi_tuple else {}
+
                 if actual_fmt == "jpg":
                     save_img = img.convert("RGB") if img.mode in ("RGBA", "LA", "P") else img
                     if self.options.get("enable_compress"):
@@ -129,12 +139,12 @@ class ProcessWorker(QThread):
                             target_kb = self.options.get("target_size_kb", 500)
                             save_img, final_q, final_size = compress_to_target_size(save_img, target_kb, "JPEG")
                             details["compress_info"] = f"质量:{final_q}, 大小:{final_size}KB"
-                            save_img.save(str(out_path), "JPEG", quality=final_q)
+                            save_img.save(str(out_path), "JPEG", quality=final_q, **_dpi_kw())
                         else:
                             quality = self.options.get("quality", 85)
-                            save_img.save(str(out_path), "JPEG", quality=quality)
+                            save_img.save(str(out_path), "JPEG", quality=quality, **_dpi_kw())
                     else:
-                        save_img.save(str(out_path), "JPEG", quality=95)
+                        save_img.save(str(out_path), "JPEG", quality=95, **_dpi_kw())
 
                 elif actual_fmt == "webp":
                     if self.options.get("enable_compress"):
@@ -142,19 +152,20 @@ class ProcessWorker(QThread):
                             target_kb = self.options.get("target_size_kb", 500)
                             img, final_q, final_size = compress_to_target_size(img, target_kb, "WEBP")
                             details["compress_info"] = f"质量:{final_q}, 大小:{final_size}KB"
-                            img.save(str(out_path), "WEBP", quality=final_q)
+                            img.save(str(out_path), "WEBP", quality=final_q, **_dpi_kw())
                         else:
                             quality = self.options.get("quality", 85)
-                            img.save(str(out_path), "WEBP", quality=quality)
+                            img.save(str(out_path), "WEBP", quality=quality, **_dpi_kw())
                     else:
-                        img.save(str(out_path), "WEBP", quality=95)
+                        img.save(str(out_path), "WEBP", quality=95, **_dpi_kw())
 
                 elif actual_fmt == "bmp":
                     save_img = img.convert("RGB") if img.mode in ("RGBA", "LA", "P") else img
-                    save_img.save(str(out_path), "BMP")
+                    # BMP：Pillow 将 dpi 写入文件头 XPelsPerMeter / YPelsPerMeter
+                    save_img.save(str(out_path), "BMP", **_dpi_kw())
                 else:
-                    # PNG
-                    img.save(str(out_path), "PNG")
+                    # PNG：dpi 写入 pHYs 块，像素数据仍为 PNG 无损编码
+                    img.save(str(out_path), "PNG", **_dpi_kw())
 
                 result.output_path = str(out_path)
                 result.success = True

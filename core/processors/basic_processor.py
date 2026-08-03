@@ -1,6 +1,6 @@
 """
-基础图片处理器 —— 图片压缩 + 格式转换 + 批量重命名
-三个步骤均可独立启用，支持任意组合使用。
+基础图片处理器 —— 格式转换 + 图片压缩 + 修改 DPI + 批量重命名
+各步骤均可独立启用，支持任意组合使用。
 """
 from PIL import Image
 from PySide6.QtWidgets import (
@@ -12,13 +12,16 @@ from PySide6.QtCore import Qt
 from core.base_processor import BaseProcessor, register_processor
 import config
 
+# 常用 DPI 预设（仅快捷填入，最终以 spin 值为准）
+_DPI_PRESETS = (72, 96, 150, 300, 600)
+
 
 @register_processor
 class BasicProcessor(BaseProcessor):
-    """基础图片处理：压缩 → 格式转换 → 批量重命名"""
+    """基础图片处理：格式转换 / 压缩 / 修改 DPI / 批量重命名"""
 
     name = "基础处理"
-    description = "图片压缩 / 格式转换 / 批量重命名，可任意组合"
+    description = "格式转换 / 图片压缩 / 修改 DPI / 批量重命名，可任意组合"
     icon = "⚙"
     preset_id = "basic_process"
 
@@ -26,6 +29,7 @@ class BasicProcessor(BaseProcessor):
         self._panel: QWidget | None = None
         self._grp_compress = None
         self._grp_format = None
+        self._grp_dpi = None
         self._grp_rename = None
 
     def create_panel(self, parent=None) -> QWidget:
@@ -37,7 +41,7 @@ class BasicProcessor(BaseProcessor):
         # ── 格式转换 ──
         self._grp_format = QGroupBox("格式转换")
         self._grp_format.setCheckable(True)
-        self._grp_format.setChecked(True)
+        self._grp_format.setChecked(False)
         f_lay = QHBoxLayout(self._grp_format)
         f_lay.setSpacing(8)
         f_lay.addWidget(QLabel("输出格式:"))
@@ -110,6 +114,61 @@ class BasicProcessor(BaseProcessor):
         # size 模式下禁止取消勾选格式转换
         self._grp_format.toggled.connect(self._on_format_toggled)
         self._sync_compress_format()
+
+        # ── 修改 DPI ──
+        # DPI 是打印分辨率元数据，不改变像素尺寸，也无「有损/无损」档位；
+        # 保存时仅写入 density 信息，像素数据保持不变。
+        self._grp_dpi = QGroupBox("修改 DPI")
+        self._grp_dpi.setCheckable(True)
+        self._grp_dpi.setChecked(False)
+        self._grp_dpi.setToolTip(
+            "仅修改图片的 DPI（打印分辨率）元数据，不改变像素宽高与画面内容。\n"
+            "支持 PNG / JPG / WEBP / BMP；与压缩、格式转换可同时使用。"
+        )
+        d_lay = QHBoxLayout(self._grp_dpi)
+        d_lay.setSpacing(8)
+        d_lay.addWidget(QLabel("目标 DPI:"))
+        self.spin_dpi = QSpinBox()
+        self.spin_dpi.setRange(1, 2400)
+        self.spin_dpi.setValue(300)
+        self.spin_dpi.setMinimumWidth(90)
+        self.spin_dpi.setToolTip("目标 DPI 值（水平与垂直使用相同 density）")
+        d_lay.addWidget(self.spin_dpi)
+        d_lay.addWidget(QLabel("常用:"))
+        self.combo_dpi_preset = QComboBox()
+        self.combo_dpi_preset.setMinimumWidth(100)
+        self.combo_dpi_preset.setStyleSheet(config.COMBOBOX_STYLE)
+        self.combo_dpi_preset.setToolTip("选择常用 DPI，自动填入左侧数值")
+        for v in _DPI_PRESETS:
+            self.combo_dpi_preset.addItem(str(v), v)
+        # 默认选中 300
+        idx_300 = self.combo_dpi_preset.findData(300)
+        if idx_300 >= 0:
+            self.combo_dpi_preset.setCurrentIndex(idx_300)
+
+        def _on_dpi_preset(_idx):
+            val = self.combo_dpi_preset.currentData()
+            if val is not None:
+                self.spin_dpi.blockSignals(True)
+                self.spin_dpi.setValue(int(val))
+                self.spin_dpi.blockSignals(False)
+
+        def _on_dpi_spin(val: int):
+            # spin 手动改值时，若命中常用项则同步下拉，否则保持当前下拉不动
+            idx = self.combo_dpi_preset.findData(val)
+            if idx >= 0:
+                self.combo_dpi_preset.blockSignals(True)
+                self.combo_dpi_preset.setCurrentIndex(idx)
+                self.combo_dpi_preset.blockSignals(False)
+
+        self.combo_dpi_preset.currentIndexChanged.connect(_on_dpi_preset)
+        self.spin_dpi.valueChanged.connect(_on_dpi_spin)
+        d_lay.addWidget(self.combo_dpi_preset)
+        d_hint = QLabel("仅改元数据，不缩放像素")
+        d_hint.setStyleSheet("color:#666e88;font-size:11px;font-style:italic;")
+        d_lay.addWidget(d_hint)
+        d_lay.addStretch()
+        root.addWidget(self._grp_dpi)
 
         # ── 批量重命名 ──
         self._grp_rename = QGroupBox("批量重命名")
@@ -212,6 +271,8 @@ class BasicProcessor(BaseProcessor):
             "target_size_kb": self.spin_target_size.value(),
             "enable_format": self._grp_format.isChecked(),
             "output_format": self.combo_fmt.currentText().lower(),
+            "enable_dpi": self._grp_dpi.isChecked(),
+            "dpi": self.spin_dpi.value(),
             "enable_rename": self._grp_rename.isChecked(),
             "prefix_mode": self.combo_prefix_mode.currentData(),
             "prefix": self.combo_fmt_prefix.currentText().strip(),
@@ -231,8 +292,10 @@ class BasicProcessor(BaseProcessor):
             "compress_mode": "quality",
             "quality": 85,
             "target_size_kb": 500,
-            "enable_format": True,
+            "enable_format": False,
             "output_format": "png",
+            "enable_dpi": False,
+            "dpi": 300,
             "enable_rename": False,
             "prefix_mode": "custom",
             "prefix": "",
@@ -270,7 +333,16 @@ class BasicProcessor(BaseProcessor):
         idx = self.combo_fmt.findText(fmt)
         self.combo_fmt.setCurrentIndex(idx if idx >= 0 else 0)
 
-        self._grp_format.setChecked(options.get("enable_format", True))
+        self._grp_format.setChecked(options.get("enable_format", False))
+
+        # DPI
+        if self._grp_dpi is not None:
+            self._grp_dpi.setChecked(options.get("enable_dpi", False))
+            dpi_val = int(options.get("dpi", 300))
+            self.spin_dpi.setValue(dpi_val)
+            p_idx = self.combo_dpi_preset.findData(dpi_val)
+            if p_idx >= 0:
+                self.combo_dpi_preset.setCurrentIndex(p_idx)
 
         self._grp_rename.setChecked(options.get("enable_rename", False))
         mode = options.get("prefix_mode", "custom")
@@ -285,14 +357,16 @@ class BasicProcessor(BaseProcessor):
 
     def process(self, img: Image.Image, options: dict) -> tuple[Image.Image, dict]:
         """
-        图片压缩和格式转换在此处理；重命名逻辑由 BasicProcessWorker 在保存阶段处理。
-        此方法仅做图像变换，不涉及文件命名。
+        格式转换的色彩模式在此处理；压缩与 DPI 在 worker 保存阶段写入。
+        重命名逻辑由 worker 在构建输出文件名时处理。
+        DPI 不改变像素数据，仅在保存时写入 density 元数据。
         """
         details = {"original_size": img.size, "original_mode": img.mode}
 
         output_fmt = options.get("output_format", "png") if options.get("enable_format") else None
 
-        # 模式转换：BMP/JPG 不支持透明通道
+        # 仅在启用格式转换时做色彩模式适配；
+        # 未转换格式时保持原 mode，避免「仅改 DPI / 仅重命名」时无谓转色导致画质/体积变化。
         if output_fmt in ("jpg", "bmp"):
             if img.mode in ("RGBA", "LA", "P"):
                 background = Image.new("RGB", img.size, (255, 255, 255))
@@ -304,12 +378,15 @@ class BasicProcessor(BaseProcessor):
                     background.paste(img)
                 img = background
                 details["mode_converted"] = "RGBA→RGB (白底合并)"
-            else:
+            elif img.mode != "RGB":
                 img = img.convert("RGB")
-        elif output_fmt in ("png", "webp", None):
-            # 保持 RGBA
+        elif output_fmt in ("png", "webp"):
+            # 目标为支持透明的格式时统一到 RGBA，便于后续保存
             if img.mode != "RGBA":
                 img = img.convert("RGBA")
+
+        if options.get("enable_dpi"):
+            details["dpi"] = int(options.get("dpi", 300))
 
         details["output_format"] = output_fmt or "原格式"
         return img, details

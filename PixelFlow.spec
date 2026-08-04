@@ -77,6 +77,8 @@ a = Analysis(
     datas=[
         (str(ROOT / 'resources'), 'resources'),
         *_optional_dir_datas('presets', 'presets'),
+        # AI 抠图 worker 脚本（在独立 uv 环境中由子进程执行，勿省略）
+        (str(ROOT / 'core' / 'matting' / 'workers'), str(Path('core') / 'matting' / 'workers')),
         # 只打必需 Qt 插件，不 collect_all
         *_collect_essential_qt_plugins(),
     ],
@@ -86,6 +88,9 @@ a = Analysis(
         'core.processors.img2doc_processor',
         'core.processors.overlay_processor',
         'core.processors.metadata_processor',
+        'core.runtime.env_manager',
+        'core.matting.inference',
+        'ui.settings_panel',
         'openpyxl',
         'openpyxl.cell',
         'openpyxl.utils',

@@ -12,6 +12,12 @@ crash.log
 # ── 运行时预设 ──
 presets/
 
+# ── AI 抠图模型权重（体积大，本地下载）──
+models/
+
+# ── AI 运行时（uv 工具 + 每模型独立 venv）──
+runtime/
+
 # ── IDE / 工具 ──
 .codebuddy/*
 !.codebuddy/rules/

@@ -29,6 +29,11 @@ RESOURCES_DIR = BASE_DIR / "resources"
 ICON_PATH = RESOURCES_DIR / "app.ico"
 PRESETS_DIR = DATA_DIR / "presets"
 LOGS_DIR = DATA_DIR / "logs"
+MODELS_DIR = DATA_DIR / "models" / "matting"  # AI 抠图模型权重目录
+# AI 运行时：uv 工具 + 每模型独立虚拟环境（与主程序/打包 exe 隔离）
+RUNTIME_DIR = DATA_DIR / "runtime"
+RUNTIME_ENVS_DIR = RUNTIME_DIR / "envs"
+RUNTIME_UV_DIR = RUNTIME_DIR / "uv"
 
 # ─── UI 样式常量 ───
 # 全局下拉框样式（QComboBox），确保背景色不透明，字体清晰可见

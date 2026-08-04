@@ -8,3 +8,6 @@ pypdf>=4.0.0
 # 图片排版与导出依赖
 python-pptx>=0.6.23
 openpyxl>=3.1.2
+# AI 抠图依赖不再写入主环境。
+# 请在软件「配置 → 开发环境」安装 uv，并在「抠图模型配置」为每个模型创建独立 venv。
+# 运行时目录：runtime/uv/ 、 runtime/envs/<model_id>/.venv/ 、 models/matting/

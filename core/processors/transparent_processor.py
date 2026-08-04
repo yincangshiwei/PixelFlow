@@ -1,16 +1,19 @@
 """
-透明图处理器 —— 裁剪透明边缘 + 调整尺寸 + 放置到画布
+透明图处理器 —— AI 抠图 + 裁剪透明边缘 + 调整尺寸 + 放置到画布
 """
 from PIL import Image
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
-    QLabel, QSpinBox, QComboBox, QPushButton, QColorDialog
+    QLabel, QSpinBox, QComboBox, QPushButton, QColorDialog, QCheckBox
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 
 from core.base_processor import BaseProcessor, register_processor
 from core.image_processor import hex_to_rgba, trim_transparent, resize_image
+from core.matting.model_registry import list_models, get_model_info
+from core.matting.model_manager import get_matting_manager
+from core.matting.inference import remove_background, MattingError
 import config
 
 
@@ -52,10 +55,10 @@ class _ColorBlock(QWidget):
 
 @register_processor
 class TransparentImageProcessor(BaseProcessor):
-    """透明图处理：裁透明边 → 缩放 → 画布居中"""
+    """透明图处理：抠图 → 裁透明边 → 缩放 → 画布居中"""
 
     name = "透明图处理"
-    description = "去除透明边缘 → 调整尺寸 → 放入画布居中"
+    description = "AI 抠图 → 去除透明边缘 → 调整尺寸 → 放入画布居中"
     icon = "✂"
     preset_id = "transparent_image"
 
@@ -63,6 +66,7 @@ class TransparentImageProcessor(BaseProcessor):
 
     def __init__(self):
         self._panel: QWidget | None = None
+        self._grp_matting = None
         self._grp_trim = None
         self._grp_resize = None
         self._grp_canvas = None
@@ -72,6 +76,42 @@ class TransparentImageProcessor(BaseProcessor):
         root = QVBoxLayout(self._panel)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(8)
+
+        # ── AI 抠图（流水线最前）──
+        self._grp_matting = QGroupBox("AI 抠图")
+        self._grp_matting.setCheckable(True)
+        self._grp_matting.setChecked(False)
+        self._grp_matting.setToolTip(
+            "使用本地 AI 模型去除背景（独立 uv 环境 + 子进程）。\n"
+            "请先在「配置 → 开发环境 / 抠图模型配置」安装 uv、创建环境并下载权重。\n"
+            "开启后会先于裁剪透明边缘执行。"
+        )
+        m_lay = QVBoxLayout(self._grp_matting)
+        m_lay.setSpacing(6)
+
+        m_row = QHBoxLayout()
+        m_row.addWidget(QLabel("模型:"))
+        self.combo_matting_model = QComboBox()
+        self.combo_matting_model.setStyleSheet(config.COMBOBOX_STYLE)
+        self._reload_matting_models()
+        self.combo_matting_model.setToolTip("目前提供 BEN2；更多模型可在后续版本扩展")
+        m_row.addWidget(self.combo_matting_model)
+
+        self.chk_refine = QCheckBox("边缘精炼")
+        self.chk_refine.setChecked(False)
+        self.chk_refine.setToolTip("提升发丝/边缘质量，速度更慢（BEN2 refine_foreground）")
+        m_row.addWidget(self.chk_refine)
+        m_row.addStretch()
+        m_lay.addLayout(m_row)
+
+        self.lbl_matting_hint = QLabel("")
+        self.lbl_matting_hint.setWordWrap(True)
+        self.lbl_matting_hint.setStyleSheet("color:#8a90b0;font-size:11px;")
+        m_lay.addWidget(self.lbl_matting_hint)
+        self.combo_matting_model.currentIndexChanged.connect(self._update_matting_hint)
+        self._grp_matting.toggled.connect(lambda _: self._update_matting_hint())
+        self._update_matting_hint()
+        root.addWidget(self._grp_matting)
 
         # ── 裁剪透明边缘 ──
         self._grp_trim = QGroupBox("裁剪透明边缘")
@@ -146,8 +186,54 @@ class TransparentImageProcessor(BaseProcessor):
         root.addStretch()
         return self._panel
 
+    def _reload_matting_models(self):
+        if not hasattr(self, "combo_matting_model"):
+            return
+        cur = self.combo_matting_model.currentData()
+        self.combo_matting_model.blockSignals(True)
+        self.combo_matting_model.clear()
+        for m in list_models():
+            self.combo_matting_model.addItem(m.name, m.id)
+        # 默认选中管理器中的默认模型
+        prefer = cur or get_matting_manager().get_default_model_id()
+        for i in range(self.combo_matting_model.count()):
+            if self.combo_matting_model.itemData(i) == prefer:
+                self.combo_matting_model.setCurrentIndex(i)
+                break
+        self.combo_matting_model.blockSignals(False)
+
+    def _update_matting_hint(self):
+        if not hasattr(self, "lbl_matting_hint"):
+            return
+        mid = self.combo_matting_model.currentData() or "ben2"
+        meta = get_model_info(mid)
+        mgr = get_matting_manager()
+        ready = mgr.is_ready(mid)
+        status = mgr.status_text(mid)
+        if meta:
+            from core.runtime.env_manager import get_runtime_manager
+            # 仅路径判断，避免面板创建/切换时启动子进程卡 UI
+            rt = get_runtime_manager()
+            env_ok = rt.env_exists(mid)
+            # 若有缓存的完整状态则用 ready
+            cached = rt.get_model_env_status(mid, quick=True)
+            if cached.ready:
+                env_ok = True
+            env_txt = "环境已创建" if env_ok else "环境未创建"
+            base = f"{meta.name} · {status} · {env_txt}"
+            if not env_ok or not ready:
+                base += "  — 请到「配置」创建隔离环境并下载权重"
+            else:
+                base += "  · 勾选后处理时将调用独立环境推理"
+            self.lbl_matting_hint.setText(base)
+        else:
+            self.lbl_matting_hint.setText("")
+
     def gather_options(self) -> dict:
         return {
+            "enable_matting": self._grp_matting.isChecked(),
+            "matting_model": self.combo_matting_model.currentData() or "ben2",
+            "matting_refine": self.chk_refine.isChecked(),
             "enable_trim": self._grp_trim.isChecked(),
             "alpha_threshold": self.spin_alpha.value(),
             "enable_resize": self._grp_resize.isChecked(),
@@ -166,6 +252,9 @@ class TransparentImageProcessor(BaseProcessor):
 
     def default_options(self) -> dict:
         return {
+            "enable_matting": False,
+            "matting_model": "ben2",
+            "matting_refine": False,
             "enable_trim": True,
             "alpha_threshold": 0,
             "enable_resize": False,
@@ -182,6 +271,16 @@ class TransparentImageProcessor(BaseProcessor):
     def apply_options(self, options: dict):
         if self._grp_trim is None:
             return
+        self._reload_matting_models()
+        self._grp_matting.setChecked(options.get("enable_matting", False))
+        mid = options.get("matting_model", "ben2")
+        for i in range(self.combo_matting_model.count()):
+            if self.combo_matting_model.itemData(i) == mid:
+                self.combo_matting_model.setCurrentIndex(i)
+                break
+        self.chk_refine.setChecked(options.get("matting_refine", False))
+        self._update_matting_hint()
+
         self._grp_trim.setChecked(options.get("enable_trim", True))
         self.spin_alpha.setValue(options.get("alpha_threshold", 0))
         self._grp_resize.setChecked(options.get("enable_resize", False))
@@ -202,6 +301,25 @@ class TransparentImageProcessor(BaseProcessor):
 
     def process(self, img: Image.Image, options: dict) -> tuple[Image.Image, dict]:
         details = {"original_size": img.size}
+
+        # 1) AI 抠图（最前）
+        if options.get("enable_matting"):
+            mid = options.get("matting_model", "ben2")
+            refine = bool(options.get("matting_refine", False))
+            try:
+                img = remove_background(
+                    img,
+                    model_id=mid,
+                    refine_foreground=refine,
+                )
+                details["matting_model"] = mid
+                details["matting_refine"] = refine
+                details["matting_size"] = img.size
+            except MattingError:
+                raise
+            except Exception as e:
+                raise MattingError(str(e)) from e
+
         img = img.convert("RGBA")
 
         if options.get("enable_trim"):

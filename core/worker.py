@@ -31,6 +31,28 @@ def _build_stem(original_stem: str, options: dict, index: int) -> str:
         return seq
 
 
+def resolve_file_out_dir(base_out_dir: Path, fpath: str, rel_path_map: dict | None) -> Path:
+    """
+    根据相对路径映射，在输出根目录下解析单文件的目标子目录。
+    rel_path 形如 "sub/a.png" 时，返回 base_out_dir/sub，并确保目录存在。
+    """
+    rel = None
+    if rel_path_map:
+        rel = rel_path_map.get(fpath)
+    if not rel:
+        base_out_dir.mkdir(parents=True, exist_ok=True)
+        return base_out_dir
+    rel_p = Path(str(rel).replace("\\", "/"))
+    # 防御：去掉盘符/绝对路径/向上穿越
+    parts = [p for p in rel_p.parts if p not in ("/", "\\", ".", "..") and ":" not in p]
+    if len(parts) > 1:
+        target = base_out_dir.joinpath(*parts[:-1])
+    else:
+        target = base_out_dir
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 class ProcessWorker(QThread):
     """后台处理线程"""
     progress = Signal(int, int, str)   # current, total, filename
@@ -41,6 +63,7 @@ class ProcessWorker(QThread):
     def __init__(self, file_list: list[str], output_dir: str,
                  processor: BaseProcessor, options: dict,
                  auto_subfolder: bool = True, overwrite: bool = False,
+                 rel_path_map: dict | None = None,
                  parent=None):
         super().__init__(parent)
         self.file_list = file_list
@@ -49,6 +72,7 @@ class ProcessWorker(QThread):
         self.options = options
         self.auto_subfolder = auto_subfolder
         self.overwrite = overwrite
+        self.rel_path_map = rel_path_map or {}
         self._cancelled = False
 
     def cancel(self):
@@ -70,6 +94,9 @@ class ProcessWorker(QThread):
                 self.debug.emit(f"开始批量合并处理: {self.processor.name}，文件数: {len(self.file_list)}，输出目录: {out_dir}")
                 batch_options = dict(self.options)
                 batch_options["_overwrite"] = self.overwrite
+                # 元数据等逐文件写出的 batch 处理器可据此重建子目录
+                if self.rel_path_map:
+                    batch_options["_rel_path_map"] = self.rel_path_map
                 results = self.processor.process_batch(self.file_list, batch_options, str(out_dir), _progress_cb)
             except Exception as e:
                 # 发生严重异常时返回单个失败结果
@@ -113,12 +140,13 @@ class ProcessWorker(QThread):
                     actual_fmt = "jpg"
                 ext = ext_map.get(actual_fmt, src.suffix.lower() or ".png")
 
-                # 构建输出文件名（支持重命名）
+                # 构建输出文件名（支持重命名）；按相对路径落到对应子目录
+                file_out_dir = resolve_file_out_dir(out_dir, fpath, self.rel_path_map)
                 stem = _build_stem(src.stem, self.options, i + 1)
-                out_path = out_dir / (stem + ext)
+                out_path = file_out_dir / (stem + ext)
                 counter = 1
                 while out_path.exists():
-                    out_path = out_dir / f"{stem}_{counter}{ext}"
+                    out_path = file_out_dir / f"{stem}_{counter}{ext}"
                     counter += 1
 
                 # 保存参数：DPI 仅写入 density 元数据，不缩放像素；

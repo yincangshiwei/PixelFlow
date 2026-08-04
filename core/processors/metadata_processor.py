@@ -1054,8 +1054,12 @@ class MetadataProcessor(BaseProcessor):
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         allow_overwrite = bool(options.get("_overwrite", False))
+        rel_path_map = options.get("_rel_path_map") or {}
         results: list[ProcessResult] = []
         total = len(file_list)
+
+        # 延迟导入，避免与 worker 循环依赖在模块加载期出问题
+        from core.worker import resolve_file_out_dir
 
         for i, fpath in enumerate(file_list):
             if progress_callback:
@@ -1074,11 +1078,12 @@ class MetadataProcessor(BaseProcessor):
                 if allow_overwrite:
                     dst = src.with_suffix(out_ext) if enable_convert else src
                 else:
-                    dst = out_dir / f"{src.stem}{out_ext}"
+                    file_out_dir = resolve_file_out_dir(out_dir, fpath, rel_path_map)
+                    dst = file_out_dir / f"{src.stem}{out_ext}"
                     if dst.resolve() == src.resolve() or dst.exists():
                         counter = 1
                         while True:
-                            cand = out_dir / f"{src.stem}_{counter}{out_ext}"
+                            cand = file_out_dir / f"{src.stem}_{counter}{out_ext}"
                             if not cand.exists() and cand.resolve() != src.resolve():
                                 dst = cand
                                 break

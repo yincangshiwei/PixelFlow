@@ -8,6 +8,7 @@ from PySide6.QtCore import QThread, Signal
 from pathlib import Path
 
 from core.base_file_processor import BaseFileProcessor, FileProcessResult
+from core.worker import resolve_file_out_dir
 
 
 class FileProcessWorker(QThread):
@@ -19,13 +20,16 @@ class FileProcessWorker(QThread):
 
     def __init__(self, file_list: list[str], output_dir: str,
                  processor: BaseFileProcessor, options: dict,
-                 auto_subfolder: bool = True, parent=None):
+                 auto_subfolder: bool = True,
+                 rel_path_map: dict | None = None,
+                 parent=None):
         super().__init__(parent)
         self.file_list = file_list
         self.output_dir = output_dir
         self.processor = processor
         self.options = options
         self.auto_subfolder = auto_subfolder
+        self.rel_path_map = rel_path_map or {}
         self._cancelled = False
 
     def cancel(self):
@@ -48,8 +52,9 @@ class FileProcessWorker(QThread):
             self.progress.emit(i + 1, total, src.name)
 
             try:
+                file_out_dir = resolve_file_out_dir(out_dir, fpath, self.rel_path_map)
                 result = self.processor.process_file(
-                    str(fpath), str(out_dir), self.options, i + 1
+                    str(fpath), str(file_out_dir), self.options, i + 1
                 )
             except Exception as e:
                 result = FileProcessResult(

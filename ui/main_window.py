@@ -34,6 +34,7 @@ import core.processors.metadata_processor     # noqa: F401
 from core.worker import ProcessWorker
 from core.file_worker import FileProcessWorker
 from core.log_manager import AppLogManager
+from ui.settings_panel import SettingsPanel
 
 # 图片格式
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif', '.gif'}
@@ -43,6 +44,9 @@ DOC_EXTS = {'.docx', '.pdf'}
 VALID_EXTS = IMAGE_EXTS | DOC_EXTS
 THUMB_SIZE = QSize(48, 48)
 _RES_DIR = str(RESOURCES_DIR).replace("\\", "/")
+# 列表项数据角色：完整路径 / 相对导入根目录的路径（用于保留目录结构）
+ROLE_PATH = Qt.UserRole
+ROLE_REL_PATH = Qt.UserRole + 1
 
 
 def _get_desktop_path() -> str:
@@ -247,11 +251,15 @@ class MainWindow(QMainWindow):
         self.btn_tab_log = QPushButton("  后台日志  ")
         self.btn_tab_log.setObjectName("tab_inactive")
         self.btn_tab_log.setMinimumHeight(34)
+        self.btn_tab_settings = QPushButton("  配置  ")
+        self.btn_tab_settings.setObjectName("tab_inactive")
+        self.btn_tab_settings.setMinimumHeight(34)
         self.btn_tab_changelog = QPushButton("  版本日志  ")
         self.btn_tab_changelog.setObjectName("tab_inactive")
         self.btn_tab_changelog.setMinimumHeight(34)
         tab_row.addWidget(self.btn_tab_process)
         tab_row.addWidget(self.btn_tab_log)
+        tab_row.addWidget(self.btn_tab_settings)
         tab_row.addWidget(self.btn_tab_changelog)
         tab_row.addStretch()
         right_lay.addLayout(tab_row)
@@ -343,7 +351,21 @@ class MainWindow(QMainWindow):
 
         self.main_stack.addWidget(log_page)  # index 1
 
-        # --- 页面2：版本日志 ---
+        # --- 页面2：配置（懒加载，避免启动时扫描 Python/环境卡顿）---
+        settings_page = QWidget()
+        settings_page.setObjectName("tab_content_group")
+        settings_page_lay = QVBoxLayout(settings_page)
+        settings_page_lay.setContentsMargins(12, 12, 12, 12)
+        settings_page_lay.setSpacing(8)
+        self._settings_page_lay = settings_page_lay
+        self.settings_panel = None  # 首次切入配置 Tab 时再创建
+        self._settings_placeholder = QLabel("正在加载配置…")
+        self._settings_placeholder.setAlignment(Qt.AlignCenter)
+        self._settings_placeholder.setStyleSheet("color:#8a90b0;")
+        settings_page_lay.addWidget(self._settings_placeholder, 1)
+        self.main_stack.addWidget(settings_page)  # index 2
+
+        # --- 页面3：版本日志 ---
         changelog_page = QWidget()
         changelog_page.setObjectName("tab_content_group")
         changelog_page_lay = QVBoxLayout(changelog_page)
@@ -356,7 +378,7 @@ class MainWindow(QMainWindow):
         self._load_changelog()
         changelog_page_lay.addWidget(self.changelog_browser, 1)
 
-        self.main_stack.addWidget(changelog_page)  # index 2
+        self.main_stack.addWidget(changelog_page)  # index 3
 
         right_lay.addWidget(self.main_stack, 1)
         right_lay.addSpacing(8)
@@ -398,10 +420,23 @@ class MainWindow(QMainWindow):
         self.lbl_src_hint.setVisible(False)
         out_lay.addWidget(self.lbl_src_hint)
 
-        # 自动创建文件夹
+        # 自动创建文件夹 + 保留目录结构（水平并排）
+        out_opt_row = QHBoxLayout()
+        out_opt_row.setSpacing(16)
         self.chk_auto_folder = QCheckBox("在该路径下自动创建文件夹保存")
         self.chk_auto_folder.setChecked(True)
-        out_lay.addWidget(self.chk_auto_folder)
+        self.chk_auto_folder.setToolTip("在所选输出路径下自动创建 PixelFlow_output 子文件夹")
+        out_opt_row.addWidget(self.chk_auto_folder)
+        self.chk_keep_structure = QCheckBox("保留目录结构")
+        self.chk_keep_structure.setChecked(True)
+        self.chk_keep_structure.setToolTip(
+            "添加文件夹时，按图片相对导入根目录的路径，\n"
+            "在输出目录下重建对应子文件夹（仅桌面/自定义路径模式有效）。\n"
+            "单独添加的文件或无相对路径时仍平铺输出。"
+        )
+        out_opt_row.addWidget(self.chk_keep_structure)
+        out_opt_row.addStretch()
+        out_lay.addLayout(out_opt_row)
 
         # 处理范围（全局：所有功能共用）
         scope_row = QHBoxLayout()
@@ -487,7 +522,8 @@ class MainWindow(QMainWindow):
         self.btn_locate_preset.clicked.connect(self._locate_preset)
         self.btn_tab_process.clicked.connect(lambda: self._switch_tab(0))
         self.btn_tab_log.clicked.connect(lambda: self._switch_tab(1))
-        self.btn_tab_changelog.clicked.connect(lambda: self._switch_tab(2))
+        self.btn_tab_settings.clicked.connect(lambda: self._switch_tab(2))
+        self.btn_tab_changelog.clicked.connect(lambda: self._switch_tab(3))
         self.btn_clear_log.clicked.connect(self._clear_current_log)
 
         # 初始状态
@@ -844,17 +880,43 @@ class MainWindow(QMainWindow):
         self._refresh_preset_list()
         # 切换功能后，把当前选中图推给新处理器（元数据回读等）
         cur = self.file_list.currentItem()
-        path = cur.data(Qt.UserRole) if cur is not None else None
+        path = cur.data(ROLE_PATH) if cur is not None else None
         self._notify_processor_selection(path)
 
     # ─── Tab 切换 ───
     def _switch_tab(self, idx):
         self.main_stack.setCurrentIndex(idx)
-        tab_btns = [self.btn_tab_process, self.btn_tab_log, self.btn_tab_changelog]
+        tab_btns = [
+            self.btn_tab_process,
+            self.btn_tab_log,
+            self.btn_tab_settings,
+            self.btn_tab_changelog,
+        ]
         for i, btn in enumerate(tab_btns):
             btn.setObjectName("tab_active" if i == idx else "tab_inactive")
             btn.style().unpolish(btn)
             btn.style().polish(btn)
+        # 配置页首次进入时再构建，避免拖慢启动
+        if idx == 2:
+            self._ensure_settings_panel()
+
+    def _ensure_settings_panel(self):
+        if self.settings_panel is not None:
+            return
+        # 先让出事件循环，保证 Tab 切换动画/重绘先完成
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self._build_settings_panel)
+
+    def _build_settings_panel(self):
+        if self.settings_panel is not None:
+            return
+        panel = SettingsPanel(lazy=True)
+        self.settings_panel = panel
+        if self._settings_placeholder is not None:
+            self._settings_page_lay.removeWidget(self._settings_placeholder)
+            self._settings_placeholder.deleteLater()
+            self._settings_placeholder = None
+        self._settings_page_lay.addWidget(panel, 1)
 
     # ─── 菜单栏 ───
     def _build_menubar(self):
@@ -912,7 +974,9 @@ class MainWindow(QMainWindow):
         self.txt_output_dir.setVisible(show_input)
         self.btn_browse.setVisible(show_browse)
         self.lbl_src_hint.setVisible(show_src_hint)
-        self.chk_auto_folder.setVisible(btn_id in (0, 1))
+        show_out_opts = btn_id in (0, 1)
+        self.chk_auto_folder.setVisible(show_out_opts)
+        self.chk_keep_structure.setVisible(show_out_opts)
 
         if btn_id == 0:
             self.txt_output_dir.setText(_get_desktop_path())
@@ -956,7 +1020,7 @@ class MainWindow(QMainWindow):
             self._insert_files(files, base_dir=folder)
 
     def _insert_files(self, files, base_dir=None):
-        existing = {self.file_list.item(i).data(Qt.UserRole) for i in range(self.file_list.count())}
+        existing = {self.file_list.item(i).data(ROLE_PATH) for i in range(self.file_list.count())}
         new_image_paths = []
         
         # 暂停 UI 更新，提升批量添加性能
@@ -964,10 +1028,12 @@ class MainWindow(QMainWindow):
         try:
             for f in files:
                 if f not in existing:
-                    # 如果提供了 base_dir，则显示相对路径，否则显示绝对路径（或文件名）
+                    # 如果提供了 base_dir，则显示并记录相对路径，供「保留目录结构」使用
+                    rel_path = None
                     if base_dir:
                         try:
-                            display_name = str(Path(f).relative_to(base_dir))
+                            rel_path = str(Path(f).relative_to(base_dir)).replace("\\", "/")
+                            display_name = rel_path
                         except ValueError:
                             display_name = Path(f).name
                     else:
@@ -975,7 +1041,8 @@ class MainWindow(QMainWindow):
                         display_name = f"{Path(f).parent.name}/{Path(f).name}"
                         
                     item = QListWidgetItem(display_name)
-                    item.setData(Qt.UserRole, f)
+                    item.setData(ROLE_PATH, f)
+                    item.setData(ROLE_REL_PATH, rel_path)
                     item.setToolTip(f)
                     # 文档文件显示文字图标，不加载缩略图
                     if Path(f).suffix.lower() in DOC_EXTS:
@@ -1027,7 +1094,7 @@ class MainWindow(QMainWindow):
             for row in rows_to_remove:
                 item = self.file_list.item(row)
                 # 从缓存中移除
-                path = item.data(Qt.UserRole)
+                path = item.data(ROLE_PATH)
                 self._path_to_item.pop(path, None)
                 self.file_list.takeItem(row)
         finally:
@@ -1058,14 +1125,22 @@ class MainWindow(QMainWindow):
 
     def _collect_process_files(self) -> list[str]:
         """按处理范围收集待处理文件路径。"""
+        return [p for p, _ in self._collect_process_entries()]
+
+    def _collect_process_entries(self) -> list[tuple[str, str | None]]:
+        """按处理范围收集 (完整路径, 相对路径|None)。相对路径用于保留目录结构。"""
         if self.rb_scope_selected.isChecked():
             items = self.file_list.selectedItems()
-            return [it.data(Qt.UserRole) for it in items if it.data(Qt.UserRole)]
-        return [
-            self.file_list.item(i).data(Qt.UserRole)
-            for i in range(self.file_list.count())
-            if self.file_list.item(i).data(Qt.UserRole)
-        ]
+        else:
+            items = [self.file_list.item(i) for i in range(self.file_list.count())]
+        entries: list[tuple[str, str | None]] = []
+        for it in items:
+            path = it.data(ROLE_PATH) if it is not None else None
+            if not path:
+                continue
+            rel = it.data(ROLE_REL_PATH)
+            entries.append((path, rel if rel else None))
+        return entries
 
     def _notify_processor_selection(self, path: str | None):
         """通知当前图片处理器：选中项变化（用于单图回读等）。"""
@@ -1089,7 +1164,7 @@ class MainWindow(QMainWindow):
         if current is None:
             self._notify_processor_selection(None)
             return
-        path = current.data(Qt.UserRole)
+        path = current.data(ROLE_PATH)
         # 文档文件不做图片预览
         if Path(path).suffix.lower() in DOC_EXTS:
             self.preview_label.clear()
@@ -1136,7 +1211,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请选择自定义输出目录")
             return
 
-        file_list = self._collect_process_files()
+        entries = self._collect_process_entries()
+        file_list = [p for p, _ in entries]
         scope_selected = self.rb_scope_selected.isChecked()
         if not file_list:
             if scope_selected:
@@ -1156,6 +1232,13 @@ class MainWindow(QMainWindow):
         mode_names = ["桌面路径", "自定义路径", "原图路径(覆盖)", "原图路径(副本)"]
         scope_name = "仅选中" if scope_selected else "全部文件"
         auto_folder = self.chk_auto_folder.isChecked() and not is_overwrite
+        # 仅桌面/自定义路径模式支持按相对路径重建子目录
+        keep_structure = (
+            self.chk_keep_structure.isChecked()
+            and not is_overwrite
+            and mode_id in (0, 1)
+        )
+        rel_map = {p: rel for p, rel in entries if rel} if keep_structure else {}
 
         self.progress_bar.setMaximum(count)
         self.progress_bar.setValue(0)
@@ -1169,11 +1252,14 @@ class MainWindow(QMainWindow):
             self._log(f"功能: {proc.icon}  {proc.name}")
             self._log(f"处理范围: {scope_name}  共 {count} 个文件")
             self._log(f"输出模式: {mode_names[mode_id]}  →  {output_dir}")
+            if keep_structure:
+                self._log(f"保留目录结构: 是（{len(rel_map)} 个文件含相对路径）")
             self._log("─" * 50)
             self.worker = ProcessWorker(
                 file_list, output_dir, proc, options,
                 auto_subfolder=auto_folder,
                 overwrite=is_overwrite,
+                rel_path_map=rel_map,
             )
             self.worker.progress.connect(self._on_progress)
             self.worker.image_done.connect(self._on_image_done)
@@ -1187,10 +1273,13 @@ class MainWindow(QMainWindow):
             self._log(f"功能: {proc.icon}  {proc.name}")
             self._log(f"处理范围: {scope_name}  共 {count} 个文件")
             self._log(f"输出模式: {mode_names[mode_id]}  →  {output_dir}")
+            if keep_structure:
+                self._log(f"保留目录结构: 是（{len(rel_map)} 个文件含相对路径）")
             self._log("─" * 50)
             self.worker = FileProcessWorker(
                 file_list, output_dir, proc, options,
-                auto_subfolder=auto_folder
+                auto_subfolder=auto_folder,
+                rel_path_map=rel_map,
             )
             self.worker.progress.connect(self._on_progress)
             self.worker.file_done.connect(self._on_file_done)
@@ -1224,6 +1313,9 @@ class MainWindow(QMainWindow):
                 self._log(f"✓ {group_label}  共 {files_count} 张图 → {pages} 页  →  {out_name}")
                 return
             parts = [f"✓ {name}"]
+            if "matting_model" in d:
+                refine = "+精炼" if d.get("matting_refine") else ""
+                parts.append(f"抠图→{d['matting_model']}{refine}")
             if "trimmed_size" in d:
                 parts.append(f"裁剪→{d['trimmed_size'][0]}×{d['trimmed_size'][1]}")
             if "resized_size" in d:

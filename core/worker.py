@@ -136,7 +136,7 @@ class ProcessWorker(QThread):
                 self.image_done.emit(res)
             return results
 
-        # 以下为原有的逐张处理逻辑
+        # 以下为原有的逐张处理逻辑（支持 AI 抠图 micro-batch / 阶段3流水线）
         results = []
         total = len(self.file_list)
 
@@ -145,96 +145,394 @@ class ProcessWorker(QThread):
         # fmt 为空串时保留原始格式
         ext_map = {"png": ".png", "jpg": ".jpg", "webp": ".webp", "bmp": ".bmp"}
 
-        for i, fpath in enumerate(self.file_list):
+        # micro-batch：仅当处理器提供 preferred_matting_batch_size / process_many
+        batch_size = 1
+        use_many = callable(getattr(self.processor, "process_many", None))
+        use_pipeline = callable(getattr(self.processor, "matting_many", None))
+        matting_on = bool(self.options.get("enable_matting"))
+        matting_refine = bool(self.options.get("matting_refine"))
+        matting_model = str(self.options.get("matting_model") or "ben2")
+        matting_device = ""
+        matting_vram = 0.0
+
+        if matting_on:
+            if use_many and callable(
+                getattr(self.processor, "preferred_matting_batch_size", None)
+            ):
+                try:
+                    batch_size = int(
+                        self.processor.preferred_matting_batch_size(self.options) or 1
+                    )
+                except Exception as e:
+                    self.debug.emit(f"解析抠图 batch 失败，回退逐张: {e}")
+                    batch_size = 1
+            batch_size = max(1, min(batch_size, 3))
+            if matting_refine:
+                batch_size = 1
+
+            # 读取会话设备信息，写入启动摘要
+            try:
+                from core.matting.inference import ensure_matting_session_ready
+
+                info = ensure_matting_session_ready(matting_model)
+                matting_device = str(info.get("device") or "")
+                matting_vram = float(info.get("vram_gb") or 0.0)
+                if not matting_refine:
+                    batch_size = max(
+                        1, min(int(info.get("recommend_batch") or batch_size), 3)
+                    )
+            except Exception as e:
+                self.debug.emit(f"AI 抠图会话预热: {e}")
+
+            path_desc = (
+                "全尺寸RGBA+边缘精炼"
+                if matting_refine
+                else "预缩放1024+仅mask"
+            )
+            # 配置偏好 vs worker 实际设备
+            try:
+                from core.matting.model_manager import get_matting_manager
+                pref = (
+                    get_matting_manager().get_device_preference() or "auto"
+                ).lower()
+            except Exception:
+                pref = "auto"
+            pref_labels = {
+                "auto": "自动(优先GPU)",
+                "cuda": "CUDA(GPU)",
+                "cpu": "CPU",
+            }
+            pref_desc = pref_labels.get(pref, pref)
+            act = (matting_device or "").lower()
+            if act == "cuda" and matting_vram > 0:
+                act_desc = f"CUDA · 显存约 {matting_vram:.1f} GB"
+            elif act == "cpu":
+                act_desc = "CPU"
+            elif act:
+                act_desc = act.upper()
+            else:
+                act_desc = "未知(预热未完成)"
+            pipe_desc = "流水线开" if (use_pipeline and total > 1) else "流水线关"
+            self.debug.emit(
+                "AI 抠图: "
+                f"模型={matting_model}  "
+                f"推理设备偏好={pref_desc}  实际={act_desc}  "
+                f"micro-batch={batch_size}  路径={path_desc}  {pipe_desc}"
+                + ("  （OOM 将自动降 batch）" if batch_size > 1 else "")
+            )
+        else:
+            batch_size = 1
+
+        # ── 阶段3：AI 抠图开启且文件数>1 时走三阶段流水线 ──
+        if matting_on and use_pipeline and total > 1 and not self._cancelled:
+            try:
+                from core.matting.pipeline import run_matting_pipeline
+
+                def _set_cur(p):
+                    self._current_path = p
+
+                return run_matting_pipeline(
+                    file_list=self.file_list,
+                    file_index_map=self.file_index_map,
+                    options=self.options,
+                    processor=self.processor,
+                    batch_size=batch_size,
+                    out_dir=out_dir,
+                    fmt=fmt,
+                    ext_map=ext_map,
+                    save_fn=self._save_processed_image,
+                    cancelled=lambda: self._cancelled,
+                    progress_fn=lambda c, t, n: self.progress.emit(c, t, n),
+                    debug_fn=lambda s: self.debug.emit(s),
+                    image_done_fn=lambda r: self.image_done.emit(r),
+                    result_factory=lambda p: ProcessResult(input_path=p),
+                    set_current_path_fn=_set_cur,
+                    matting_device=matting_device,
+                    prefetch_batches=2,
+                    post_queue_depth=2,
+                )
+            except Exception as e:
+                self.debug.emit(
+                    f"AI 抠图流水线启动失败，回退串行: {e}\n"
+                    + traceback.format_exc()
+                )
+
+        batch_round = 0  # 已完成的 micro-batch 轮次（仅日志）
+
+        i = 0
+        while i < total:
             if self._cancelled:
                 break
 
-            src = Path(fpath)
-            self._current_path = fpath
-            order = int(self.file_index_map.get(fpath, i + 1) or (i + 1))
-            self.progress.emit(i + 1, total, src.name)
+            # 每轮重新读取建议值（OOM 降级后 cap 会变小）
+            prev_bs = batch_size
+            if (
+                matting_on
+                and use_many
+                and batch_size >= 1
+                and not matting_refine
+            ):
+                try:
+                    from core.matting.inference import recommend_matting_batch_size
 
-            result = ProcessResult(input_path=fpath)
-            try:
-                img = Image.open(fpath)
-                # 为处理器提供额外的上下文信息（图片索引和路径）
-                process_options = dict(self.options)
-                process_options['_image_index'] = order - 1
-                process_options['_current_image_path'] = fpath
-                img, details = self.processor.process(img, process_options)
+                    cur = int(
+                        recommend_matting_batch_size(
+                            matting_model,
+                            refine=False,
+                        )
+                        or 1
+                    )
+                    batch_size = max(1, min(cur, 3))
+                    if batch_size != prev_bs:
+                        self.debug.emit(
+                            f"AI 抠图: micro-batch 调整 {prev_bs} → {batch_size}"
+                            + ("（可能因 OOM 降级）" if batch_size < prev_bs else "")
+                        )
+                except Exception:
+                    pass
 
-                # 确定实际输出格式
-                actual_fmt = fmt if fmt else src.suffix.lstrip(".").lower()
-                # 规范化：jpeg → jpg
-                if actual_fmt == "jpeg":
-                    actual_fmt = "jpg"
-                ext = ext_map.get(actual_fmt, src.suffix.lower() or ".png")
+            chunk_end = min(i + batch_size, total)
+            # 取消时不要开新 batch
+            if self._cancelled:
+                break
 
-                # 构建输出文件名（支持重命名）；按相对路径落到对应子目录
-                file_out_dir = resolve_file_out_dir(out_dir, fpath, self.rel_path_map)
-                stem = _build_stem(src.stem, self.options, order)
-                out_path = file_out_dir / (stem + ext)
-                counter = 1
-                while out_path.exists():
-                    out_path = file_out_dir / f"{stem}_{counter}{ext}"
-                    counter += 1
+            if batch_size == 1 or not use_many or (chunk_end - i) == 1:
+                # 单张路径
+                fpath = self.file_list[i]
+                src = Path(fpath)
+                self._current_path = fpath
+                order = int(self.file_index_map.get(fpath, i + 1) or (i + 1))
+                self.progress.emit(i + 1, total, src.name)
+                if matting_on:
+                    self.debug.emit(
+                        f"AI 抠图: [{i + 1}/{total}] {src.name}  "
+                        f"batch=1  设备={(matting_device or 'auto').upper()}"
+                    )
 
-                # 保存参数：DPI 仅写入 density 元数据，不缩放像素；
-                # 未开压缩时 JPG/WEBP 仍用 quality=95（与既有最优质量策略一致）
-                dpi_tuple = None
-                if self.options.get("enable_dpi"):
-                    dpi_val = int(self.options.get("dpi", 300))
-                    dpi_tuple = (dpi_val, dpi_val)
-                    details["dpi"] = dpi_val
+                result = ProcessResult(input_path=fpath)
+                try:
+                    img = Image.open(fpath)
+                    process_options = dict(self.options)
+                    process_options["_image_index"] = order - 1
+                    process_options["_current_image_path"] = fpath
+                    img, details = self.processor.process(img, process_options)
+                    self._save_processed_image(
+                        img, details, fpath, src, order, out_dir, fmt, ext_map, result
+                    )
+                except Exception as e:
+                    result.success = False
+                    result.error = str(e)
+                    self.debug.emit(f"处理失败: {fpath}\n" + traceback.format_exc())
 
-                def _dpi_kw():
-                    return {"dpi": dpi_tuple} if dpi_tuple else {}
+                results.append(result)
+                self.image_done.emit(result)
+                self._current_path = None
+                i += 1
+                continue
 
-                if actual_fmt == "jpg":
-                    save_img = img.convert("RGB") if img.mode in ("RGBA", "LA", "P") else img
-                    if self.options.get("enable_compress"):
-                        if self.options.get("compress_mode") == "size":
-                            target_kb = self.options.get("target_size_kb", 500)
-                            save_img, final_q, final_size = compress_to_target_size(save_img, target_kb, "JPEG")
-                            details["compress_info"] = f"质量:{final_q}, 大小:{final_size}KB"
-                            save_img.save(str(out_path), "JPEG", quality=final_q, **_dpi_kw())
-                        else:
-                            quality = self.options.get("quality", 85)
-                            save_img.save(str(out_path), "JPEG", quality=quality, **_dpi_kw())
-                    else:
-                        save_img.save(str(out_path), "JPEG", quality=95, **_dpi_kw())
+            # ── micro-batch 路径 ──
+            chunk_paths = self.file_list[i:chunk_end]
+            chunk_imgs: list = []
+            chunk_opts: list[dict] = []
+            chunk_meta: list[tuple] = []  # (fpath, src, order, list_index)
+            open_errors: dict[int, Exception] = {}
+            batch_round += 1
+            names_preview = ", ".join(Path(p).name for p in chunk_paths[:4])
+            if len(chunk_paths) > 4:
+                names_preview += f" 等{len(chunk_paths)}张"
+            self.debug.emit(
+                f"AI 抠图: batch#{batch_round}  "
+                f"文件 {i + 1}-{chunk_end}/{total}  "
+                f"size={len(chunk_paths)}  "
+                f"设备={(matting_device or 'auto').upper()}  "
+                f"[{names_preview}]"
+            )
 
-                elif actual_fmt == "webp":
-                    if self.options.get("enable_compress"):
-                        if self.options.get("compress_mode") == "size":
-                            target_kb = self.options.get("target_size_kb", 500)
-                            img, final_q, final_size = compress_to_target_size(img, target_kb, "WEBP")
-                            details["compress_info"] = f"质量:{final_q}, 大小:{final_size}KB"
-                            img.save(str(out_path), "WEBP", quality=final_q, **_dpi_kw())
-                        else:
-                            quality = self.options.get("quality", 85)
-                            img.save(str(out_path), "WEBP", quality=quality, **_dpi_kw())
-                    else:
-                        img.save(str(out_path), "WEBP", quality=95, **_dpi_kw())
+            for j, fpath in enumerate(chunk_paths):
+                list_i = i + j
+                src = Path(fpath)
+                order = int(self.file_index_map.get(fpath, list_i + 1) or (list_i + 1))
+                self.progress.emit(list_i + 1, total, src.name)
+                try:
+                    img = Image.open(fpath)
+                    img.load()
+                    process_options = dict(self.options)
+                    process_options["_image_index"] = order - 1
+                    process_options["_current_image_path"] = fpath
+                    chunk_imgs.append(img)
+                    chunk_opts.append(process_options)
+                    chunk_meta.append((fpath, src, order, list_i))
+                except Exception as e:
+                    open_errors[list_i] = e
 
-                elif actual_fmt == "bmp":
-                    save_img = img.convert("RGB") if img.mode in ("RGBA", "LA", "P") else img
-                    # BMP：Pillow 将 dpi 写入文件头 XPelsPerMeter / YPelsPerMeter
-                    save_img.save(str(out_path), "BMP", **_dpi_kw())
+            processed_map: dict[int, tuple] = {}  # list_i -> (img, details) | Exception
+            if chunk_imgs:
+                self._current_path = chunk_meta[0][0]
+                try:
+                    outs = self.processor.process_many(chunk_imgs, chunk_opts)
+                    if len(outs) != len(chunk_meta):
+                        raise RuntimeError(
+                            f"process_many 返回数量不匹配: {len(outs)} vs {len(chunk_meta)}"
+                        )
+                    for (fpath, src, order, list_i), (img, details) in zip(
+                        chunk_meta, outs
+                    ):
+                        processed_map[list_i] = (img, details, fpath, src, order)
+                    self.debug.emit(
+                        f"AI 抠图: batch#{batch_round} 完成  "
+                        f"{len(chunk_meta)} 张  micro-batch={len(chunk_meta)}"
+                    )
+                except Exception as e:
+                    # 整批失败：逐张重试，避免一张拖死整批
+                    self.debug.emit(
+                        f"AI 抠图: batch#{batch_round} 失败，逐张重试 "
+                        f"({len(chunk_meta)} 张): {e}\n"
+                        + traceback.format_exc()
+                    )
+                    for (fpath, src, order, list_i), img0, opt0 in zip(
+                        chunk_meta, chunk_imgs, chunk_opts
+                    ):
+                        if self._cancelled:
+                            break
+                        try:
+                            img, details = self.processor.process(img0, opt0)
+                            processed_map[list_i] = (img, details, fpath, src, order)
+                        except Exception as e2:
+                            processed_map[list_i] = e2
+
+            # 按原顺序写出结果（含 open 失败）
+            for j, fpath in enumerate(chunk_paths):
+                list_i = i + j
+                src = Path(fpath)
+                order = int(self.file_index_map.get(fpath, list_i + 1) or (list_i + 1))
+                result = ProcessResult(input_path=fpath)
+                self._current_path = fpath
+
+                if list_i in open_errors:
+                    result.success = False
+                    result.error = str(open_errors[list_i])
+                    self.debug.emit(
+                        f"处理失败: {fpath}\n{open_errors[list_i]!r}"
+                    )
+                elif list_i not in processed_map:
+                    result.success = False
+                    result.error = "未处理（已取消或内部跳过）"
                 else:
-                    # PNG：dpi 写入 pHYs 块，像素数据仍为 PNG 无损编码
-                    img.save(str(out_path), "PNG", **_dpi_kw())
+                    item = processed_map[list_i]
+                    if isinstance(item, Exception):
+                        result.success = False
+                        result.error = str(item)
+                        self.debug.emit(
+                            f"处理失败: {fpath}\n{item!r}"
+                        )
+                    else:
+                        img, details, fp, src2, order2 = item
+                        try:
+                            self._save_processed_image(
+                                img,
+                                details,
+                                fp,
+                                src2,
+                                order2,
+                                out_dir,
+                                fmt,
+                                ext_map,
+                                result,
+                            )
+                        except Exception as e:
+                            result.success = False
+                            result.error = str(e)
+                            self.debug.emit(
+                                f"保存失败: {fpath}\n" + traceback.format_exc()
+                            )
 
-                result.output_path = str(out_path)
-                result.success = True
-                result.details = details
-            except Exception as e:
-                result.success = False
-                result.error = str(e)
-                self.debug.emit(f"处理失败: {fpath}\n" + traceback.format_exc())
+                results.append(result)
+                self.image_done.emit(result)
+                self._current_path = None
 
-            results.append(result)
-            self.image_done.emit(result)
-            self._current_path = None
+            i = chunk_end
 
         return results
+
+    def _save_processed_image(
+        self,
+        img,
+        details: dict,
+        fpath: str,
+        src: Path,
+        order: int,
+        out_dir: Path,
+        fmt: str,
+        ext_map: dict,
+        result: ProcessResult,
+    ) -> None:
+        """将 process 结果写入磁盘并填充 ProcessResult。"""
+        # 确定实际输出格式
+        actual_fmt = fmt if fmt else src.suffix.lstrip(".").lower()
+        # 规范化：jpeg → jpg
+        if actual_fmt == "jpeg":
+            actual_fmt = "jpg"
+        ext = ext_map.get(actual_fmt, src.suffix.lower() or ".png")
+
+        # 构建输出文件名（支持重命名）；按相对路径落到对应子目录
+        file_out_dir = resolve_file_out_dir(out_dir, fpath, self.rel_path_map)
+        stem = _build_stem(src.stem, self.options, order)
+        out_path = file_out_dir / (stem + ext)
+        counter = 1
+        while out_path.exists():
+            out_path = file_out_dir / f"{stem}_{counter}{ext}"
+            counter += 1
+
+        # 保存参数：DPI 仅写入 density 元数据，不缩放像素；
+        # 未开压缩时 JPG/WEBP 仍用 quality=95（与既有最优质量策略一致）
+        dpi_tuple = None
+        if self.options.get("enable_dpi"):
+            dpi_val = int(self.options.get("dpi", 300))
+            dpi_tuple = (dpi_val, dpi_val)
+            details["dpi"] = dpi_val
+
+        def _dpi_kw():
+            return {"dpi": dpi_tuple} if dpi_tuple else {}
+
+        if actual_fmt == "jpg":
+            save_img = img.convert("RGB") if img.mode in ("RGBA", "LA", "P") else img
+            if self.options.get("enable_compress"):
+                if self.options.get("compress_mode") == "size":
+                    target_kb = self.options.get("target_size_kb", 500)
+                    save_img, final_q, final_size = compress_to_target_size(
+                        save_img, target_kb, "JPEG"
+                    )
+                    details["compress_info"] = f"质量:{final_q}, 大小:{final_size}KB"
+                    save_img.save(str(out_path), "JPEG", quality=final_q, **_dpi_kw())
+                else:
+                    quality = self.options.get("quality", 85)
+                    save_img.save(str(out_path), "JPEG", quality=quality, **_dpi_kw())
+            else:
+                save_img.save(str(out_path), "JPEG", quality=95, **_dpi_kw())
+
+        elif actual_fmt == "webp":
+            if self.options.get("enable_compress"):
+                if self.options.get("compress_mode") == "size":
+                    target_kb = self.options.get("target_size_kb", 500)
+                    img, final_q, final_size = compress_to_target_size(
+                        img, target_kb, "WEBP"
+                    )
+                    details["compress_info"] = f"质量:{final_q}, 大小:{final_size}KB"
+                    img.save(str(out_path), "WEBP", quality=final_q, **_dpi_kw())
+                else:
+                    quality = self.options.get("quality", 85)
+                    img.save(str(out_path), "WEBP", quality=quality, **_dpi_kw())
+            else:
+                img.save(str(out_path), "WEBP", quality=95, **_dpi_kw())
+
+        elif actual_fmt == "bmp":
+            save_img = img.convert("RGB") if img.mode in ("RGBA", "LA", "P") else img
+            # BMP：Pillow 将 dpi 写入文件头 XPelsPerMeter / YPelsPerMeter
+            save_img.save(str(out_path), "BMP", **_dpi_kw())
+        else:
+            # PNG：dpi 写入 pHYs 块，像素数据仍为 PNG 无损编码
+            img.save(str(out_path), "PNG", **_dpi_kw())
+
+        result.output_path = str(out_path)
+        result.success = True
+        result.details = details

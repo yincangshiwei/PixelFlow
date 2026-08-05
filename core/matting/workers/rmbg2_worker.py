@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-BEN2 抠图子进程入口 —— 在模型独立 uv 环境中运行。
+RMBG 2.0 抠图子进程入口 —— 在模型独立 uv 环境中运行。
+
+基于 BRIA AI RMBG-2.0（BiRefNet + transformers AutoModelForImageSegmentation）。
+协议与 ben2_worker 对齐，便于主进程统一调度。
 
 用法（单次）:
-  python ben2_worker.py --input in.png --output out.png [--device auto|cpu|cuda]
-                        [--refine] [--return-mask] --weights-dir DIR [--weights-file FILE]
+  python rmbg2_worker.py --input in.png --output out.png [--device auto|cpu|cuda]
+                        [--return-mask] --weights-dir DIR [--weights-file FILE]
 
 用法（常驻，批量复用模型）:
-  python ben2_worker.py --serve [--device auto|cpu|cuda]
+  python rmbg2_worker.py --serve [--device auto|cpu|cuda]
                         --weights-dir DIR [--weights-file FILE]
   启动后先输出一行 JSON:
     {"ok":true,"event":"ready","device":"...","vram_gb":8.0,"recommend_batch":2}
@@ -21,8 +24,9 @@ BEN2 抠图子进程入口 —— 在模型独立 uv 环境中运行。
   - 业务状态只写 stdout（一行一个 JSON）
   - 诊断信息可写 stderr
   - return_mask=true 时 output 为单通道 L 遮罩 PNG（尺寸=输入图）
-  - return_mask=false 时 output 为 RGBA 前景 PNG（兼容旧路径）
-  - infer_batch 仅支持非 refine + return_mask（真 tensor batch）
+  - return_mask=false 时 output 为 RGBA 前景 PNG
+  - infer_batch 仅支持 return_mask（真 tensor batch）
+  - refine 参数保留协议兼容，RMBG2 无独立精炼，忽略该标志
 """
 from __future__ import annotations
 
@@ -32,62 +36,84 @@ import sys
 import traceback
 from pathlib import Path
 
+# 与官方 README / BEN2 业务侧预缩放一致
+_INFER_SIZE = (1024, 1024)
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD = [0.229, 0.224, 0.225]
+
 
 def _load_model(weights_dir: str | None, weights_file: str | None, device: str):
     import torch
-    from ben2 import BEN_Base
+    from transformers import AutoModelForImageSegmentation
 
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     elif device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("请求 CUDA，但当前环境 torch.cuda 不可用")
 
-    model = None
+    candidates: list[Path] = []
     wdir = Path(weights_dir) if weights_dir else None
     wfile = Path(weights_file) if weights_file else None
 
-    if wdir and (wdir / "model.safetensors").is_file():
+    if wdir and wdir.is_dir():
+        candidates.append(wdir)
+    if wfile and wfile.is_file():
+        candidates.append(wfile.parent)
+
+    model = None
+    last_err: Exception | None = None
+    for path in candidates:
+        # 目录内需有 config + 权重，供 trust_remote_code 本地加载
+        if not (path / "config.json").is_file() and not any(path.glob("*.safetensors")):
+            if not any(path.glob("*.bin")):
+                continue
         try:
-            model = BEN_Base.from_pretrained(str(wdir))
-        except Exception:
+            model = AutoModelForImageSegmentation.from_pretrained(
+                str(path),
+                trust_remote_code=True,
+                local_files_only=True,
+            )
+            break
+        except Exception as e:
+            last_err = e
             model = None
-
-    if model is None and wfile and wfile.is_file():
-        suf = wfile.suffix.lower()
-        if suf in (".pth", ".pt"):
-            model = BEN_Base()
-            model.loadcheckpoints(str(wfile))
-        elif suf == ".safetensors":
-            model = BEN_Base.from_pretrained(str(wfile.parent))
-
-    if model is None and wdir and wdir.is_dir():
-        for name in ("BEN2_Base.pth", "pytorch_model.bin", "model.safetensors"):
-            p = wdir / name
-            if not p.is_file():
-                continue
-            if p.suffix.lower() in (".pth", ".pt"):
-                model = BEN_Base()
-                model.loadcheckpoints(str(p))
-                break
             try:
-                model = BEN_Base.from_pretrained(str(wdir))
+                # 本地标记不完整时再试（允许补全缓存，一般仍用本地文件）
+                model = AutoModelForImageSegmentation.from_pretrained(
+                    str(path),
+                    trust_remote_code=True,
+                )
                 break
-            except Exception:
-                continue
+            except Exception as e2:
+                last_err = e2
+                model = None
 
     if model is None:
+        detail = f"（{last_err}）" if last_err else ""
         raise RuntimeError(
-            "未找到可用权重（需要 model.safetensors 或 BEN2_Base.pth）"
+            "未找到可用 RMBG-2.0 权重目录（需要 model.safetensors + config.json 等）"
+            + detail
         )
 
     model.to(device).eval()
-    # 固定 1024 输入，有利于 cuDNN 选算法
     try:
         if device == "cuda":
             torch.backends.cudnn.benchmark = True
     except Exception:
         pass
     return model, device
+
+
+def _build_transform():
+    from torchvision import transforms
+
+    return transforms.Compose(
+        [
+            transforms.Resize(_INFER_SIZE),
+            transforms.ToTensor(),
+            transforms.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
+        ]
+    )
 
 
 def _device_meta(device: str) -> dict:
@@ -103,10 +129,10 @@ def _device_meta(device: str) -> dict:
         props = torch.cuda.get_device_properties(0)
         vram = float(props.total_memory) / (1024 ** 3)
         meta["vram_gb"] = round(vram, 2)
-        # 与主进程 recommend 规则对齐（保守）
-        if vram < 4.0:
+        # RMBG2 ~BiRefNet 比 BEN2 更吃显存，略保守
+        if vram < 6.0:
             meta["recommend_batch"] = 1
-        elif vram < 8.0:
+        elif vram < 10.0:
             meta["recommend_batch"] = 2
         else:
             meta["recommend_batch"] = 3
@@ -127,18 +153,12 @@ def _prepare_rgb(img):
         bg = Image.new("RGB", img.size, (255, 255, 255))
         bg.paste(img, mask=img.split()[-1])
         return bg
+    if img.mode == "LA":
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[-1])
+        return bg
     return img.convert("RGB")
-
-
-def _extract_mask_from_rgba(result):
-    """从 BEN2 RGBA 结果取出 Alpha 作为 L 遮罩。"""
-    if result.mode == "RGBA":
-        return result.split()[-1]
-    if result.mode == "L":
-        return result
-    if result.mode == "LA":
-        return result.split()[-1]
-    return result.convert("L")
 
 
 def _is_oom(exc: BaseException) -> bool:
@@ -154,8 +174,56 @@ def _is_oom(exc: BaseException) -> bool:
     return any(k in msg for k in keys)
 
 
+def _predict_masks(model, device: str, pil_rgbs: list, transform) -> list:
+    """
+    对若干 RGB PIL 图推理，返回与输入等长的 L 模式 mask（尺寸=各图原始 size）。
+    """
+    import torch
+    from PIL import Image
+    from torchvision import transforms as T
+
+    if not pil_rgbs:
+        return []
+
+    tensors = [transform(im) for im in pil_rgbs]
+    batch = torch.stack(tensors, dim=0).to(device)
+
+    try:
+        with torch.inference_mode():
+            preds = model(batch)[-1].sigmoid().detach().cpu()
+    except Exception as e:
+        if _is_oom(e):
+            try:
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"CUDA OOM during forward (batch={len(pil_rgbs)}): {e}"
+            ) from e
+        raise
+
+    # preds: (B, 1, H, W) 或 (B, H, W)
+    if preds.dim() == 3:
+        preds = preds.unsqueeze(1)
+
+    to_pil = T.ToPILImage()
+    masks = []
+    for i, rgb in enumerate(pil_rgbs):
+        matte = preds[i].squeeze().clamp(0.0, 1.0)
+        mask = to_pil(matte)
+        if mask.mode != "L":
+            mask = mask.convert("L")
+        if mask.size != rgb.size:
+            mask = mask.resize(rgb.size, resample=Image.BILINEAR)
+        masks.append(mask)
+    return masks
+
+
 def _infer_one(
     model,
+    device: str,
+    transform,
     input_path: str,
     output_path: str,
     refine: bool,
@@ -164,20 +232,17 @@ def _infer_one(
 ) -> dict:
     from PIL import Image
 
+    # refine 保留协议位，RMBG2 无独立精炼实现
+    _ = refine
+
     img = Image.open(input_path)
     work = _prepare_rgb(img)
-
-    # 边缘精炼会改 RGB，必须走完整 RGBA；mask-only 仅用于非 refine
-    use_mask = bool(return_mask) and not bool(refine)
-    result = model.inference(work, refine_foreground=bool(refine))
+    mask = _predict_masks(model, device, [work], transform)[0]
 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    if use_mask:
-        mask = _extract_mask_from_rgba(result)
-        if mask.mode != "L":
-            mask = mask.convert("L")
+    if return_mask:
         mask.save(str(out), format="PNG")
         return {
             "ok": True,
@@ -185,38 +250,28 @@ def _infer_one(
             "output_kind": "mask",
         }
 
-    if result.mode != "RGBA":
-        result = result.convert("RGBA")
-    result.save(str(out), format="PNG")
+    rgba = work.convert("RGBA")
+    rgba.putalpha(mask)
+    rgba.save(str(out), format="PNG")
     return {
         "ok": True,
-        "size": list(result.size),
+        "size": list(rgba.size),
         "output_kind": "rgba",
     }
 
 
-def _infer_batch_masks(model, device: str, items: list[dict]) -> dict:
+def _infer_batch_masks(model, device: str, transform, items: list[dict]) -> dict:
     """
     真 tensor batch：stack → 一次 forward → 逐张写 mask。
     items: [{"input": path, "output": path}, ...]
-    输入图建议已是 1024×1024（主进程阶段1预缩放）；否则此处再对齐。
+    输入图建议已是 ≤1024（主进程阶段1预缩放）；transform 内仍会 Resize 到 1024。
     """
-    import torch
     from PIL import Image
-    from ben2.modeling_ben2 import (
-        img_transform,
-        img_transform32,
-        postprocess_image,
-        set_random_seed,
-    )
 
     if not items:
         raise ValueError("infer_batch items 为空")
 
-    set_random_seed(9)
-
     pil_rgbs = []
-    sizes = []  # (w, h) 磁盘输入尺寸，mask 按此输出（主进程再放大到原图）
     out_paths = []
     for it in items:
         inp = it.get("input") or ""
@@ -225,53 +280,18 @@ def _infer_batch_masks(model, device: str, items: list[dict]) -> dict:
             raise ValueError("infer_batch 每项需要 input 与 output")
         img = Image.open(str(inp))
         work = _prepare_rgb(img)
-        w, h = work.size
-        # 与 BEN2 rgb_loader 一致：固定 1024×1024
-        if (w, h) != (1024, 1024):
-            work_net = work.resize((1024, 1024), resample=Image.LANCZOS)
-        else:
-            work_net = work
-        pil_rgbs.append(work_net)
-        sizes.append((w, h))
+        pil_rgbs.append(work)
         out_paths.append(Path(str(outp)))
 
-    use_fp16 = device == "cuda" and torch.cuda.is_available()
-    tfm = img_transform if use_fp16 else img_transform32
-    tensors = [tfm(im) for im in pil_rgbs]
-    batch = torch.stack(tensors, dim=0).to(next(model.parameters()).device)
-
-    try:
-        with torch.inference_mode():
-            res = model.forward(batch)
-    except Exception as e:
-        if _is_oom(e):
-            try:
-                if device == "cuda":
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-            raise RuntimeError(f"CUDA OOM during batch forward (batch={len(items)}): {e}") from e
-        raise
-
-    # res: (B, 1, H, W) 或 (B, H, W)
-    if res.dim() == 3:
-        res = res.unsqueeze(1)
+    masks = _predict_masks(model, device, pil_rgbs, transform)
 
     results_meta = []
-    for i, out in enumerate(out_paths):
-        # sizes 为 PIL (width, height)
-        width, height = sizes[i]
-        # BEN2 单张路径：rgb_loader 把 size 拆成 h,w=image.size（实为宽、高），
-        # 再 postprocess_image(..., im_size=[w,h]) → 即 PyTorch 的 (H,W)=(height,width)
-        one = res[i : i + 1]
-        alpha = postprocess_image(one, im_size=[height, width])
-        mask = Image.fromarray(alpha).convert("L")
-        if mask.size != (width, height):
-            mask = mask.resize((width, height), resample=Image.BILINEAR)
+    for mask, out in zip(masks, out_paths):
         out.parent.mkdir(parents=True, exist_ok=True)
         mask.save(str(out), format="PNG")
+        w, h = mask.size
         results_meta.append(
-            {"ok": True, "size": [width, height], "output_kind": "mask"}
+            {"ok": True, "size": [w, h], "output_kind": "mask"}
         )
 
     return {
@@ -289,8 +309,11 @@ def _run_oneshot(args) -> int:
             args.weights_file or None,
             args.device,
         )
+        transform = _build_transform()
         meta = _infer_one(
             model,
+            device,
+            transform,
             args.input,
             args.output,
             bool(args.refine),
@@ -300,7 +323,7 @@ def _run_oneshot(args) -> int:
         _emit(meta)
         return 0
     except Exception as e:
-        print(f"BEN2 worker error: {e}", file=sys.stderr)
+        print(f"RMBG2 worker error: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         err = {"ok": False, "error": str(e)}
         if _is_oom(e):
@@ -316,8 +339,9 @@ def _run_serve(args) -> int:
             args.weights_file or None,
             args.device,
         )
+        transform = _build_transform()
     except Exception as e:
-        print(f"BEN2 worker error: {e}", file=sys.stderr)
+        print(f"RMBG2 worker error: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         _emit({"ok": False, "event": "ready", "error": str(e)})
         return 1
@@ -355,6 +379,7 @@ def _run_serve(args) -> int:
             refine = bool(req.get("refine", False))
             return_mask = bool(req.get("return_mask", True))
             if refine:
+                # 与 BEN2 一致：batch 路径不跑 refine（本模型本身无 refine）
                 _emit({
                     "ok": False,
                     "error": "infer_batch 不支持 refine，请逐张 infer",
@@ -371,11 +396,11 @@ def _run_serve(args) -> int:
                 _emit({"ok": False, "error": "infer_batch 需要非空 items"})
                 continue
             try:
-                meta = _infer_batch_masks(model, device, items)
+                meta = _infer_batch_masks(model, device, transform, items)
                 meta["device"] = device
                 _emit(meta)
             except Exception as e:
-                print(f"BEN2 worker infer_batch error: {e}", file=sys.stderr)
+                print(f"RMBG2 worker infer_batch error: {e}", file=sys.stderr)
                 traceback.print_exc(file=sys.stderr)
                 err = {"ok": False, "error": str(e), "oom": _is_oom(e)}
                 _emit(err)
@@ -394,12 +419,18 @@ def _run_serve(args) -> int:
             continue
         try:
             meta = _infer_one(
-                model, str(inp), str(outp), refine, return_mask=return_mask
+                model,
+                device,
+                transform,
+                str(inp),
+                str(outp),
+                refine,
+                return_mask=return_mask,
             )
             meta["device"] = device
             _emit(meta)
         except Exception as e:
-            print(f"BEN2 worker infer error: {e}", file=sys.stderr)
+            print(f"RMBG2 worker infer error: {e}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
             err = {"ok": False, "error": str(e), "oom": _is_oom(e)}
             _emit(err)
@@ -408,16 +439,20 @@ def _run_serve(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="BEN2 matting worker")
+    parser = argparse.ArgumentParser(description="RMBG-2.0 matting worker")
     parser.add_argument("--serve", action="store_true", help="常驻模式：stdin JSON 协议")
     parser.add_argument("--input", default="")
     parser.add_argument("--output", default="")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--refine", action="store_true")
+    parser.add_argument(
+        "--refine",
+        action="store_true",
+        help="协议兼容位；RMBG2 无独立边缘精炼，忽略",
+    )
     parser.add_argument(
         "--return-mask",
         action="store_true",
-        help="仅输出单通道 mask PNG（非 refine 时有效）",
+        help="仅输出单通道 mask PNG",
     )
     parser.add_argument("--weights-dir", default="")
     parser.add_argument("--weights-file", default="")

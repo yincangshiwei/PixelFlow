@@ -26,6 +26,18 @@ import config
 
 ProgressCb = Callable[[str, float, str], None]  # stage, percent, message
 
+# 默认 PyPI 镜像（仅用于本应用 `uv pip install -i …`，不改用户全局 pip/uv 配置）
+DEFAULT_PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+# 常用镜像快捷项（UI 下拉用）
+PIP_INDEX_PRESETS: tuple[tuple[str, str], ...] = (
+    ("清华大学", "https://pypi.tuna.tsinghua.edu.cn/simple"),
+    ("阿里云", "https://mirrors.aliyun.com/pypi/simple"),
+    ("中科大", "https://pypi.mirrors.ustc.edu.cn/simple"),
+    ("豆瓣", "https://pypi.douban.com/simple"),
+    ("官方 PyPI", "https://pypi.org/simple"),
+)
+
 
 # ── 数据结构 ──
 
@@ -167,6 +179,8 @@ def _import_name_for(pkg: str) -> str:
         "einops": "einops",
         "timm": "timm",
         "numpy": "numpy",
+        "kornia": "kornia",
+        "transformers": "transformers",
     }
     return import_map.get(pkg.lower(), pkg.replace("-", "_"))
 
@@ -281,6 +295,7 @@ class RuntimeManager:
         return {
             "python_path": "",
             "uv_path": "",
+            "pip_index_url": DEFAULT_PIP_INDEX_URL,
         }
 
     def save_settings(self):
@@ -305,6 +320,27 @@ class RuntimeManager:
         self._settings["uv_path"] = path.strip()
         self.save_settings()
         self.invalidate_caches(uv=True)
+
+    def get_pip_index_url(self) -> str:
+        """
+        返回安装依赖时使用的 PyPI 索引 URL。
+        空字符串表示不附加 -i（走 uv/pip 默认源）。
+        未配置时默认清华源。
+        """
+        if "pip_index_url" not in self._settings:
+            return DEFAULT_PIP_INDEX_URL
+        return str(self._settings.get("pip_index_url", "") or "").strip()
+
+    def set_pip_index_url(self, url: str):
+        self._settings["pip_index_url"] = (url or "").strip()
+        self.save_settings()
+
+    def pip_index_args(self) -> list[str]:
+        """供 `uv pip install` 使用的索引参数，如 ['-i', 'https://…/simple']。"""
+        url = self.get_pip_index_url()
+        if not url:
+            return []
+        return ["-i", url]
 
     def invalidate_caches(
         self,
@@ -952,7 +988,7 @@ sys.stdout.flush()
                 if progress:
                     progress(
                         model_id, 30,
-                        f"安装完整依赖（{len(packages)} 项，含 torch/ben2，可能较久）…",
+                        f"安装完整依赖（{len(packages)} 项，含 torch 等，可能较久）…",
                     )
                 # 分两批：先核心推理栈，再其余（便于定位失败点）
                 core = [p for p in packages if any(
@@ -964,6 +1000,12 @@ sys.stdout.flush()
                     batches = [packages]
                 done = 0
                 total = max(len(packages), 1)
+                index_args = self.pip_index_args()
+                if progress and index_args:
+                    progress(
+                        model_id, 28,
+                        f"使用 PyPI 镜像: {self.get_pip_index_url()}",
+                    )
                 for batch in batches:
                     if progress:
                         pct = 30 + int(50 * done / total)
@@ -972,6 +1014,7 @@ sys.stdout.flush()
                         uv.path, "pip", "install",
                         "--python", str(py),
                         "--upgrade",
+                        *index_args,
                         *batch,
                     ]
                     r = _run(cmd, timeout=None, cwd=env_dir)
@@ -1010,6 +1053,7 @@ sys.stdout.flush()
                     uv.path, "pip", "install",
                     "--python", str(py),
                     "--upgrade",
+                    *self.pip_index_args(),
                     *retry_specs,
                 ]
                 r = _run(cmd, timeout=None, cwd=env_dir)
@@ -1125,6 +1169,15 @@ sys.stdout.flush()
             lines.append(f"已保存选择: {saved}")
         lines.append("")
 
+        lines.append("— 依赖安装镜像（仅本应用 uv pip install -i）—")
+        idx = self.get_pip_index_url()
+        if idx:
+            lines.append(idx)
+        else:
+            lines.append("（未指定，使用 uv/pip 默认源）")
+        lines.append(f"默认推荐: {DEFAULT_PIP_INDEX_URL}")
+        lines.append("")
+
         lines.append("— 当前应用进程 —")
         lines.append(f"sys.executable: {sys.executable}")
         lines.append(f"frozen: {getattr(sys, 'frozen', False)}")
@@ -1134,6 +1187,7 @@ sys.stdout.flush()
             "说明: AI 抠图不在主程序进程内加载 torch，"
             "而是为每个模型维护独立 uv 环境，通过子进程调用 worker 脚本，"
             "这样打包 exe 体积不受影响，且不同模型依赖互不冲突。"
+            "安装依赖时使用上方镜像 -i，不会修改系统 pip/uv 全局配置。"
         )
         return "\n".join(lines)
 

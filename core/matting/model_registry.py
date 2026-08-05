@@ -33,8 +33,8 @@ class MattingModelInfo:
     extra: dict = field(default_factory=dict)
 
 
-# ── 已注册模型（目前仅 BEN2）──
-# 说明：依赖装在 runtime/envs/ben2/.venv，不进入主程序/打包体积
+# ── 已注册模型 ──
+# 说明：依赖装在 runtime/envs/<id>/.venv，不进入主程序/打包体积
 MATTING_MODELS: dict[str, MattingModelInfo] = {
     "ben2": MattingModelInfo(
         id="ben2",
@@ -72,7 +72,8 @@ MATTING_MODELS: dict[str, MattingModelInfo] = {
             "huggingface_hub",
             "safetensors",
             "modelscope",
-            "git+https://github.com/PramaLLC/BEN2.git",
+            # 使用 fork 仓库，避免上游删库导致安装失败
+            "git+https://github.com/yincangshiwei/BEN2.git",
         ),
         env_check_packages=(
             "torch",
@@ -92,6 +93,74 @@ MATTING_MODELS: dict[str, MattingModelInfo] = {
             "alt_weight_files": ("BEN2_Base.pth", "pytorch_model.bin"),
             "package": "ben2",
             "class_name": "BEN_Base",
+            "supports_refine": True,
+            "infer_size": 1024,
+        },
+    ),
+    "rmbg2": MattingModelInfo(
+        id="rmbg2",
+        name="RMBG 2.0",
+        description=(
+            "BRIA AI RMBG v2.0（BiRefNet），通用背景去除。"
+            "输出高质量 alpha matte，适合电商/广告/库存图；在独立 uv 环境中运行。"
+        ),
+        source="modelscope",
+        repo_id="briaai/RMBG-2.0",
+        page_url="https://www.modelscope.cn/models/briaai/RMBG-2.0",
+        weight_files=("model.safetensors",),
+        approx_size_mb=900,
+        min_ram_gb=8.0,
+        recommend_ram_gb=16.0,
+        min_vram_gb=0.0,
+        recommend_vram_gb=6.0,
+        supports_cpu=True,
+        supports_cuda=True,
+        notes=(
+            "固定 1024×1024 推理；消费级 GPU 建议 batch≤2（显存≥8GB 可试 3）。"
+            "无 BEN2 式边缘精炼；非商用 CC BY-NC 4.0，商用需向 BRIA 取得许可。"
+            "依赖通过「配置环境」安装到独立 venv，与主程序隔离。"
+        ),
+        python_version="3.12",
+        env_packages=(
+            "torch",
+            "torchvision",
+            "numpy",
+            "Pillow",
+            "kornia",
+            "transformers",
+            "huggingface_hub",
+            "safetensors",
+            "modelscope",
+        ),
+        env_check_packages=(
+            "torch",
+            "torchvision",
+            "numpy",
+            "pillow",
+            "kornia",
+            "transformers",
+            "safetensors",
+            "huggingface_hub",
+            "modelscope",
+        ),
+        worker_script="rmbg2_worker.py",
+        extra={
+            "alt_weight_files": ("pytorch_model.bin",),
+            "package": "transformers",
+            "class_name": "AutoModelForImageSegmentation",
+            "supports_refine": False,
+            "infer_size": 1024,
+            # 仓库可能含 ONNX/示例图，下载时忽略以减小体积
+            "download_ignore_patterns": (
+                "*.onnx",
+                "*.onnx_data",
+                "onnx/*",
+                "*.png",
+                "*.jpg",
+                "*.jpeg",
+                "*.gif",
+                "*.webp",
+            ),
         },
     ),
 }

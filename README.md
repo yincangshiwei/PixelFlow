@@ -2,6 +2,8 @@
 
 一款基于 PySide6 的桌面图像处理工具，采用插件化架构，支持多种图像处理功能的灵活扩展，支持单图和批量处理。
 
+> **技术实现说明**见根目录 [TECHNICAL.md](TECHNICAL.md)（架构、AI 抠图、批处理、扩展方式等）。
+
 ---
 
 ## 界面截图
@@ -189,7 +191,7 @@ core/
 
 | 步骤 | 参数 | 说明 |
 |------|------|------|
-| **AI 抠图** | 模型、边缘精炼 | 使用本地 AI 去除背景；当前 **BEN2**（[ModelScope](https://www.modelscope.cn/models/PramaLLC/BEN2)）。依赖装在独立 uv 环境，主程序通过子进程调用；需先在配置页安装 uv、创建环境并下载权重 |
+| **AI 抠图** | 模型、边缘精炼 | 使用本地 AI 去除背景；可选 **BEN2**（[ModelScope](https://www.modelscope.cn/models/PramaLLC/BEN2)）、**RMBG 2.0**（[ModelScope](https://www.modelscope.cn/models/briaai/RMBG-2.0)）。每模型独立 uv 环境，主程序通过子进程调用；需先在配置页安装 uv、创建环境并下载权重。边缘精炼仅 BEN2 支持 |
 | **裁剪透明边缘** | Alpha 阈值 (0-254) | 去除四周多余透明空间。阈值为 0 表示仅裁剪完全透明像素；调高可忽略半透明边缘 |
 | **画布与主体布局** | 画布宽高、背景、主体占比、细节恢复 | 类似智能对象：裁剪后的全分辨率主体作源，导出时预乘 Alpha 后一次栅格化到画布；主体等比完整放入画布百分比安全框并居中 |
 
@@ -205,16 +207,17 @@ core/
 |------|------|
 | **系统 Python** | 自动扫描本机 3.10–3.12（64 位），可手动指定 `python.exe` |
 | **uv** | 可一键下载安装到 `runtime/uv/`（也可使用 PATH 中已有 uv） |
+| **依赖安装镜像** | 默认清华大学 PyPI 源；创建模型环境时自动 `uv pip install -i <镜像>`，不改用户全局 pip/uv 配置，可自行修改或留空 |
 | **隔离策略** | 主程序 / 打包 exe **不内嵌** torch；每个 AI 模型一个 venv |
 
 #### 抠图模型配置
 
 | 能力 | 说明 |
 |------|------|
-| **模型选择** | 当前 BEN2；推理设备自动 / CUDA / CPU |
+| **模型选择** | **BEN2** / **RMBG 2.0**；推理设备自动 / CUDA / CPU |
 | **创建/修复环境** | `uv venv` + `uv pip install` 到 `runtime/envs/<model_id>/.venv` |
-| **权重下载** | ModelScope `PramaLLC/BEN2` → `models/matting/ben2/`；或指定本地路径 |
-| **推理方式** | 子进程执行 `core/matting/workers/ben2_worker.py`（在该模型 venv 的 Python 中） |
+| **权重下载** | ModelScope → `models/matting/<id>/`（BEN2：`PramaLLC/BEN2`；RMBG2：`briaai/RMBG-2.0`）；或指定本地路径 |
+| **推理方式** | 子进程执行 `core/matting/workers/<model>_worker.py`（在该模型 venv 的 Python 中） |
 | **电脑配置检测** | CPU / 内存 / GPU，评估是否适合运行 |
 
 **推荐准备顺序：** 开发环境检测 Python → 安装 uv → 抠图模型「创建/修复环境」→ 下载权重 → 透明图处理勾选 AI 抠图。

@@ -319,9 +319,25 @@ class MattingModelManager:
             progress(meta.id, 5, f"连接 ModelScope: {meta.repo_id}")
 
         local_dir = str(target)
+        ignore = list(meta.extra.get("download_ignore_patterns") or ())
+        # 在隔离环境内执行，兼容 ignore_file_pattern 有/无 的 modelscope 版本
         code = (
             "from modelscope.hub.snapshot_download import snapshot_download\n"
-            f"snapshot_download(model_id={meta.repo_id!r}, local_dir={local_dir!r})\n"
+            f"repo={meta.repo_id!r}\n"
+            f"local_dir={local_dir!r}\n"
+            f"ignore={ignore!r}\n"
+            "kwargs={'model_id': repo, 'local_dir': local_dir}\n"
+            "if ignore:\n"
+            "    kwargs['ignore_file_pattern'] = ignore\n"
+            "try:\n"
+            "    snapshot_download(**kwargs)\n"
+            "except TypeError:\n"
+            "    kwargs.pop('ignore_file_pattern', None)\n"
+            "    try:\n"
+            "        snapshot_download(**kwargs)\n"
+            "    except TypeError:\n"
+            "        path = snapshot_download(repo, cache_dir=local_dir)\n"
+            "        print('CACHE', path)\n"
             "print('OK')\n"
         )
 
@@ -349,20 +365,29 @@ class MattingModelManager:
                 ) from e
             if progress:
                 progress(meta.id, 15, "通过主进程 modelscope 下载…")
+            kwargs = {"model_id": meta.repo_id, "local_dir": local_dir}
+            if ignore:
+                kwargs["ignore_file_pattern"] = ignore
             try:
-                snapshot_download(model_id=meta.repo_id, local_dir=local_dir)
+                snapshot_download(**kwargs)
             except TypeError:
-                path = snapshot_download(meta.repo_id, cache_dir=str(target.parent))
-                src = Path(path)
-                if src.resolve() != target.resolve() and src.is_dir():
-                    for name in meta.weight_files:
-                        sp = src / name
-                        if sp.is_file():
-                            shutil.copy2(sp, target / name)
-                    for name in meta.extra.get("alt_weight_files", ()):
-                        sp = src / name
-                        if sp.is_file() and not (target / name).exists():
-                            shutil.copy2(sp, target / name)
+                kwargs.pop("ignore_file_pattern", None)
+                try:
+                    snapshot_download(**kwargs)
+                except TypeError:
+                    path = snapshot_download(
+                        meta.repo_id, cache_dir=str(target.parent)
+                    )
+                    src = Path(path)
+                    if src.resolve() != target.resolve() and src.is_dir():
+                        for name in meta.weight_files:
+                            sp = src / name
+                            if sp.is_file():
+                                shutil.copy2(sp, target / name)
+                        for name in meta.extra.get("alt_weight_files", ()):
+                            sp = src / name
+                            if sp.is_file() and not (target / name).exists():
+                                shutil.copy2(sp, target / name)
 
         if progress:
             progress(meta.id, 90, f"文件已保存到 {local_dir}")

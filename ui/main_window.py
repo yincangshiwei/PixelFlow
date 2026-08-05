@@ -1558,6 +1558,8 @@ class MainWindow(QMainWindow):
             self._log(f"▶ {action}: {icon}  {proc.name}  共 {count} 个文件")
             self._log(f"输出: {mode_names[sess.path_mode_id]}  →  {output_dir}")
             self._log(f"参数: 沿用该批次快照")
+            if options.get("enable_matting"):
+                self._log(self._format_matting_start_log(options))
             self._log(f"开始时间: {start_text}")
             self._log("─" * 50)
 
@@ -1696,6 +1698,9 @@ class MainWindow(QMainWindow):
                 self._log(f"保留目录结构: 是（{len(rel_map)} 个文件含相对路径）")
             if not supports:
                 self._log("说明: 当前为批量合并功能，不支持中途续跑/按文件重试")
+            # AI 抠图开启时，启动摘要先写一版（Worker 内会再写设备/batch 实测值）
+            if options.get("enable_matting"):
+                self._log(self._format_matting_start_log(options))
             self._log(f"开始时间: {start_text}")
             self._log("─" * 50)
             self.worker = ProcessWorker(
@@ -1850,7 +1855,21 @@ class MainWindow(QMainWindow):
             parts = [f"✓ {name}"]
             if "matting_model" in d:
                 refine = "+精炼" if d.get("matting_refine") else ""
-                parts.append(f"抠图→{d['matting_model']}{refine}")
+                batch_n = d.get("matting_batch")
+                dev = str(d.get("matting_device") or "").upper()
+                path = d.get("matting_path") or ""
+                matting_bits = [f"抠图→{d['matting_model']}{refine}"]
+                if batch_n:
+                    matting_bits.append(f"batch={batch_n}")
+                if dev:
+                    matting_bits.append(dev)
+                if path == "mask_prescale":
+                    matting_bits.append("mask")
+                elif path == "refine_rgba":
+                    matting_bits.append("精炼全尺寸")
+                if d.get("matting_pipeline"):
+                    matting_bits.append("流水线")
+                parts.append(" · ".join(matting_bits))
             if "trimmed_size" in d:
                 parts.append(f"裁剪→{d['trimmed_size'][0]}×{d['trimmed_size'][1]}")
             if "layout_display_size" in d:
@@ -2023,6 +2042,31 @@ class MainWindow(QMainWindow):
         # 自然结束且有失败：提示可用底部「重试失败」
         lines.append("可查看后台日志；失败项可用底部「重试失败」重新处理。")
         QMessageBox.warning(self, "完成", "\n".join(lines))
+
+    @staticmethod
+    def _format_matting_start_log(options: dict) -> str:
+        """点击开始时写 AI 抠图摘要（含配置里的推理设备偏好）。"""
+        mid = options.get("matting_model", "ben2")
+        refine = bool(options.get("matting_refine", False))
+        try:
+            from core.matting.model_manager import get_matting_manager
+            pref = (
+                get_matting_manager().get_device_preference() or "auto"
+            ).lower()
+        except Exception:
+            pref = "auto"
+        labels = {
+            "auto": "自动(优先GPU)",
+            "cuda": "CUDA(GPU)",
+            "cpu": "CPU",
+        }
+        pref_desc = labels.get(pref, pref)
+        return (
+            f"AI 抠图: 已开启  模型={mid}  "
+            f"推理设备={pref_desc}  "
+            f"边缘精炼={'开' if refine else '关'}  "
+            f"（实际运行设备与 batch 见处理线程日志）"
+        )
 
     def _log(self, text: str):
         self.log_text.append(text)

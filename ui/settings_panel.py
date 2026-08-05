@@ -21,7 +21,13 @@ from core.matting.hardware import detect_hardware, evaluate_model, HardwareInfo
 from core.matting.model_manager import get_matting_manager
 from core.matting.model_registry import list_models, get_model_info
 from core.matting.inference import clear_model_cache
-from core.runtime.env_manager import get_runtime_manager, UvInfo, ModelEnvStatus
+from core.runtime.env_manager import (
+    get_runtime_manager,
+    UvInfo,
+    ModelEnvStatus,
+    DEFAULT_PIP_INDEX_URL,
+    PIP_INDEX_PRESETS,
+)
 
 
 def _get_desktop_path() -> str:
@@ -241,6 +247,52 @@ class SettingsPanel(QWidget):
         gu.addWidget(self.lbl_dev_msg)
         lay.addWidget(grp_uv)
 
+        # PyPI 镜像（仅本应用 uv pip install -i，不改用户全局配置）
+        grp_mirror = QGroupBox("依赖安装镜像源")
+        gm = QVBoxLayout(grp_mirror)
+        gm.setSpacing(8)
+        mirror_tip = QLabel(
+            "创建/修复模型环境时，会在 <b>uv pip install</b> 命令上自动附加 "
+            "<code>-i &lt;镜像地址&gt;</code>。"
+            "仅影响本应用安装依赖，不会修改你系统里的 pip / uv 全局配置。"
+        )
+        mirror_tip.setWordWrap(True)
+        mirror_tip.setStyleSheet("color:#8a90b0;font-size:12px;")
+        gm.addWidget(mirror_tip)
+
+        m_row = QHBoxLayout()
+        m_row.addWidget(QLabel("快捷选择:"))
+        self.combo_pip_preset = QComboBox()
+        self.combo_pip_preset.setStyleSheet(config.COMBOBOX_STYLE)
+        self.combo_pip_preset.setMinimumWidth(140)
+        for name, url in PIP_INDEX_PRESETS:
+            self.combo_pip_preset.addItem(name, url)
+        self.combo_pip_preset.addItem("自定义 / 官方默认", "")
+        self.combo_pip_preset.currentIndexChanged.connect(self._on_pip_preset_changed)
+        m_row.addWidget(self.combo_pip_preset)
+        m_row.addWidget(QLabel("索引 URL:"))
+        self.edit_pip_index = QLineEdit()
+        self.edit_pip_index.setPlaceholderText(
+            "例如 https://pypi.tuna.tsinghua.edu.cn/simple；留空=不指定 -i"
+        )
+        self.edit_pip_index.setMinimumWidth(280)
+        m_row.addWidget(self.edit_pip_index, 1)
+        self.btn_save_pip_index = QPushButton("保存镜像")
+        self.btn_save_pip_index.clicked.connect(self._save_pip_index)
+        m_row.addWidget(self.btn_save_pip_index)
+        self.btn_reset_pip_index = QPushButton("恢复默认")
+        self.btn_reset_pip_index.setToolTip(f"恢复为清华源\n{DEFAULT_PIP_INDEX_URL}")
+        self.btn_reset_pip_index.clicked.connect(self._reset_pip_index)
+        m_row.addWidget(self.btn_reset_pip_index)
+        gm.addLayout(m_row)
+
+        self.lbl_pip_index_hint = QLabel("")
+        self.lbl_pip_index_hint.setWordWrap(True)
+        self.lbl_pip_index_hint.setStyleSheet("color:#8a90b0;font-size:12px;")
+        gm.addWidget(self.lbl_pip_index_hint)
+        lay.addWidget(grp_mirror)
+        self._load_pip_index_ui()
+
         # 诊断
         grp_diag = QGroupBox("环境诊断")
         gd = QVBoxLayout(grp_diag)
@@ -320,6 +372,11 @@ class SettingsPanel(QWidget):
         self.combo_device.addItem("CPU", "cpu")
         self.combo_device.currentIndexChanged.connect(self._on_device_changed)
         row1.addWidget(self.combo_device)
+        # 随推理设备切换，只显示当前模式的最低配置（不占纵向空间）
+        self.lbl_device_req = QLabel("")
+        self.lbl_device_req.setStyleSheet("color:#8a90b0;font-size:12px;")
+        self.lbl_device_req.setToolTip("当前推理设备对应的最低配置要求")
+        row1.addWidget(self.lbl_device_req)
         row1.addStretch()
         gm.addLayout(row1)
 
@@ -347,7 +404,8 @@ class SettingsPanel(QWidget):
         ge.setSpacing(8)
         env_tip = QLabel(
             "每个模型使用独立虚拟环境，避免依赖版本冲突。"
-            "创建环境会安装 torch / ben2 等，体积较大、耗时较长，请保持网络畅通。"
+            "创建环境会安装 torch 及对应模型依赖（如 BEN2 / transformers 等），"
+            "体积较大、耗时较长，请保持网络畅通。"
             "进度详情请查看「后台日志」。"
         )
         env_tip.setWordWrap(True)
@@ -590,6 +648,7 @@ class SettingsPanel(QWidget):
 
     def _apply_dev_snapshot(self, pys, uv: UvInfo, diag: str):
         self._dev_loaded = True
+        self._load_pip_index_ui()
         saved = self._rt.get_saved_python_path()
         self.combo_python.blockSignals(True)
         self.combo_python.clear()
@@ -680,6 +739,8 @@ class SettingsPanel(QWidget):
             self.lbl_model_desc.setText("")
             self.lbl_size.setText("")
 
+        self._update_device_req_hint()
+
         w_ready = mgr.is_ready(mid)
         w_text = mgr.status_text(mid)
         w_color = "#6dcea0" if w_ready else "#e0a060"
@@ -716,7 +777,7 @@ class SettingsPanel(QWidget):
             self.lbl_env_msg.setText(f"等待切换校验模型 {mid} …")
             return
         self._pending_env_check_id = None
-        self.lbl_env_msg.setText("正在后台校验完整依赖（torch / ben2 等）…")
+        self.lbl_env_msg.setText("正在后台校验完整依赖（torch 及模型包等）…")
         # 切换模型时重置「已校验」标记，确保每个模型单独检查
         self._env_verified_once = False
         worker = _EnvCheckWorker(mid, None, parent=self)
@@ -804,6 +865,88 @@ class SettingsPanel(QWidget):
         self._rt.set_python_path(path)
         QMessageBox.information(self, "已保存", f"已设为默认基础 Python:\n{path}")
         self._schedule_dev_refresh(force=True)
+
+    def _load_pip_index_ui(self):
+        """从 runtime_settings 回填镜像源控件。"""
+        if not hasattr(self, "edit_pip_index"):
+            return
+        url = self._rt.get_pip_index_url()
+        self.edit_pip_index.blockSignals(True)
+        self.edit_pip_index.setText(url)
+        self.edit_pip_index.blockSignals(False)
+
+        self.combo_pip_preset.blockSignals(True)
+        matched = False
+        for i in range(self.combo_pip_preset.count()):
+            if (self.combo_pip_preset.itemData(i) or "") == url:
+                self.combo_pip_preset.setCurrentIndex(i)
+                matched = True
+                break
+        if not matched:
+            # 自定义 URL：选中「自定义」项
+            for i in range(self.combo_pip_preset.count()):
+                if self.combo_pip_preset.itemData(i) == "":
+                    self.combo_pip_preset.setCurrentIndex(i)
+                    break
+        self.combo_pip_preset.blockSignals(False)
+        self._update_pip_index_hint()
+
+    def _on_pip_preset_changed(self, _idx: int = 0):
+        url = self.combo_pip_preset.currentData()
+        # 选预设时写入输入框；选「自定义」不覆盖用户正在编辑的内容（除非当前为空）
+        if url:
+            self.edit_pip_index.setText(str(url))
+        self._update_pip_index_hint()
+
+    def _update_pip_index_hint(self):
+        if not hasattr(self, "lbl_pip_index_hint"):
+            return
+        url = (self.edit_pip_index.text() or "").strip()
+        if url:
+            self.lbl_pip_index_hint.setText(
+                f"安装依赖时将附加: uv pip install -i {url} …"
+            )
+        else:
+            self.lbl_pip_index_hint.setText(
+                "当前未指定镜像：安装时不附加 -i，使用 uv/pip 默认源。"
+            )
+
+    def _save_pip_index(self):
+        url = (self.edit_pip_index.text() or "").strip()
+        if url and not (
+            url.startswith("http://") or url.startswith("https://")
+        ):
+            QMessageBox.warning(
+                self, "无效地址",
+                "镜像地址需以 http:// 或 https:// 开头，或留空表示不使用 -i。",
+            )
+            return
+        self._rt.set_pip_index_url(url)
+        self._load_pip_index_ui()
+        if url:
+            QMessageBox.information(
+                self, "已保存",
+                f"已保存依赖安装镜像源:\n{url}\n\n"
+                "下次「创建/修复环境」时将自动使用 -i 该地址。",
+            )
+        else:
+            QMessageBox.information(
+                self, "已保存",
+                "已清空镜像源：安装依赖时不附加 -i。",
+            )
+        # 刷新诊断文本中的镜像行
+        if hasattr(self, "txt_diag"):
+            self.txt_diag.setPlainText(self._rt.diagnose_text())
+
+    def _reset_pip_index(self):
+        self._rt.set_pip_index_url(DEFAULT_PIP_INDEX_URL)
+        self._load_pip_index_ui()
+        if hasattr(self, "txt_diag"):
+            self.txt_diag.setPlainText(self._rt.diagnose_text())
+        QMessageBox.information(
+            self, "已恢复默认",
+            f"已恢复为清华大学源:\n{DEFAULT_PIP_INDEX_URL}",
+        )
 
     def _install_uv(self):
         if self._rt.is_busy:
@@ -940,6 +1083,58 @@ class SettingsPanel(QWidget):
         dev = self.combo_device.currentData() or "auto"
         self._mgr.set_device_preference(dev)
         clear_model_cache()
+        self._update_device_req_hint()
+
+    @staticmethod
+    def _fmt_gb(value: float) -> str:
+        """8.0 → 8；4.5 → 4.5"""
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return "?"
+        if abs(v - round(v)) < 1e-6:
+            return str(int(round(v)))
+        return f"{v:.1f}"
+
+    def _update_device_req_hint(self):
+        """按当前推理设备，只显示对应模式的最低配置（一行简短提示）。"""
+        mid = self._current_model_id()
+        meta = get_model_info(mid)
+        dev = self.combo_device.currentData() or "auto"
+        if meta is None:
+            self.lbl_device_req.setText("")
+            self.lbl_device_req.setToolTip("")
+            return
+
+        ram_min = self._fmt_gb(meta.min_ram_gb)
+        ram_rec = self._fmt_gb(meta.recommend_ram_gb)
+        # GPU 侧以推荐显存为主（min_vram 可能为 0 表示允许 CPU）
+        vram_show = meta.recommend_vram_gb if meta.recommend_vram_gb > 0 else meta.min_vram_gb
+        vram_txt = self._fmt_gb(vram_show)
+
+        if dev == "cpu":
+            text = f"最低配置：内存 ≥ {ram_min}GB"
+            tip = (
+                f"CPU 推理：系统内存建议 ≥ {ram_min}GB（推荐 {ram_rec}GB）。"
+                "速度较慢，适合无独显或显存不足时使用。"
+            )
+        elif dev == "cuda":
+            text = f"最低配置：显存 ≥ {vram_txt}GB"
+            tip = (
+                f"GPU 推理：建议 NVIDIA 显存 ≥ {vram_txt}GB；"
+                f"系统内存建议 ≥ {ram_min}GB。"
+                "需隔离环境中安装支持 CUDA 的 PyTorch。"
+            )
+        else:
+            # auto：优先 GPU，只提示主路径，避免同时堆 CPU/GPU 两套说明
+            text = f"最低配置：显存 ≥ {vram_txt}GB（优先 GPU）"
+            tip = (
+                f"自动模式优先使用 GPU（建议显存 ≥ {vram_txt}GB）；"
+                f"无可用 GPU 时回退 CPU（内存 ≥ {ram_min}GB）。"
+            )
+
+        self.lbl_device_req.setText(text)
+        self.lbl_device_req.setToolTip(tip)
 
     def _browse_custom_path(self):
         start = self.txt_custom_path.text().strip() or _get_desktop_path()

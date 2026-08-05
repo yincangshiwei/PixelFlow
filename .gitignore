@@ -15,8 +15,9 @@ presets/
 # ── AI 抠图模型权重（体积大，本地下载）──
 models/
 
-# ── AI 运行时（uv 工具 + 每模型独立 venv）──
-runtime/
+# ── AI 运行时数据（仅项目根目录：uv 工具 + 每模型独立 venv + settings）──
+# 必须用 /runtime/ 锚定根目录，否则会误忽略源码包 core/runtime/
+/runtime/
 
 # ── IDE / 工具 ──
 .codebuddy/*

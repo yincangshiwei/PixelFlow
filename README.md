@@ -428,7 +428,8 @@ PixelFlow/
 
 ## 环境要求
 
-- Python 3.12+
+- **操作系统**：Windows 10/11，或 macOS 12+（Apple Silicon / Intel 均可）
+- Python 3.12+（开发运行）；AI 抠图另需本机可调用的 CPython 3.10–3.12（64 位）
 - PySide6 < 6.9
 - Pillow >= 10.0
 - python-pptx >= 0.6（图片排版导出 PPT）
@@ -437,23 +438,53 @@ PixelFlow/
 - openpyxl >= 3.1（Excel 排序功能）
 - **AI 抠图（可选）**：需本机 Python 3.10–3.12（64 位）+ 软件内安装的 **uv**；依赖由配置页自动装入 `runtime/envs/`，无需写入主程序 `requirements.txt`
 
+> 主程序依赖均为跨平台库。核心图像处理、排版导出、叠加、元数据、AI 抠图（子进程 + uv 隔离环境）在 macOS 上均可使用。个别体验差异见下文「macOS 说明」。
+
 ## 安装与运行
 
+开发运行在 Windows / macOS 上步骤相同：
+
 ```bash
+# 建议使用虚拟环境
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+
+# macOS / Linux
+source .venv/bin/activate
+
 pip install -r requirements.txt
 python app.py
 ```
+
+### macOS 开发补充
+
+一般**无需**额外系统库即可开发运行。若启动时报 Qt 平台插件相关错误，确认使用的是虚拟环境内的 PySide6，且未混用多个 Python 安装。
+
+| 项目 | 说明 |
+|------|------|
+| 解释器 | 推荐官方 python.org 或 Homebrew 的 Python 3.12；配置页选择解释器时选 `python3`（不是 `python.exe`） |
+| AI 抠图 | 与 Windows 相同：配置 → 开发环境（检测 Python / 安装 uv）→ 抠图模型配置（创建环境、下载权重） |
+| GPU | macOS 无 CUDA；抠图设备选「自动 / CPU」即可（视 PyTorch 与机型而定，可能使用 MPS/CPU） |
+| 桌面路径 | 界面默认「桌面」按 `~/Desktop` 解析；若系统桌面文件夹名为「桌面」且路径异常，可改用「自定义路径」 |
+| 中文字体 | 图片叠加内置字体名偏 Windows（如微软雅黑）；可用「加载外部字体」选择 `.ttf/.otf/.ttc`，或依赖自动回退 |
+| 元数据「标记」 | 写入的是文件内 EXIF/PNG 字段；Finder 展示方式可能与 Windows 资源管理器不同 |
 
 ---
 
 ## 打包与分发
 
-### 方式一：打包为可执行程序（免安装）
+> **重要：** PyInstaller **不能跨平台交叉编译**。Windows 安装包必须在 Windows 上构建；macOS 应用必须在 **Mac 本机**（或 macOS CI）上构建。
 
-使用 PyInstaller 将项目打包为独立 exe，用户无需安装 Python 环境。
+### Windows
+
+#### 方式一：打包为可执行程序（免安装）
+
+使用 PyInstaller 将项目打包为独立目录，用户无需安装 Python。
 
 ```bash
-# 安装打包依赖
+# 安装打包依赖（requirements.txt 已包含 pyinstaller 时可跳过）
 pip install pyinstaller
 
 # 一键打包
@@ -462,7 +493,7 @@ python build.py
 
 打包完成后，输出目录为 `dist/PixelFlow/`，直接运行其中的 `PixelFlow.exe` 即可。
 
-### 方式二：生成 Windows 安装包
+#### 方式二：生成 Windows 安装包
 
 在方式一的基础上，使用 Inno Setup 6 生成标准 Windows 安装程序（`.exe` 安装包）。
 
@@ -473,7 +504,7 @@ python build.py --installer
 
 安装包输出到 `dist/installer/PixelFlow_Setup_x.x.x.exe`。
 
-#### Inno Setup 安装
+##### Inno Setup 安装
 
 项目根目录已附带 **`innosetup-6.7.1.exe`**（Inno Setup 官方安装程序）和 **`ChineseSimplified.isl`**（简体中文语言包），无需另行下载：
 
@@ -493,17 +524,97 @@ python build.py --installer
 > set ISCC=你的安装路径\ISCC.exe
 > ```
 
+### macOS
+
+当前仓库的 `build.py` / `PixelFlow.spec` **以 Windows 一键打包为主**（会校验 `qwindows.dll`，`--installer` 调用 Inno Setup）。在 Mac 上请按下面步骤**本机**打包；不要使用 `python build.py --installer`。
+
+#### 1. 准备环境
+
+```bash
+cd /path/to/PixelFlow
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+确认 GUI 可运行：
+
+```bash
+python app.py
+```
+
+#### 2. 使用 PyInstaller 打包
+
+`requirements.txt` 已包含 PyInstaller。推荐在 Mac 上直接调用（可先复制并微调 spec，避免 Windows 专用校验逻辑）：
+
+```bash
+# 目录模式（onedir）：生成 dist/PixelFlow/，内含可执行文件 PixelFlow
+pyinstaller --noconfirm --clean PixelFlow.spec
+```
+
+打包要点：
+
+| 项 | 说明 |
+|----|------|
+| Qt 平台插件 | macOS 需要 Cocoa 插件（`libqcocoa.dylib`），不是 Windows 的 `qwindows.dll`。`PixelFlow.spec` 会从当前环境的 PySide6 收集 `plugins/platforms` 等目录；**请在 Mac 的 venv 中打包**，即可带上正确插件 |
+| 图标 | 仓库默认 `resources/app.ico` 面向 Windows；正式分发建议另备 `resources/app.icns`，并在 spec 的 `EXE`/`BUNDLE` 中指定 |
+| 输出形态 | 默认 spec 为 **onedir**（`COLLECT`）。若需要双击即用的 **`PixelFlow.app`**，在 spec 末尾增加 `BUNDLE(...)`（PyInstaller 文档：macOS .app bundles），或增加一条仅用于 macOS 的 spec |
+| AI 运行时 | 与 Windows 相同：**不要**把 torch 打进主包；用户首次使用抠图时在「配置」中安装 uv、创建模型环境并下载权重（写入应用旁的 `runtime/`、`models/`） |
+
+运行目录模式产物：
+
+```bash
+open dist/PixelFlow/PixelFlow
+# 或
+./dist/PixelFlow/PixelFlow
+```
+
+若已生成 `.app`：
+
+```bash
+open dist/PixelFlow.app
+```
+
+#### 3. 制作 DMG（可选，便于分发）
+
+```bash
+# 若已有 PixelFlow.app
+hdiutil create -volname PixelFlow -srcfolder dist/PixelFlow.app -ov -format UDZO dist/PixelFlow.dmg
+```
+
+也可使用 [create-dmg](https://github.com/create-dmg/create-dmg) 制作带拖拽安装界面的 DMG。
+
+#### 4. 代码签名与公证（对外分发建议）
+
+未签名的应用在其他 Mac 上可能被 Gatekeeper 拦截（「无法验证开发者」）。向他人分发时建议：
+
+1. 加入 [Apple Developer Program](https://developer.apple.com/)
+2. 对 `.app` 使用 `codesign` 签名
+3. 使用 `notarytool` 公证，再 `stapler staple` 装订票据
+
+仅自己本机使用时，可在「系统设置 → 隐私与安全性」中允许打开，或右键 → 打开。
+
+#### 5. macOS 安装与使用说明（给最终用户）
+
+| 方式 | 说明 |
+|------|------|
+| 目录包 | 解压/拷贝整个 `PixelFlow` 文件夹，运行其中的 `PixelFlow` |
+| `.app` / DMG | 打开 DMG，将 `PixelFlow.app` 拖到「应用程序」或任意目录后启动 |
+| AI 抠图 | 首次使用前在应用内完成：开发环境（Python + uv）→ 模型环境与权重下载 |
+| 升级 | 替换 `.app` 或目录即可；`presets/`、`runtime/`、`models/` 若放在用户数据目录需自行保留（以实际运行路径为准） |
+
 ### 打包相关文件
 
 | 文件 | 说明 |
 |------|------|
 | `config.py` | **唯一信源** — 应用名称、版本、描述、路径等全局配置 |
-| `PixelFlow.spec` | PyInstaller 打包配置，从 `config.py` 读取应用名 |
-| `installer.iss.template` | Inno Setup 模板，占位符由 `build.py` 自动替换生成 `installer.iss` |
+| `PixelFlow.spec` | PyInstaller 打包配置，从 `config.py` 读取应用名（Windows 为主；macOS 可在本机直接使用或按需改为 BUNDLE） |
+| `installer.iss.template` | Inno Setup 模板，占位符由 `build.py` 自动替换生成 `installer.iss`（**仅 Windows**） |
 | `installer.iss` | 由 `build.py` 生成的实际打包脚本（不纳入版本控制） |
 | `ChineseSimplified.isl` | Inno Setup 简体中文语言文件，需手动复制到 Inno Setup 的 `Languages/` 目录 |
-| `innosetup-6.7.1.exe` | Inno Setup 安装程序，随项目附带方便离线安装 |
-| `build.py` | 自动化打包脚本，从 `config.py` 读取所有元信息，支持 `--installer` 和 `--clean` |
+| `innosetup-6.7.1.exe` | Inno Setup 安装程序，随项目附带方便离线安装（**仅 Windows**） |
+| `build.py` | Windows 自动化打包脚本（`python build.py` / `--installer` / `--clean`）；**macOS 请用上文 PyInstaller 步骤** |
+| `packaging/rthook_pyside6.py` | 运行时设置 `QT_PLUGIN_PATH`，Windows / macOS 打包后均有助于找到 Qt 插件 |
 
 ### 版本更新
 
@@ -521,6 +632,7 @@ APP_PUBLISHER = "PixelFlow"
 
 ```bash
 python build.py --clean
+# 或手动删除 build/、dist/
 ```
 
 ---

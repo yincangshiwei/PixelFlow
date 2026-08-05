@@ -100,11 +100,19 @@ class ProcessWorker(QThread):
         finally:
             # 必须先释放 AI 抠图常驻子进程，再让 QThread 发出 finished。
             # 完成弹窗和 QThread 引用清理统一由主线程在 finished 后执行。
+            # 常驻 worker 仅在本批处理期间保活；结束后 shutdown 释放 GPU/内存。
             try:
                 from core.matting.inference import shutdown_matting_workers
+                if bool(self.options.get("enable_matting")):
+                    self.debug.emit("AI 抠图: 正在卸载模型并释放显存/内存…")
                 shutdown_matting_workers()
-            except Exception:
-                pass
+                if bool(self.options.get("enable_matting")):
+                    self.debug.emit("AI 抠图: 模型已卸载")
+            except Exception as e:
+                try:
+                    self.debug.emit(f"AI 抠图: 卸载时异常（可忽略）: {e}")
+                except Exception:
+                    pass
 
     def _run_impl(self):
         out_dir = Path(self.output_dir)

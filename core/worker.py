@@ -64,6 +64,7 @@ class ProcessWorker(QThread):
                  processor: BaseProcessor, options: dict,
                  auto_subfolder: bool = True, overwrite: bool = False,
                  rel_path_map: dict | None = None,
+                 file_index_map: dict | None = None,
                  parent=None):
         super().__init__(parent)
         self.file_list = file_list
@@ -73,12 +74,39 @@ class ProcessWorker(QThread):
         self.auto_subfolder = auto_subfolder
         self.overwrite = overwrite
         self.rel_path_map = rel_path_map or {}
+        # 续跑/重试时保持原批次序号（重命名、_image_index）
+        self.file_index_map = file_index_map or {}
         self._cancelled = False
+        self._current_path: str | None = None
+        self.results: list[ProcessResult] = []
 
     def cancel(self):
+        # 只设置取消标记。常驻抠图进程由 run() 所在线程统一关闭，
+        # 避免 GUI 线程与正在读写管道的工作线程并发销毁子进程。
         self._cancelled = True
 
+    @property
+    def current_path(self) -> str | None:
+        return self._current_path
+
     def run(self):
+        try:
+            self.results = self._run_impl()
+        except Exception as e:
+            self.debug.emit("处理线程发生未捕获异常:\n" + traceback.format_exc())
+            self.results = [
+                ProcessResult(input_path="批量处理", success=False, error=str(e))
+            ]
+        finally:
+            # 必须先释放 AI 抠图常驻子进程，再让 QThread 发出 finished。
+            # 完成弹窗和 QThread 引用清理统一由主线程在 finished 后执行。
+            try:
+                from core.matting.inference import shutdown_matting_workers
+                shutdown_matting_workers()
+            except Exception:
+                pass
+
+    def _run_impl(self):
         out_dir = Path(self.output_dir)
         if self.auto_subfolder:
             out_dir = out_dir / "PixelFlow_output"
@@ -106,14 +134,14 @@ class ProcessWorker(QThread):
             
             for res in results:
                 self.image_done.emit(res)
-            self.all_done.emit(results)
-            return
+            return results
 
         # 以下为原有的逐张处理逻辑
         results = []
         total = len(self.file_list)
 
-        fmt = self.processor.get_output_format()
+        # 输出格式由 GUI 线程在启动前快照，工作线程不得读取 QComboBox 等 UI 控件。
+        fmt = str(self.options.get("_output_format", "") or "").lower()
         # fmt 为空串时保留原始格式
         ext_map = {"png": ".png", "jpg": ".jpg", "webp": ".webp", "bmp": ".bmp"}
 
@@ -122,6 +150,8 @@ class ProcessWorker(QThread):
                 break
 
             src = Path(fpath)
+            self._current_path = fpath
+            order = int(self.file_index_map.get(fpath, i + 1) or (i + 1))
             self.progress.emit(i + 1, total, src.name)
 
             result = ProcessResult(input_path=fpath)
@@ -129,7 +159,7 @@ class ProcessWorker(QThread):
                 img = Image.open(fpath)
                 # 为处理器提供额外的上下文信息（图片索引和路径）
                 process_options = dict(self.options)
-                process_options['_image_index'] = i
+                process_options['_image_index'] = order - 1
                 process_options['_current_image_path'] = fpath
                 img, details = self.processor.process(img, process_options)
 
@@ -142,7 +172,7 @@ class ProcessWorker(QThread):
 
                 # 构建输出文件名（支持重命名）；按相对路径落到对应子目录
                 file_out_dir = resolve_file_out_dir(out_dir, fpath, self.rel_path_map)
-                stem = _build_stem(src.stem, self.options, i + 1)
+                stem = _build_stem(src.stem, self.options, order)
                 out_path = file_out_dir / (stem + ext)
                 counter = 1
                 while out_path.exists():
@@ -205,5 +235,6 @@ class ProcessWorker(QThread):
 
             results.append(result)
             self.image_done.emit(result)
+            self._current_path = None
 
-        self.all_done.emit(results)
+        return results

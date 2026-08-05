@@ -695,9 +695,12 @@ sys.stdout.write('PF_DEPS_JSON=' + json.dumps(
 sys.stdout.flush()
 """ % (repr(mods), repr(names))
         try:
-            r = _run([str(python_exe), "-c", code], timeout=45)
+            # torch 冷启动 import 较慢；超时过短会在批处理/杀毒扫描时误报缺依赖
+            r = _run([str(python_exe), "-c", code], timeout=120)
+        except subprocess.TimeoutExpired:
+            return [], [], "探测失败: timeout（依赖探测超时，环境未必损坏）"
         except Exception as e:
-            return names[:], [], f"探测失败: {e}"
+            return [], [], f"探测失败: {e}"
 
         stdout = _strip_ansi(r.stdout or "")
         stderr = _strip_ansi(r.stderr or "")
@@ -713,10 +716,10 @@ sys.stdout.flush()
                 break
 
         if payload is None:
-            # 解析失败时不要把 ANSI/警告当包名
+            # 解析失败时不要把全部包名标成 missing（会误导成「环境未配置」）
             hint = (stderr or stdout or f"exit={r.returncode}")[-500:]
             hint = _strip_ansi(hint).replace("\x1b", "")
-            return names[:], [], f"依赖探测输出异常: {hint}"
+            return [], [], f"依赖探测输出异常: {hint}"
 
         missing = [str(x) for x in (payload.get("missing") or []) if str(x).strip()]
         # 过滤明显不是包名的噪声
@@ -798,10 +801,21 @@ sys.stdout.flush()
 
         missing, present, err = self.check_packages_in_python(py, pkgs)
         st.missing_packages = missing
-        st.ready = len(missing) == 0
-        if st.ready:
+        # 瞬时探测失败（超时/输出异常）不写死 ready=False 进长期缓存，
+        # 避免批处理下一张图继续吃到错误结论
+        probe_transient = bool(err) and (
+            "探测失败" in err or "依赖探测输出异常" in err or "timeout" in err.lower()
+        )
+        if not missing and not probe_transient:
+            st.ready = True
             st.detail = f"环境就绪（{len(present)} 项依赖）"
+        elif not missing and probe_transient:
+            st.ready = False
+            st.detail = err
+            # 不缓存瞬时失败
+            return st
         else:
+            st.ready = False
             st.detail = f"缺少: {', '.join(missing)}"
             if err:
                 st.detail += f"  [{err[:200]}]"

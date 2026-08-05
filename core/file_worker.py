@@ -22,6 +22,7 @@ class FileProcessWorker(QThread):
                  processor: BaseFileProcessor, options: dict,
                  auto_subfolder: bool = True,
                  rel_path_map: dict | None = None,
+                 file_index_map: dict | None = None,
                  parent=None):
         super().__init__(parent)
         self.file_list = file_list
@@ -30,13 +31,21 @@ class FileProcessWorker(QThread):
         self.options = options
         self.auto_subfolder = auto_subfolder
         self.rel_path_map = rel_path_map or {}
+        self.file_index_map = file_index_map or {}
         self._cancelled = False
+        self._current_path: str | None = None
+        self.results: list[FileProcessResult] = []
 
     def cancel(self):
         self._cancelled = True
 
+    @property
+    def current_path(self) -> str | None:
+        return self._current_path
+
     def run(self):
         results = []
+        self.results = results
         total = len(self.file_list)
 
         out_dir = Path(self.output_dir)
@@ -49,12 +58,14 @@ class FileProcessWorker(QThread):
                 break
 
             src = Path(fpath)
+            self._current_path = fpath
+            order = int(self.file_index_map.get(fpath, i + 1) or (i + 1))
             self.progress.emit(i + 1, total, src.name)
 
             try:
                 file_out_dir = resolve_file_out_dir(out_dir, fpath, self.rel_path_map)
                 result = self.processor.process_file(
-                    str(fpath), str(file_out_dir), self.options, i + 1
+                    str(fpath), str(file_out_dir), self.options, order
                 )
             except Exception as e:
                 result = FileProcessResult(
@@ -66,5 +77,6 @@ class FileProcessWorker(QThread):
 
             results.append(result)
             self.file_done.emit(result)
+            self._current_path = None
 
-        self.all_done.emit(results)
+        self.results = results

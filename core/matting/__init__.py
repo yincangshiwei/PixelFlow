@@ -8,7 +8,12 @@ from core.matting.model_registry import (
 )
 from core.matting.model_manager import MattingModelManager, get_matting_manager
 from core.matting.hardware import detect_hardware, HardwareInfo
-from core.matting.inference import remove_background, MattingError
+from core.matting.inference import (
+    remove_background,
+    MattingError,
+    shutdown_matting_workers,
+    clear_model_cache,
+)
 
 __all__ = [
     "MATTING_MODELS",
@@ -20,4 +25,6 @@ __all__ = [
     "HardwareInfo",
     "remove_background",
     "MattingError",
+    "shutdown_matting_workers",
+    "clear_model_cache",
 ]

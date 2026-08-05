@@ -88,6 +88,10 @@ class _HwDetectWorker(QThread):
 class SettingsPanel(QWidget):
     """主窗口「配置」Tab 的内容区"""
 
+    # 后台日志：由主窗口连接，写入「后台日志」页
+    log_begin = Signal(str, str)   # feature_id, title
+    log_line = Signal(str)         # 一行日志
+
     def __init__(self, parent=None, lazy: bool = False):
         super().__init__(parent)
         self._mgr = get_matting_manager()
@@ -96,9 +100,12 @@ class SettingsPanel(QWidget):
         self._bridge.progress.connect(self._on_async_progress)
         self._bridge.finished.connect(self._on_async_finished)
         self._async_kind = ""  # uv / env / download
+        self._async_feature = ""  # 当前任务日志 feature_id
+        self._last_log_msg = ""   # 去重进度文案
         self._dev_loaded = False
         self._model_loaded = False
         self._hw_loaded = False
+        self._dev_ready = False
         self._scan_worker: QThread | None = None
         self._env_worker: QThread | None = None
         self._hw_worker: QThread | None = None
@@ -247,6 +254,46 @@ class SettingsPanel(QWidget):
 
     # ═══ 抠图模型 ═══
     def _build_matting_page(self) -> QWidget:
+        """外层 stack：0=开发环境未就绪门禁，1=模型配置正文。"""
+        self._matting_stack = QStackedWidget()
+
+        # —— 门禁页：开发环境未就绪 ——
+        gate = QWidget()
+        gate_lay = QVBoxLayout(gate)
+        gate_lay.setContentsMargins(24, 40, 24, 24)
+        gate_lay.setSpacing(14)
+        gate_lay.addStretch(1)
+
+        gate_title = QLabel("请先完成开发环境配置")
+        gate_title.setAlignment(Qt.AlignCenter)
+        gate_title.setStyleSheet(
+            "color:#e0e4f0;font-size:16px;font-weight:bold;"
+        )
+        gate_lay.addWidget(gate_title)
+
+        self.lbl_matting_gate = QLabel(
+            "抠图模型依赖独立的 Python + uv 环境。\n"
+            "请先到「开发环境」检测/选择 Python，并安装 uv，再回来配置模型。"
+        )
+        self.lbl_matting_gate.setAlignment(Qt.AlignCenter)
+        self.lbl_matting_gate.setWordWrap(True)
+        self.lbl_matting_gate.setStyleSheet("color:#a8b0d0;font-size:13px;")
+        gate_lay.addWidget(self.lbl_matting_gate)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self.btn_goto_dev = QPushButton("前往开发环境配置")
+        self.btn_goto_dev.setObjectName("btn_start")
+        self.btn_goto_dev.setMinimumHeight(38)
+        self.btn_goto_dev.setMinimumWidth(200)
+        self.btn_goto_dev.clicked.connect(lambda: self.open_menu(0))
+        btn_row.addWidget(self.btn_goto_dev)
+        btn_row.addStretch()
+        gate_lay.addLayout(btn_row)
+        gate_lay.addStretch(2)
+        self._matting_stack.addWidget(gate)  # 0
+
+        # —— 正文页 ——
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setContentsMargins(4, 2, 8, 8)
@@ -301,6 +348,7 @@ class SettingsPanel(QWidget):
         env_tip = QLabel(
             "每个模型使用独立虚拟环境，避免依赖版本冲突。"
             "创建环境会安装 torch / ben2 等，体积较大、耗时较长，请保持网络畅通。"
+            "进度详情请查看「后台日志」。"
         )
         env_tip.setWordWrap(True)
         env_tip.setStyleSheet("color:#8a90b0;font-size:12px;")
@@ -346,7 +394,7 @@ class SettingsPanel(QWidget):
         gd.setSpacing(8)
         tip = QLabel(
             "从 ModelScope 下载权重到 models/matting/；也可指定已有权重文件/文件夹。"
-            "下载依赖模型隔离环境中的 modelscope。"
+            "下载依赖模型隔离环境中的 modelscope。进度详情请查看「后台日志」。"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#8a90b0;font-size:12px;")
@@ -418,9 +466,21 @@ class SettingsPanel(QWidget):
         gh.addWidget(self.txt_hw)
         lay.addWidget(grp_hw)
         lay.addStretch()
-        return self._wrap_scroll(body)
 
-    # ── 菜单 ──
+        self._matting_stack.addWidget(self._wrap_scroll(body))  # 1
+        # 初始先显示门禁，待开发环境检测后再切换
+        self._matting_stack.setCurrentIndex(0)
+        return self._matting_stack
+
+    # ── 菜单 / 对外跳转 ──
+    def open_menu(self, row: int):
+        """供主窗口/其它模块跳转到指定配置子页。"""
+        row = max(0, min(row, self.menu_list.count() - 1))
+        if self.menu_list.currentRow() != row:
+            self.menu_list.setCurrentRow(row)
+        else:
+            self._on_menu_changed(row)
+
     def _on_menu_changed(self, row: int):
         if row < 0:
             return
@@ -432,13 +492,65 @@ class SettingsPanel(QWidget):
         if row == 0:
             self._schedule_dev_refresh(force=False)
         elif row == 1:
-            self._schedule_model_refresh(force_env=False)
-            if not self._hw_loaded:
-                self._run_hardware_detect(async_=True)
+            # 进入模型页前先确认开发环境是否就绪
+            self._update_dev_ready_flag()
+            self._apply_matting_gate()
+            if self._dev_ready:
+                self._schedule_model_refresh(force_env=False)
+                if not self._hw_loaded:
+                    self._run_hardware_detect(async_=True)
 
     def _current_model_id(self) -> str:
         mid = self.combo_model.currentData()
         return mid or "ben2"
+
+    # ── 开发环境就绪判断 / 模型页门禁 ──
+    def _check_dev_ready(self) -> tuple[bool, str]:
+        """返回 (是否可配置模型, 说明文案)。"""
+        uv = self._rt.resolve_uv()
+        base = self._rt.resolve_base_python()
+        missing = []
+        if base is None:
+            missing.append("可用 Python 3.10–3.12（64 位）")
+        if not uv.found:
+            missing.append("包管理工具 uv")
+        if missing:
+            return False, "缺少: " + "、".join(missing)
+        return True, "开发环境已就绪"
+
+    def _update_dev_ready_flag(self):
+        ok, detail = self._check_dev_ready()
+        self._dev_ready = ok
+        return ok, detail
+
+    def _apply_matting_gate(self):
+        """开发环境未就绪时，模型配置右侧只显示跳转引导。"""
+        ok, detail = self._update_dev_ready_flag()
+        if ok:
+            self._matting_stack.setCurrentIndex(1)
+        else:
+            self.lbl_matting_gate.setText(
+                f"{detail}\n\n"
+                "抠图模型依赖独立的 Python + uv 环境。\n"
+                "请先到「开发环境」检测/选择 Python，并安装 uv，再回来配置模型。"
+            )
+            self._matting_stack.setCurrentIndex(0)
+
+    # ── 后台日志辅助 ──
+    def _emit_log_begin(self, feature_id: str, title: str):
+        self._async_feature = feature_id
+        self._last_log_msg = ""
+        self.log_begin.emit(feature_id, title)
+
+    def _emit_log(self, text: str, *, dedupe: bool = False):
+        msg = (text or "").strip()
+        if not msg:
+            return
+        # 进度条会高频回调同一文案，避免刷屏
+        if dedupe and msg == self._last_log_msg:
+            return
+        self._last_log_msg = msg
+        self.log_line.emit(msg)
 
     def _apply_dev_placeholder(self):
         self.lbl_py_hint.setText("检测将在后台进行…")
@@ -521,9 +633,15 @@ class SettingsPanel(QWidget):
             self.btn_install_uv.setText("安装 uv")
 
         self.txt_diag.setPlainText(diag or "")
+        # 开发环境状态变化后，同步模型页门禁
+        self._apply_matting_gate()
 
     # ── 模型区刷新（轻量同步 + 可选后台校验）──
     def _schedule_model_refresh(self, force_env: bool = False):
+        ok, _ = self._update_dev_ready_flag()
+        self._apply_matting_gate()
+        if not ok:
+            return
         self._refresh_model_section_light()
         # 进入模型页或手动刷新时，后台做一次真实依赖检测
         if force_env or not getattr(self, "_env_verified_once", False):
@@ -589,9 +707,18 @@ class SettingsPanel(QWidget):
 
     def _schedule_env_check(self):
         mid = self._current_model_id()
+        # 已有 worker：若校验的就是当前模型则跳过；否则等它结束后再由回调/下次触发
         if self._env_worker is not None and self._env_worker.isRunning():
+            if getattr(self._env_worker, "model_id", None) == mid:
+                return
+            # 目标模型已变：标记待检，当前 worker 完成后会再启一次
+            self._pending_env_check_id = mid
+            self.lbl_env_msg.setText(f"等待切换校验模型 {mid} …")
             return
+        self._pending_env_check_id = None
         self.lbl_env_msg.setText("正在后台校验完整依赖（torch / ben2 等）…")
+        # 切换模型时重置「已校验」标记，确保每个模型单独检查
+        self._env_verified_once = False
         worker = _EnvCheckWorker(mid, None, parent=self)
         self._env_worker = worker
         worker.done.connect(self._on_env_check_done)
@@ -599,8 +726,14 @@ class SettingsPanel(QWidget):
 
     @Slot(str, object)
     def _on_env_check_done(self, model_id: str, st: ModelEnvStatus):
-        if model_id != self._current_model_id():
+        # 若用户已切到别的模型，丢弃结果并立刻校验当前模型
+        pending = getattr(self, "_pending_env_check_id", None)
+        current = self._current_model_id()
+        if model_id != current or (pending and pending != model_id):
+            self._pending_env_check_id = None
+            QTimer.singleShot(0, self._schedule_env_check)
             return
+        self._pending_env_check_id = None
         self._env_verified_once = True
         self._apply_env_status(st, pending_verify=False)
         if st.ready:
@@ -680,6 +813,8 @@ class SettingsPanel(QWidget):
         self.progress_dev.setValue(0)
         self.lbl_dev_msg.setText("开始安装 uv…")
         self.btn_install_uv.setEnabled(False)
+        self._emit_log_begin("settings_runtime", "配置 · 安装 / 修复 uv")
+        self._emit_log("开始安装 uv 到 runtime/uv/ …")
         bridge = self._bridge
 
         def prog(stage, pct, msg):
@@ -726,7 +861,7 @@ class SettingsPanel(QWidget):
             )
             if ret != QMessageBox.Yes:
                 return
-            self.menu_list.setCurrentRow(0)
+            self.open_menu(0)
             self._install_uv()
             return
 
@@ -738,7 +873,7 @@ class SettingsPanel(QWidget):
                 "未找到可用的 Python 3.10–3.12（64 位）。\n"
                 "请到「开发环境」安装/选择 Python 后再试。",
             )
-            self.menu_list.setCurrentRow(0)
+            self.open_menu(0)
             return
 
         if force:
@@ -755,6 +890,20 @@ class SettingsPanel(QWidget):
         self.lbl_env_msg.setText("准备创建环境…")
         self.btn_setup_env.setEnabled(False)
         self.btn_recreate_env.setEnabled(False)
+        action = "强制重建" if force else "创建/修复"
+        pkgs = list(meta.env_packages)
+        self._emit_log_begin(
+            f"settings_matting_{mid}",
+            f"配置 · {action}模型环境 — {meta.name} ({mid})",
+        )
+        self._emit_log(f"目标 Python: {meta.python_version}")
+        self._emit_log(f"依赖包数: {len(pkgs)}")
+        if pkgs:
+            self._emit_log("依赖列表: " + ", ".join(pkgs[:12]) + ("…" if len(pkgs) > 12 else ""))
+        if base:
+            self._emit_log(f"基础解释器: {base.display}")
+        if uv.found:
+            self._emit_log(f"uv: {uv.display}")
         bridge = self._bridge
 
         def prog(stage, pct, msg):
@@ -766,7 +915,7 @@ class SettingsPanel(QWidget):
         self._rt.ensure_model_env_async(
             mid,
             python_version=meta.python_version,
-            packages=list(meta.env_packages),
+            packages=pkgs,
             progress=prog,
             finished=fin,
             force_recreate=force,
@@ -782,7 +931,9 @@ class SettingsPanel(QWidget):
         mid = self._current_model_id()
         self._mgr.set_default_model_id(mid)
         clear_model_cache()
-        self._schedule_model_refresh(force_env=False)
+        # 每个模型有独立环境/权重，切换后强制重新校验
+        self._env_verified_once = False
+        self._schedule_model_refresh(force_env=True)
         self._update_compat_label()
 
     def _on_device_changed(self, _idx: int):
@@ -862,6 +1013,12 @@ class SettingsPanel(QWidget):
         self.lbl_dl_msg.setText("准备下载…")
         self.btn_download.setEnabled(False)
         self.btn_download.setText("下载中…")
+        self._emit_log_begin(
+            f"settings_matting_{mid}",
+            f"配置 · 下载模型权重 — {meta.name} ({mid})",
+        )
+        self._emit_log(f"来源: {meta.source}  ·  {meta.repo_id}")
+        self._emit_log(f"保存目录: {self._mgr.default_local_dir(mid)}")
         bridge = self._bridge
 
         def on_prog(model_id, percent, message):
@@ -875,6 +1032,19 @@ class SettingsPanel(QWidget):
     # ── 异步回调 ──
     @Slot(str, float, str)
     def _on_async_progress(self, key: str, percent: float, message: str):
+        # 进度写入后台日志：按文案去重（百分比变化不刷屏），阶段切换才记一行
+        lines = [ln.strip() for ln in (message or "").splitlines() if ln.strip()]
+        body = lines[0] if lines else (message or "").strip()
+        if body and body != self._last_log_msg:
+            pct = ""
+            if percent is not None and percent >= 0:
+                pct = f"[{int(min(100, max(0, percent))):3d}%] "
+            self._emit_log(f"{pct}{body}")
+            self._last_log_msg = body
+            # 额外行（如 URL）一并写入
+            for ln in lines[1:]:
+                self._emit_log(f"      {ln}")
+
         if key == "uv":
             if percent >= 0:
                 self.progress_dev.setValue(int(min(100, max(0, percent))))
@@ -890,6 +1060,12 @@ class SettingsPanel(QWidget):
 
     @Slot(str, bool, str)
     def _on_async_finished(self, key: str, ok: bool, message: str):
+        if ok:
+            self._emit_log(f"✓ 完成: {message}")
+        else:
+            self._emit_log(f"✗ 失败: {message}")
+        self._emit_log("─" * 50)
+
         if key == "uv":
             self.btn_install_uv.setEnabled(True)
             self._rt.invalidate_caches(uv=True)

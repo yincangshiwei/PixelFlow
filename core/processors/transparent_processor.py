@@ -1,16 +1,16 @@
 """
-透明图处理器 —— AI 抠图 + 裁剪透明边缘 + 调整尺寸 + 放置到画布
+透明图处理器 —— AI 抠图 + 裁剪透明边缘 + 画布主体布局
 """
 from PIL import Image
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QSpinBox, QComboBox, QPushButton, QColorDialog, QCheckBox
 )
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QColor, QDesktopServices
 
 from core.base_processor import BaseProcessor, register_processor
-from core.image_processor import hex_to_rgba, trim_transparent, resize_image
+from core.image_processor import trim_transparent, place_subject_on_canvas
 from core.matting.model_registry import list_models, get_model_info
 from core.matting.model_manager import get_matting_manager
 from core.matting.inference import remove_background, MattingError
@@ -55,21 +55,18 @@ class _ColorBlock(QWidget):
 
 @register_processor
 class TransparentImageProcessor(BaseProcessor):
-    """透明图处理：抠图 → 裁透明边 → 缩放 → 画布居中"""
+    """透明图处理：抠图 → 裁透明边 → 主体等比放入画布"""
 
     name = "透明图处理"
-    description = "AI 抠图 → 去除透明边缘 → 调整尺寸 → 放入画布居中"
+    description = "AI 抠图 → 去除透明边缘 → 按画布占比等比放置主体"
     icon = "✂"
     preset_id = "transparent_image"
-
-    _MODE_MAP = {"contain": 0, "cover": 1, "stretch": 2}
 
     def __init__(self):
         self._panel: QWidget | None = None
         self._grp_matting = None
         self._grp_trim = None
-        self._grp_resize = None
-        self._grp_canvas = None
+        self._grp_layout = None
 
     def create_panel(self, parent=None) -> QWidget:
         self._panel = QWidget(parent)
@@ -94,7 +91,10 @@ class TransparentImageProcessor(BaseProcessor):
         self.combo_matting_model = QComboBox()
         self.combo_matting_model.setStyleSheet(config.COMBOBOX_STYLE)
         self._reload_matting_models()
-        self.combo_matting_model.setToolTip("目前提供 BEN2；更多模型可在后续版本扩展")
+        self.combo_matting_model.setToolTip(
+            "每个模型有独立环境与权重；切换后会重新检查就绪状态。"
+            "更多模型可在后续版本扩展。"
+        )
         m_row.addWidget(self.combo_matting_model)
 
         self.chk_refine = QCheckBox("边缘精炼")
@@ -107,8 +107,11 @@ class TransparentImageProcessor(BaseProcessor):
         self.lbl_matting_hint = QLabel("")
         self.lbl_matting_hint.setWordWrap(True)
         self.lbl_matting_hint.setStyleSheet("color:#8a90b0;font-size:11px;")
+        self.lbl_matting_hint.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.lbl_matting_hint.setOpenExternalLinks(False)
+        self.lbl_matting_hint.linkActivated.connect(self._on_matting_link)
         m_lay.addWidget(self.lbl_matting_hint)
-        self.combo_matting_model.currentIndexChanged.connect(self._update_matting_hint)
+        self.combo_matting_model.currentIndexChanged.connect(self._on_matting_model_changed)
         self._grp_matting.toggled.connect(lambda _: self._update_matting_hint())
         self._update_matting_hint()
         root.addWidget(self._grp_matting)
@@ -122,56 +125,80 @@ class TransparentImageProcessor(BaseProcessor):
         self.spin_alpha = QSpinBox()
         self.spin_alpha.setRange(0, 254)
         self.spin_alpha.setValue(0)
-        self.spin_alpha.setToolTip("大于此值视为有效内容 (0=仅裁完全透明)")
+        self.spin_alpha.setToolTip(
+            "大于此值视为有效内容（0=仅裁完全透明像素）。\n"
+            "会按主体连续区域裁剪，自动忽略与主体不相连的边缘半透明噪点。"
+        )
         t_lay.addWidget(self.spin_alpha)
         t_lay.addStretch()
         root.addWidget(self._grp_trim)
 
-        # ── 调整尺寸 ──
-        self._grp_resize = QGroupBox("调整尺寸")
-        self._grp_resize.setCheckable(True)
-        self._grp_resize.setChecked(False)
-        r_lay = QHBoxLayout(self._grp_resize)
-        r_lay.addWidget(QLabel("宽:"))
-        self.spin_rw = QSpinBox()
-        self.spin_rw.setRange(1, 99999)
-        self.spin_rw.setValue(800)
-        r_lay.addWidget(self.spin_rw)
-        r_lay.addWidget(QLabel("高:"))
-        self.spin_rh = QSpinBox()
-        self.spin_rh.setRange(1, 99999)
-        self.spin_rh.setValue(800)
-        r_lay.addWidget(self.spin_rh)
-        r_lay.addWidget(QLabel("模式:"))
-        self.combo_mode = QComboBox()
-        self.combo_mode.addItem("等比缩放 (完整显示)", "contain")
-        self.combo_mode.addItem("等比铺满 (可能裁切)", "cover")
-        self.combo_mode.addItem("拉伸填充 (不保持比例)", "stretch")
-        self.combo_mode.setStyleSheet(config.COMBOBOX_STYLE)
-        r_lay.addWidget(self.combo_mode)
-        r_lay.addStretch()
-        root.addWidget(self._grp_resize)
+        # ── 画布与主体布局 ──
+        self._grp_layout = QGroupBox("画布与主体布局")
+        self._grp_layout.setCheckable(True)
+        self._grp_layout.setChecked(False)
+        self._grp_layout.setToolTip(
+            "类似智能对象：裁剪后的全分辨率主体作为源，画布只存布局参数，\n"
+            "导出时从源预乘 Alpha 后一次栅格化到画布，避免中间重复缩放。\n"
+            "主体占比 = 完整放入画布对应比例的安全框（始终保持宽高比）。\n"
+            "注意：画布/显示尺寸小于源时，放大查看仍会丢细节（与 PS 相同）。"
+        )
+        layout_lay = QVBoxLayout(self._grp_layout)
+        layout_lay.setSpacing(6)
 
-        # ── 放置到画布 ──
-        self._grp_canvas = QGroupBox("放置到画布")
-        self._grp_canvas.setCheckable(True)
-        self._grp_canvas.setChecked(False)
-        c_lay = QHBoxLayout(self._grp_canvas)
-        c_lay.addWidget(QLabel("宽:"))
+        canvas_row = QHBoxLayout()
+        canvas_row.addWidget(QLabel("画布宽:"))
         self.spin_cw = QSpinBox()
         self.spin_cw.setRange(1, 99999)
         self.spin_cw.setValue(1500)
-        c_lay.addWidget(self.spin_cw)
-        c_lay.addWidget(QLabel("高:"))
+        self.spin_cw.setSuffix(" px")
+        canvas_row.addWidget(self.spin_cw)
+        canvas_row.addWidget(QLabel("画布高:"))
         self.spin_ch = QSpinBox()
         self.spin_ch.setRange(1, 99999)
         self.spin_ch.setValue(1500)
-        c_lay.addWidget(self.spin_ch)
-        c_lay.addWidget(QLabel("颜色:"))
-        self.color_btn = _ColorBlock("#FFFFFF")
-        c_lay.addWidget(self.color_btn)
-        c_lay.addStretch()
-        root.addWidget(self._grp_canvas)
+        self.spin_ch.setSuffix(" px")
+        canvas_row.addWidget(self.spin_ch)
+        canvas_row.addWidget(QLabel("背景:"))
+        self.color_btn = _ColorBlock("#00000000")
+        canvas_row.addWidget(self.color_btn)
+        canvas_row.addStretch()
+        layout_lay.addLayout(canvas_row)
+
+        subject_row = QHBoxLayout()
+        subject_row.addWidget(QLabel("主体占比:"))
+        self.spin_subject_percent = QSpinBox()
+        self.spin_subject_percent.setRange(1, 100)
+        self.spin_subject_percent.setValue(80)
+        self.spin_subject_percent.setSuffix(" %")
+        self.spin_subject_percent.setToolTip(
+            "例如 1500×1000 画布设置 80%，主体会等比完整放入 1200×800 的安全框。\n"
+            "无论源图偏大或偏小，都按此占比统一呈现（标准化构图）。"
+        )
+        subject_row.addWidget(self.spin_subject_percent)
+        subject_row.addWidget(QLabel("细节:"))
+        self.combo_detail = QComboBox()
+        self.combo_detail.setStyleSheet(config.COMBOBOX_STYLE)
+        self.combo_detail.addItem("标准", "normal")
+        self.combo_detail.addItem("弱恢复", "subtle")
+        self.combo_detail.addItem("关闭", "off")
+        self.combo_detail.setCurrentIndex(0)
+        self.combo_detail.setToolTip(
+            "缩小时对颜色通道做轻度锐化以补偿重采样发软；不影响透明边缘。\n"
+            "不能恢复已小于源分辨率而丢失的像素细节。"
+        )
+        subject_row.addWidget(self.combo_detail)
+        subject_row.addStretch()
+        layout_lay.addLayout(subject_row)
+
+        self.lbl_layout_hint = QLabel(
+            "所有图按同一主体占比标准化呈现；源像素只在导出时采样一次。"
+            "画布比源小时会丢细节，源本身偏小时放大也无法凭空变清。"
+        )
+        self.lbl_layout_hint.setWordWrap(True)
+        self.lbl_layout_hint.setStyleSheet("color:#8a90b0;font-size:11px;")
+        layout_lay.addWidget(self.lbl_layout_hint)
+        root.addWidget(self._grp_layout)
 
         # ── 输出格式 ──
         fmt_row = QHBoxLayout()
@@ -202,32 +229,142 @@ class TransparentImageProcessor(BaseProcessor):
                 break
         self.combo_matting_model.blockSignals(False)
 
+    def on_panel_activated(self):
+        """主窗口切回图像处理 Tab 时刷新模型列表与就绪提示。"""
+        self._reload_matting_models()
+        self._update_matting_hint()
+
+    def _on_matting_model_changed(self, _idx: int = 0):
+        """切换模型时同步默认模型，并按该模型独立检查环境/权重。"""
+        mid = self.combo_matting_model.currentData()
+        if mid:
+            get_matting_manager().set_default_model_id(mid)
+        self._update_matting_hint()
+
+    def _find_main_window(self):
+        w = self._panel
+        while w is not None:
+            if hasattr(w, "open_settings"):
+                return w
+            w = w.parentWidget() if hasattr(w, "parentWidget") else None
+        return None
+
+    def _on_matting_link(self, link: str):
+        """处理提示区中的配置跳转链接。"""
+        link = (link or "").strip()
+        mw = self._find_main_window()
+        if link == "pixelflow://settings/dev":
+            if mw is not None:
+                mw.open_settings(0)
+            return
+        if link == "pixelflow://settings/matting":
+            if mw is not None:
+                mw.open_settings(1)
+            return
+        if link.startswith("http://") or link.startswith("https://"):
+            QDesktopServices.openUrl(QUrl(link))
+
+    def _matting_readiness(self, model_id: str) -> dict:
+        """
+        轻量检查当前模型是否可推理（不启动子进程 import）。
+        返回: dev_ok / env_ok / weight_ok / detail 文案组件
+        """
+        from core.runtime.env_manager import get_runtime_manager
+
+        rt = get_runtime_manager()
+        mgr = get_matting_manager()
+        uv = rt.resolve_uv()
+        base = rt.resolve_base_python()
+        dev_ok = bool(uv.found and base is not None)
+
+        env_exists = rt.env_exists(model_id)
+        cached = rt.get_model_env_status(model_id, quick=True)
+        env_ready = bool(cached.ready)
+        env_ok = env_ready or env_exists  # 已创建即可尝试；完整依赖处理时再验
+        weight_ok = mgr.is_ready(model_id)
+        status = mgr.status_text(model_id)
+
+        if not dev_ok:
+            missing = []
+            if base is None:
+                missing.append("Python")
+            if not uv.found:
+                missing.append("uv")
+            stage = "dev"
+            summary = "开发环境未配置（缺少 " + "、".join(missing) + "）"
+        elif not env_exists:
+            stage = "env"
+            summary = "模型隔离环境未创建"
+        elif not env_ready:
+            stage = "env"
+            miss = ", ".join(cached.missing_packages) if cached.missing_packages else ""
+            summary = f"模型环境不完整" + (f"（缺 {miss}）" if miss else "")
+        elif not weight_ok:
+            stage = "weight"
+            summary = "模型权重未下载"
+        else:
+            stage = "ready"
+            summary = "已就绪"
+
+        return {
+            "dev_ok": dev_ok,
+            "env_ok": env_ok and env_exists,
+            "env_ready": env_ready,
+            "env_exists": env_exists,
+            "weight_ok": weight_ok,
+            "status": status,
+            "stage": stage,
+            "summary": summary,
+        }
+
     def _update_matting_hint(self):
         if not hasattr(self, "lbl_matting_hint"):
             return
         mid = self.combo_matting_model.currentData() or "ben2"
         meta = get_model_info(mid)
-        mgr = get_matting_manager()
-        ready = mgr.is_ready(mid)
-        status = mgr.status_text(mid)
-        if meta:
-            from core.runtime.env_manager import get_runtime_manager
-            # 仅路径判断，避免面板创建/切换时启动子进程卡 UI
-            rt = get_runtime_manager()
-            env_ok = rt.env_exists(mid)
-            # 若有缓存的完整状态则用 ready
-            cached = rt.get_model_env_status(mid, quick=True)
-            if cached.ready:
-                env_ok = True
-            env_txt = "环境已创建" if env_ok else "环境未创建"
-            base = f"{meta.name} · {status} · {env_txt}"
-            if not env_ok or not ready:
-                base += "  — 请到「配置」创建隔离环境并下载权重"
-            else:
-                base += "  · 勾选后处理时将调用独立环境推理"
-            self.lbl_matting_hint.setText(base)
-        else:
+        if not meta:
             self.lbl_matting_hint.setText("")
+            return
+
+        info = self._matting_readiness(mid)
+        name = meta.name
+        status = info["status"]
+        stage = info["stage"]
+
+        # 状态色
+        if stage == "ready":
+            color = "#6dcea0"
+        elif stage == "dev":
+            color = "#e0a060"
+        else:
+            color = "#e0c060"
+
+        # 可点击跳转
+        link_dev = '<a href="pixelflow://settings/dev" style="color:#5b8af5;text-decoration:none;">前往开发环境配置</a>'
+        link_model = '<a href="pixelflow://settings/matting" style="color:#5b8af5;text-decoration:none;">前往抠图模型配置</a>'
+
+        if stage == "ready":
+            body = (
+                f"{name} · {status} · 环境就绪"
+                f"  · 勾选后处理时将调用该模型独立环境推理"
+            )
+            extra = ""
+        elif stage == "dev":
+            body = f"{name} · {info['summary']}"
+            extra = f"  — {link_dev}"
+        elif stage == "env":
+            body = f"{name} · {status} · {info['summary']}"
+            extra = f"  — {link_model}"
+        else:  # weight
+            body = f"{name} · {status} · 环境已创建"
+            extra = f"  — 请下载权重：{link_model}"
+
+        # 未勾选 AI 抠图时也显示状态，便于用户提前配置
+        html = (
+            f'<span style="color:{color};font-size:11px;">{body}</span>'
+            f'<span style="color:#8a90b0;font-size:11px;">{extra}</span>'
+        )
+        self.lbl_matting_hint.setText(html)
 
     def gather_options(self) -> dict:
         return {
@@ -236,14 +373,12 @@ class TransparentImageProcessor(BaseProcessor):
             "matting_refine": self.chk_refine.isChecked(),
             "enable_trim": self._grp_trim.isChecked(),
             "alpha_threshold": self.spin_alpha.value(),
-            "enable_resize": self._grp_resize.isChecked(),
-            "resize_w": self.spin_rw.value(),
-            "resize_h": self.spin_rh.value(),
-            "resize_mode": self.combo_mode.currentData(),
-            "enable_canvas": self._grp_canvas.isChecked(),
+            "enable_layout": self._grp_layout.isChecked(),
             "canvas_w": self.spin_cw.value(),
             "canvas_h": self.spin_ch.value(),
             "canvas_color": self.color_btn.get_color(),
+            "subject_percent": self.spin_subject_percent.value(),
+            "detail_restore": self.combo_detail.currentData() or "normal",
             "output_format": self.combo_fmt.currentText(),
         }
 
@@ -257,14 +392,12 @@ class TransparentImageProcessor(BaseProcessor):
             "matting_refine": False,
             "enable_trim": True,
             "alpha_threshold": 0,
-            "enable_resize": False,
-            "resize_w": 800,
-            "resize_h": 800,
-            "resize_mode": "contain",
-            "enable_canvas": False,
+            "enable_layout": False,
             "canvas_w": 1500,
             "canvas_h": 1500,
-            "canvas_color": "#FFFFFF",
+            "canvas_color": "#00000000",
+            "subject_percent": 80,
+            "detail_restore": "normal",
             "output_format": "png",
         }
 
@@ -283,16 +416,32 @@ class TransparentImageProcessor(BaseProcessor):
 
         self._grp_trim.setChecked(options.get("enable_trim", True))
         self.spin_alpha.setValue(options.get("alpha_threshold", 0))
-        self._grp_resize.setChecked(options.get("enable_resize", False))
-        self.spin_rw.setValue(options.get("resize_w", 800))
-        self.spin_rh.setValue(options.get("resize_h", 800))
-        mode = options.get("resize_mode", "contain")
-        idx = self._MODE_MAP.get(mode, 0)
-        self.combo_mode.setCurrentIndex(idx)
-        self._grp_canvas.setChecked(options.get("enable_canvas", False))
-        self.spin_cw.setValue(options.get("canvas_w", 1500))
-        self.spin_ch.setValue(options.get("canvas_h", 1500))
-        color = options.get("canvas_color", "#FFFFFF")
+
+        # 兼容旧预设：原来启用画布时迁移到新布局；根据旧目标框估算占比。
+        layout_enabled = options.get("enable_layout")
+        if layout_enabled is None:
+            layout_enabled = bool(options.get("enable_canvas", False))
+        canvas_w = int(options.get("canvas_w", 1500))
+        canvas_h = int(options.get("canvas_h", 1500))
+        subject_percent = options.get("subject_percent")
+        if subject_percent is None and options.get("enable_resize"):
+            resize_w = max(1, int(options.get("resize_w", 800)))
+            resize_h = max(1, int(options.get("resize_h", 800)))
+            subject_percent = round(
+                min(resize_w / max(1, canvas_w), resize_h / max(1, canvas_h)) * 100
+            )
+        self._grp_layout.setChecked(bool(layout_enabled))
+        self.spin_cw.setValue(canvas_w)
+        self.spin_ch.setValue(canvas_h)
+        self.spin_subject_percent.setValue(max(1, min(100, int(subject_percent or 80))))
+        detail = options.get("detail_restore", "normal")
+        for i in range(self.combo_detail.count()):
+            if self.combo_detail.itemData(i) == detail:
+                self.combo_detail.setCurrentIndex(i)
+                break
+        else:
+            self.combo_detail.setCurrentIndex(0)
+        color = options.get("canvas_color", "#00000000")
         self.color_btn._color = color
         self.color_btn._refresh()
         fmt = options.get("output_format", "png")
@@ -327,20 +476,17 @@ class TransparentImageProcessor(BaseProcessor):
             details["trim_bbox"] = bbox
             details["trimmed_size"] = img.size
 
-        if options.get("enable_resize"):
-            target = (options["resize_w"], options["resize_h"])
-            img = resize_image(img, target_size=target, mode=options.get("resize_mode", "contain"))
-            details["resized_size"] = img.size
-
-        if options.get("enable_canvas"):
-            cs = (options["canvas_w"], options["canvas_h"])
-            canvas_rgba = hex_to_rgba(options.get("canvas_color", "#FFFFFF"))
-            canvas = Image.new("RGBA", cs, canvas_rgba)
-            px = (cs[0] - img.size[0]) // 2
-            py = (cs[1] - img.size[1]) // 2
-            canvas.paste(img, (px, py), img)
-            img = canvas
-            details["canvas_size"] = cs
-            details["paste_pos"] = (px, py)
+        # 智能对象式布局：asset 锁定为当前全分辨率主体，只把变换参数交给
+        # place_subject_on_canvas，导出时预乘 Alpha 后一次栅格化到画布。
+        if options.get("enable_layout"):
+            asset = img
+            img, layout_info = place_subject_on_canvas(
+                asset,
+                (int(options["canvas_w"]), int(options["canvas_h"])),
+                subject_percent=int(options.get("subject_percent", 80)),
+                canvas_color=options.get("canvas_color", "#00000000"),
+                detail_restore=str(options.get("detail_restore", "normal") or "normal"),
+            )
+            details.update(layout_info)
 
         return img, details

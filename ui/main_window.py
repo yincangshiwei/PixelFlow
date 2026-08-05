@@ -5,6 +5,8 @@ PixelFlow 主窗口
 import os
 import subprocess
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -34,6 +36,14 @@ import core.processors.metadata_processor     # noqa: F401
 from core.worker import ProcessWorker
 from core.file_worker import FileProcessWorker
 from core.log_manager import AppLogManager
+from core.batch_session import (
+    BatchSession,
+    STATUS_PENDING,
+    STATUS_RUNNING,
+    STATUS_SUCCESS,
+    STATUS_FAILED,
+    STATUS_CANCELLED,
+)
 from ui.settings_panel import SettingsPanel
 
 # 图片格式
@@ -47,6 +57,24 @@ _RES_DIR = str(RESOURCES_DIR).replace("\\", "/")
 # 列表项数据角色：完整路径 / 相对导入根目录的路径（用于保留目录结构）
 ROLE_PATH = Qt.UserRole
 ROLE_REL_PATH = Qt.UserRole + 1
+ROLE_BASE_TEXT = Qt.UserRole + 2  # 不含状态前缀的显示名
+ROLE_JOB_STATUS = Qt.UserRole + 3
+
+# 列表状态前缀（与缩略图并存，一眼可辨）
+_STATUS_PREFIX = {
+    STATUS_PENDING: "",
+    STATUS_RUNNING: "… ",
+    STATUS_SUCCESS: "✓ ",
+    STATUS_FAILED: "✗ ",
+    STATUS_CANCELLED: "⏸ ",
+}
+_STATUS_COLOR = {
+    STATUS_PENDING: QColor(176, 180, 200),
+    STATUS_RUNNING: QColor(120, 170, 255),
+    STATUS_SUCCESS: QColor(110, 200, 140),
+    STATUS_FAILED: QColor(240, 120, 120),
+    STATUS_CANCELLED: QColor(230, 190, 100),
+}
 
 
 def _get_desktop_path() -> str:
@@ -148,8 +176,14 @@ class MainWindow(QMainWindow):
 
         self.worker = None
         self._thumb_loader = None
+        # 本批次处理计时（点击「开始处理」起算）
+        self._process_t0_mono: float | None = None
+        self._process_t0_wall: datetime | None = None
         # 路径到列表项的映射缓存，加速缩略图加载时的查找
         self._path_to_item: dict[str, QListWidgetItem] = {}
+        # 最近一次可续跑/重试的批处理会话（内存）
+        self._batch_session: BatchSession | None = None
+        self._run_mode: str = "full"  # full | continue | retry_failed
         # 图片处理器（BaseProcessor 体系）
         self._processors: list[BaseProcessor] = []
         self._current_processor: BaseProcessor | None = None
@@ -211,6 +245,17 @@ class MainWindow(QMainWindow):
         self.lbl_file_count = QLabel("共 0 个文件")
         self.lbl_file_count.setStyleSheet("color:#888;font-size:12px;")
         left_lay.addWidget(self.lbl_file_count)
+
+        # 失败项快捷选择（配合「仅选中」重跑）
+        fail_row = QHBoxLayout()
+        fail_row.setSpacing(4)
+        self.btn_select_failed = QPushButton("选中失败项")
+        self.btn_select_failed.setToolTip("选中上一批处理失败的文件，可配合「仅选中」范围重新处理")
+        self.btn_select_failed.setEnabled(False)
+        self.btn_select_failed.setVisible(False)
+        fail_row.addWidget(self.btn_select_failed)
+        fail_row.addStretch()
+        left_lay.addLayout(fail_row)
 
         # 预览
         self.preview_label = QLabel("点击列表预览图片")
@@ -470,12 +515,31 @@ class MainWindow(QMainWindow):
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setFormat("%v / %m")
         bottom.addWidget(self.progress_bar, 1)
+        self.btn_continue = QPushButton("继续")
+        self.btn_continue.setObjectName("btn_resume")
+        self.btn_continue.setMinimumHeight(38)
+        self.btn_continue.setVisible(False)
+        self.btn_continue.setToolTip(
+            "从取消后剩余的未完成文件继续处理（含取消时中断的那张）。\n"
+            "使用该批次保存的参数与输出设置。"
+        )
+        bottom.addWidget(self.btn_continue)
+        self.btn_retry_failed = QPushButton("重试失败")
+        self.btn_retry_failed.setObjectName("btn_resume")
+        self.btn_retry_failed.setMinimumHeight(38)
+        self.btn_retry_failed.setVisible(False)
+        self.btn_retry_failed.setToolTip(
+            "仅重新处理上一批失败的文件。\n"
+            "使用该批次保存的参数与输出设置。"
+        )
+        bottom.addWidget(self.btn_retry_failed)
         self.btn_start = QPushButton("  开始处理  ")
         self.btn_start.setObjectName("btn_start")
         self.btn_start.setMinimumHeight(38)
         bottom.addWidget(self.btn_start)
         self.btn_cancel = QPushButton("取消")
         self.btn_cancel.setEnabled(False)
+        self.btn_cancel.setVisible(False)
         self.btn_cancel.setMinimumHeight(38)
         bottom.addWidget(self.btn_cancel)
         right_lay.addLayout(bottom)
@@ -505,7 +569,10 @@ class MainWindow(QMainWindow):
         self.btn_remove.clicked.connect(self._remove_selected)
         self.btn_browse.clicked.connect(self._browse_output)
         self.btn_start.clicked.connect(self._start_process)
+        self.btn_continue.clicked.connect(self._continue_process)
+        self.btn_retry_failed.clicked.connect(self._retry_failed_process)
         self.btn_cancel.clicked.connect(self._cancel_process)
+        self.btn_select_failed.clicked.connect(self._select_failed_files)
         self.file_list.currentItemChanged.connect(self._on_file_selected)
         self.file_list.itemSelectionChanged.connect(self._on_selection_changed)
         self.file_list.model().rowsInserted.connect(self._update_file_count)
@@ -605,6 +672,25 @@ class MainWindow(QMainWindow):
                 background: rgba(50, 50, 70, 140);
                 color: #555;
                 border-color: rgba(80, 80, 100, 0.2);
+            }}
+
+            /* 继续 / 重试失败 */
+            QPushButton#btn_resume {{
+                background: rgba(55, 70, 120, 160);
+                color: #d8e0ff;
+                border: 1px solid rgba(100, 140, 255, 0.35);
+                border-radius: 8px;
+                padding: 6px 14px;
+            }}
+            QPushButton#btn_resume:hover {{
+                background: rgba(70, 90, 150, 190);
+                border-color: rgba(130, 170, 255, 0.55);
+                color: #fff;
+            }}
+            QPushButton#btn_resume:disabled {{
+                background: rgba(40, 40, 60, 100);
+                color: #555;
+                border-color: rgba(80, 80, 100, 0.15);
             }}
 
             /* Tab 按钮 */
@@ -878,6 +964,13 @@ class MainWindow(QMainWindow):
         # 重置滚动条到顶部
         self._scroll_to_top()
         self._refresh_preset_list()
+        # 切换功能后刷新面板状态（如抠图模型就绪提示）
+        proc = self._get_current_any_processor()
+        if proc is not None and hasattr(proc, "on_panel_activated"):
+            try:
+                proc.on_panel_activated()
+            except Exception:
+                pass
         # 切换功能后，把当前选中图推给新处理器（元数据回读等）
         cur = self.file_list.currentItem()
         path = cur.data(ROLE_PATH) if cur is not None else None
@@ -899,6 +992,14 @@ class MainWindow(QMainWindow):
         # 配置页首次进入时再构建，避免拖慢启动
         if idx == 2:
             self._ensure_settings_panel()
+        # 回到图像处理时刷新当前面板状态（如抠图模型就绪提示）
+        elif idx == 0:
+            proc = self._get_current_any_processor()
+            if proc is not None and hasattr(proc, "on_panel_activated"):
+                try:
+                    proc.on_panel_activated()
+                except Exception:
+                    pass
 
     def _ensure_settings_panel(self):
         if self.settings_panel is not None:
@@ -912,11 +1013,42 @@ class MainWindow(QMainWindow):
             return
         panel = SettingsPanel(lazy=True)
         self.settings_panel = panel
+        panel.log_begin.connect(self._on_settings_log_begin)
+        panel.log_line.connect(self._on_settings_log_line)
         if self._settings_placeholder is not None:
             self._settings_page_lay.removeWidget(self._settings_placeholder)
             self._settings_placeholder.deleteLater()
             self._settings_placeholder = None
         self._settings_page_lay.addWidget(panel, 1)
+        # 若有待跳转的配置子菜单（如从透明图处理点链接）
+        pending = getattr(self, "_pending_settings_menu", None)
+        if pending is not None:
+            self._pending_settings_menu = None
+            panel.open_menu(int(pending))
+
+    def open_settings(self, menu_row: int = 0):
+        """打开「配置」Tab，并切换到指定左侧菜单（0=开发环境，1=抠图模型）。"""
+        self._pending_settings_menu = menu_row
+        self._switch_tab(2)
+        if self.settings_panel is not None:
+            self._pending_settings_menu = None
+            self.settings_panel.open_menu(menu_row)
+
+    def _on_settings_log_begin(self, feature_id: str, title: str):
+        """配置中心长任务开始：切换后台日志并写入标题。"""
+        try:
+            self._log_manager.switch_feature(feature_id or "settings_runtime", clear_current=True)
+        except Exception:
+            pass
+        self.log_text.clear()
+        self._switch_tab(1)
+        self._log(title)
+        self._log("─" * 50)
+
+    def _on_settings_log_line(self, text: str):
+        """配置中心进度/详情写入后台日志。"""
+        if text:
+            self._log(text)
 
     # ─── 菜单栏 ───
     def _build_menubar(self):
@@ -1040,14 +1172,16 @@ class MainWindow(QMainWindow):
                         # 对于单个添加的文件，尽量显示其父目录+文件名以便区分
                         display_name = f"{Path(f).parent.name}/{Path(f).name}"
                         
-                    item = QListWidgetItem(display_name)
-                    item.setData(ROLE_PATH, f)
-                    item.setData(ROLE_REL_PATH, rel_path)
-                    item.setToolTip(f)
-                    # 文档文件显示文字图标，不加载缩略图
+                    base_text = display_name
                     if Path(f).suffix.lower() in DOC_EXTS:
                         ext = Path(f).suffix.lower()
-                        item.setText(f"{'📄' if ext == '.pdf' else '📝'}  {display_name}")
+                        base_text = f"{'📄' if ext == '.pdf' else '📝'}  {display_name}"
+                    item = QListWidgetItem(base_text)
+                    item.setData(ROLE_PATH, f)
+                    item.setData(ROLE_REL_PATH, rel_path)
+                    item.setData(ROLE_BASE_TEXT, base_text)
+                    item.setData(ROLE_JOB_STATUS, STATUS_PENDING)
+                    item.setToolTip(f)
                     self.file_list.addItem(item)
                     # 缓存路径到项的映射
                     self._path_to_item[f] = item
@@ -1080,6 +1214,7 @@ class MainWindow(QMainWindow):
         self.preview_label.clear()
         self.preview_label.setText("点击列表预览图片")
         self.lbl_preview_info.setText("")
+        self._clear_batch_session()
 
     def _remove_selected(self):
         selected_items = self.file_list.selectedItems()
@@ -1097,9 +1232,18 @@ class MainWindow(QMainWindow):
                 path = item.data(ROLE_PATH)
                 self._path_to_item.pop(path, None)
                 self.file_list.takeItem(row)
+                # 同步会话：移除的文件不再参与续跑
+                if self._batch_session is not None:
+                    job = self._batch_session.get(path)
+                    if job is not None:
+                        self._batch_session.files = [
+                            f for f in self._batch_session.files if f.path != path
+                        ]
+                        self._batch_session._index.pop(path, None)
         finally:
             # 恢复 UI 更新
             self.file_list.setUpdatesEnabled(True)
+        self._update_resume_buttons()
         
         # 更新文件计数
         self._update_file_count()
@@ -1196,14 +1340,282 @@ class MainWindow(QMainWindow):
         if folder:
             self.txt_output_dir.setText(folder)
 
+    # ─── 批处理会话 / 列表状态 ───
+    def _clear_batch_session(self):
+        self._batch_session = None
+        self._run_mode = "full"
+        self._reset_list_job_status()
+        self._update_resume_buttons()
+
+    def _reset_list_job_status(self):
+        for i in range(self.file_list.count()):
+            item = self.file_list.item(i)
+            if item is None:
+                continue
+            self._apply_item_job_status(item, STATUS_PENDING, error="")
+
+    def _apply_item_job_status(self, item: QListWidgetItem, status: str, error: str = ""):
+        if item is None:
+            return
+        base = item.data(ROLE_BASE_TEXT)
+        if not base:
+            # 兼容旧项：去掉已知前缀
+            text = item.text()
+            for pref in _STATUS_PREFIX.values():
+                if pref and text.startswith(pref):
+                    text = text[len(pref):]
+                    break
+            base = text
+            item.setData(ROLE_BASE_TEXT, base)
+        prefix = _STATUS_PREFIX.get(status, "")
+        item.setText(f"{prefix}{base}")
+        item.setData(ROLE_JOB_STATUS, status)
+        color = _STATUS_COLOR.get(status, _STATUS_COLOR[STATUS_PENDING])
+        item.setForeground(color)
+        path = item.data(ROLE_PATH) or ""
+        tip_lines = [str(path)] if path else []
+        status_label = {
+            STATUS_PENDING: "未处理",
+            STATUS_RUNNING: "处理中",
+            STATUS_SUCCESS: "成功",
+            STATUS_FAILED: "失败",
+            STATUS_CANCELLED: "已取消（未完成）",
+        }.get(status, status)
+        tip_lines.append(f"状态: {status_label}")
+        if error:
+            tip_lines.append(f"错误: {error.splitlines()[0]}")
+        item.setToolTip("\n".join(tip_lines))
+
+    def _set_path_job_status(self, path: str, status: str, error: str = ""):
+        item = self._path_to_item.get(path)
+        if item is not None:
+            self._apply_item_job_status(item, status, error=error)
+
+    def _sync_list_from_session(self):
+        sess = self._batch_session
+        if sess is None:
+            return
+        for job in sess.files:
+            self._set_path_job_status(job.path, job.status, error=job.error)
+
+    def _update_resume_buttons(self):
+        """
+        底部按钮按需显示，避免常态冗余：
+        - 「继续」：仅用户取消后且仍有未完成时显示
+        - 「重试失败」：仅存在失败项时显示
+        """
+        busy = self.worker is not None and self.worker.isRunning()
+        sess = self._batch_session
+        # 继续：必须是取消过的会话，且还有 pending/cancelled
+        show_cont = (
+            (not busy)
+            and sess is not None
+            and sess.supports_resume
+            and sess.user_cancelled
+            and sess.can_continue()
+        )
+        # 重试失败：有失败即可（取消后若也有失败可一并显示）
+        show_retry = (
+            (not busy)
+            and sess is not None
+            and sess.supports_resume
+            and sess.can_retry_failed()
+        )
+        self.btn_continue.setVisible(show_cont)
+        self.btn_continue.setEnabled(show_cont)
+        self.btn_retry_failed.setVisible(show_retry)
+        self.btn_retry_failed.setEnabled(show_retry)
+
+        has_failed = sess is not None and bool(sess.failed_paths())
+        self.btn_select_failed.setVisible(has_failed)
+        self.btn_select_failed.setEnabled(has_failed and not busy)
+
+        if sess and sess.supports_resume:
+            s = sess.summary()
+            unfinished = s["pending"] + s["cancelled"]
+            self.btn_continue.setText(
+                f"继续({unfinished})" if unfinished else "继续"
+            )
+            self.btn_retry_failed.setText(
+                f"重试失败({s['failed']})" if s["failed"] else "重试失败"
+            )
+        else:
+            self.btn_continue.setText("继续")
+            self.btn_retry_failed.setText("重试失败")
+
+    def _select_failed_files(self):
+        sess = self._batch_session
+        if sess is None:
+            return
+        failed = set(sess.failed_paths())
+        if not failed:
+            return
+        self.file_list.clearSelection()
+        first = None
+        for path in failed:
+            item = self._path_to_item.get(path)
+            if item is None:
+                continue
+            item.setSelected(True)
+            if first is None:
+                first = item
+        if first is not None:
+            self.file_list.setCurrentItem(first)
+            self.file_list.scrollToItem(first)
+        self.rb_scope_selected.setChecked(True)
+        self._log(f"已选中 {len(failed)} 个失败文件，处理范围已切换为「仅选中」")
+
+    def _resolve_processor_for_session(self, sess: BatchSession):
+        if sess.kind == "image":
+            for p in self._processors:
+                if p.preset_id == sess.processor_preset_id:
+                    return p
+        else:
+            for p in self._file_processors:
+                if p.preset_id == sess.processor_preset_id:
+                    return p
+        return None
+
+    def _processor_supports_resume(self, proc) -> bool:
+        """批量合并类不支持按文件续跑。"""
+        if proc is None:
+            return False
+        return not bool(getattr(proc, "is_batch_processor", False))
+
     # ─── 处理逻辑 ───
     def _start_process(self):
+        self._begin_process(mode="full")
+
+    def _continue_process(self):
+        self._begin_process(mode="continue")
+
+    def _retry_failed_process(self):
+        self._begin_process(mode="retry_failed")
+
+    def _begin_process(self, mode: str = "full"):
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.warning(self, "提示", "已有任务正在处理，请等待完成或取消后再试")
+            return
+
+        mode_names = ["桌面路径", "自定义路径", "原图路径(覆盖)", "原图路径(副本)"]
+
+        # ── 续跑 / 重试失败：复用会话快照 ──
+        if mode in ("continue", "retry_failed"):
+            sess = self._batch_session
+            if sess is None or not sess.supports_resume:
+                QMessageBox.information(self, "提示", "当前没有可续跑的批处理任务")
+                return
+            paths = sess.pending_paths() if mode == "continue" else sess.failed_paths()
+            if not paths:
+                tip = "没有未完成的文件" if mode == "continue" else "没有失败的文件"
+                QMessageBox.information(self, "提示", tip)
+                return
+            proc = self._resolve_processor_for_session(sess)
+            if proc is None:
+                QMessageBox.warning(
+                    self, "提示",
+                    f"找不到原功能「{sess.processor_name}」，无法续跑。\n请重新选择功能后点「开始处理」。"
+                )
+                return
+
+            # 切回对应功能（不改用户面板参数；Worker 用会话 options）
+            self._activate_processor_by_preset(sess.processor_preset_id, sess.kind)
+
+            sess.reset_for_retry(paths)
+            self._sync_list_from_session()
+            self._run_mode = mode
+            file_list = list(paths)
+            rel_map = {
+                p: sess.rel_path_map[p]
+                for p in file_list
+                if sess.keep_structure and p in sess.rel_path_map
+            }
+            file_index_map = sess.order_map()
+            output_dir = sess.output_dir
+            auto_folder = sess.auto_subfolder
+            is_overwrite = sess.overwrite
+            options = dict(sess.options)
+            count = len(file_list)
+
+            proc_for_log = proc
+            if proc_for_log is not None:
+                self._log_manager.switch_feature(proc_for_log.preset_id, clear_current=False)
+            self._switch_tab(1)
+            self.progress_bar.setMaximum(count)
+            self.progress_bar.setValue(0)
+            self.btn_start.setEnabled(False)
+            self.btn_continue.setVisible(False)
+            self.btn_retry_failed.setVisible(False)
+            self.btn_cancel.setVisible(True)
+            self.btn_cancel.setEnabled(True)
+
+            self._process_t0_mono = time.monotonic()
+            self._process_t0_wall = datetime.now()
+            start_text = self._process_t0_wall.strftime("%Y-%m-%d %H:%M:%S")
+            action = "继续未完成" if mode == "continue" else "重试失败"
+            icon = getattr(proc, "icon", "")
+            self._log("─" * 50)
+            self._log(f"▶ {action}: {icon}  {proc.name}  共 {count} 个文件")
+            self._log(f"输出: {mode_names[sess.path_mode_id]}  →  {output_dir}")
+            self._log(f"参数: 沿用该批次快照")
+            self._log(f"开始时间: {start_text}")
+            self._log("─" * 50)
+
+            if sess.kind == "image":
+                self.worker = ProcessWorker(
+                    file_list, output_dir, proc, options,
+                    auto_subfolder=auto_folder,
+                    overwrite=is_overwrite,
+                    rel_path_map=rel_map,
+                    file_index_map=file_index_map,
+                )
+                self.worker.progress.connect(self._on_progress)
+                self.worker.image_done.connect(self._on_image_done)
+                self.worker.finished.connect(self._on_worker_finished)
+                self.worker.debug.connect(self._on_worker_debug)
+                self.worker.start()
+            else:
+                self.worker = FileProcessWorker(
+                    file_list, output_dir, proc, options,
+                    auto_subfolder=auto_folder,
+                    rel_path_map=rel_map,
+                    file_index_map=file_index_map,
+                )
+                self.worker.progress.connect(self._on_progress)
+                self.worker.file_done.connect(self._on_file_done)
+                self.worker.finished.connect(self._on_worker_finished)
+                self.worker.debug.connect(self._on_worker_debug)
+                self.worker.start()
+            return
+
+        # ── 全新整批 ──
         if self.file_list.count() == 0:
             QMessageBox.warning(self, "提示", "请先添加要处理的文件")
             return
         if self._current_processor is None and self._current_file_processor is None:
             QMessageBox.warning(self, "提示", "请选择处理功能")
             return
+
+        # 若有未完成/失败会话，确认是否开新批次
+        old = self._batch_session
+        if old is not None and old.supports_resume and (
+            old.can_continue() or old.can_retry_failed()
+        ):
+            s = old.summary()
+            unfinished = s["pending"] + s["cancelled"]
+            ret = QMessageBox.question(
+                self,
+                "开始新任务",
+                (
+                    f"上一批仍有未完成 {unfinished} 个、失败 {s['failed']} 个。\n"
+                    f"开始新任务将清除续跑记录（已成功输出的文件不受影响）。\n\n"
+                    f"是否继续开始新任务？"
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                return
 
         # 验证自定义路径
         mode_id = self.path_group.checkedId()
@@ -1229,7 +1641,6 @@ class MainWindow(QMainWindow):
             self._log_manager.switch_feature(proc_for_log.preset_id, clear_current=True)
         self.log_text.clear()
         self._switch_tab(1)
-        mode_names = ["桌面路径", "自定义路径", "原图路径(覆盖)", "原图路径(副本)"]
         scope_name = "仅选中" if scope_selected else "全部文件"
         auto_folder = self.chk_auto_folder.isChecked() and not is_overwrite
         # 仅桌面/自定义路径模式支持按相对路径重建子目录
@@ -1243,54 +1654,156 @@ class MainWindow(QMainWindow):
         self.progress_bar.setMaximum(count)
         self.progress_bar.setValue(0)
         self.btn_start.setEnabled(False)
+        self.btn_continue.setVisible(False)
+        self.btn_retry_failed.setVisible(False)
+        self.btn_select_failed.setVisible(False)
+        self.btn_cancel.setVisible(True)
         self.btn_cancel.setEnabled(True)
+
+        # 批次计时：以点击「开始处理」为准
+        self._process_t0_mono = time.monotonic()
+        self._process_t0_wall = datetime.now()
+        start_text = self._process_t0_wall.strftime("%Y-%m-%d %H:%M:%S")
+        self._run_mode = "full"
 
         if self._current_processor is not None:
             # ── 图片处理 Worker ──
             proc = self._current_processor
             options = proc.gather_options()
+            options["_output_format"] = proc.get_output_format()
+            supports = self._processor_supports_resume(proc)
+            self._batch_session = BatchSession.create(
+                kind="image",
+                processor_preset_id=proc.preset_id,
+                processor_name=proc.name,
+                supports_resume=supports,
+                options=options,
+                output_dir=output_dir,
+                auto_subfolder=auto_folder,
+                overwrite=is_overwrite,
+                keep_structure=keep_structure,
+                path_mode_id=mode_id,
+                entries=entries,
+            )
+            self._reset_list_job_status()
+            for p, _ in entries:
+                self._set_path_job_status(p, STATUS_PENDING)
+
             self._log(f"功能: {proc.icon}  {proc.name}")
             self._log(f"处理范围: {scope_name}  共 {count} 个文件")
             self._log(f"输出模式: {mode_names[mode_id]}  →  {output_dir}")
             if keep_structure:
                 self._log(f"保留目录结构: 是（{len(rel_map)} 个文件含相对路径）")
+            if not supports:
+                self._log("说明: 当前为批量合并功能，不支持中途续跑/按文件重试")
+            self._log(f"开始时间: {start_text}")
             self._log("─" * 50)
             self.worker = ProcessWorker(
                 file_list, output_dir, proc, options,
                 auto_subfolder=auto_folder,
                 overwrite=is_overwrite,
                 rel_path_map=rel_map,
+                file_index_map=self._batch_session.order_map(),
             )
             self.worker.progress.connect(self._on_progress)
             self.worker.image_done.connect(self._on_image_done)
-            self.worker.all_done.connect(self._on_all_done)
+            self.worker.finished.connect(self._on_worker_finished)
             self.worker.debug.connect(self._on_worker_debug)
             self.worker.start()
         else:
             # ── 文件处理 Worker ──
             proc = self._current_file_processor
             options = proc.gather_options()
+            supports = True  # 文件处理器均为逐文件
+            self._batch_session = BatchSession.create(
+                kind="file",
+                processor_preset_id=proc.preset_id,
+                processor_name=proc.name,
+                supports_resume=supports,
+                options=options,
+                output_dir=output_dir,
+                auto_subfolder=auto_folder,
+                overwrite=is_overwrite,
+                keep_structure=keep_structure,
+                path_mode_id=mode_id,
+                entries=entries,
+            )
+            self._reset_list_job_status()
+            for p, _ in entries:
+                self._set_path_job_status(p, STATUS_PENDING)
+
             self._log(f"功能: {proc.icon}  {proc.name}")
             self._log(f"处理范围: {scope_name}  共 {count} 个文件")
             self._log(f"输出模式: {mode_names[mode_id]}  →  {output_dir}")
             if keep_structure:
                 self._log(f"保留目录结构: 是（{len(rel_map)} 个文件含相对路径）")
+            self._log(f"开始时间: {start_text}")
             self._log("─" * 50)
             self.worker = FileProcessWorker(
                 file_list, output_dir, proc, options,
                 auto_subfolder=auto_folder,
                 rel_path_map=rel_map,
+                file_index_map=self._batch_session.order_map(),
             )
             self.worker.progress.connect(self._on_progress)
             self.worker.file_done.connect(self._on_file_done)
-            self.worker.all_done.connect(self._on_all_done)
+            self.worker.finished.connect(self._on_worker_finished)
             self.worker.debug.connect(self._on_worker_debug)
             self.worker.start()
 
+    def _activate_processor_by_preset(self, preset_id: str, kind: str):
+        """切换功能下拉到指定处理器（续跑时保证 UI 与任务一致，不清空日志）。"""
+        combo = self.combo_processor
+        procs = self._processors if kind == "image" else self._file_processors
+        target_idx = None
+        for i, p in enumerate(procs):
+            if p.preset_id == preset_id:
+                target_idx = i
+                break
+        if target_idx is None:
+            return
+        for i in range(combo.count()):
+            data = combo.itemData(i)
+            if data != (kind, target_idx):
+                continue
+            if combo.currentIndex() == i:
+                # 已选中时仍同步 current 引用
+                if kind == "image":
+                    self._current_processor = self._processors[target_idx]
+                    self._current_file_processor = None
+                else:
+                    self._current_processor = None
+                    self._current_file_processor = self._file_processors[target_idx]
+                return
+            # 阻断 currentIndexChanged，避免 switch_feature(clear) 清掉续跑日志
+            combo.blockSignals(True)
+            combo.setCurrentIndex(i)
+            combo.blockSignals(False)
+            if kind == "image":
+                self._current_processor = self._processors[target_idx]
+                self._current_file_processor = None
+                self.panel_stack.setCurrentIndex(target_idx)
+                self.lbl_proc_desc.setText(self._current_processor.description)
+            else:
+                self._current_processor = None
+                self._current_file_processor = self._file_processors[target_idx]
+                self.panel_stack.setCurrentIndex(len(self._processors) + target_idx)
+                self.lbl_proc_desc.setText(self._current_file_processor.description)
+            self._scroll_to_top()
+            self._refresh_preset_list()
+            return
+
     def _cancel_process(self):
         if self.worker:
+            # 先标记当前 running，避免 cancel 抢在 image_done 前
+            cur = getattr(self.worker, "current_path", None)
+            if self._batch_session is not None and cur:
+                self._batch_session.mark_running(cur)
             self.worker.cancel()
-            self._log("⚠ 用户取消处理")
+            if self._batch_session is not None:
+                self._batch_session.mark_cancelled_running()
+                self._sync_list_from_session()
+            self._log("⚠ 用户取消处理（已成功的文件保留；可用「继续」处理剩余）")
 
     def _on_progress(self, current, total, filename):
         # 动态同步最大值（批量处理器上报的 total 是文件总数，可能与初始 count 不同）
@@ -1299,8 +1812,30 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(current)
         if filename and filename != "完成":
             self._log(f"  ▶ {filename}")
+        # 标记 running（用 worker.current_path 更准）
+        if self.worker is not None and self._batch_session is not None:
+            cur = getattr(self.worker, "current_path", None)
+            if cur:
+                self._batch_session.mark_running(cur)
+                self._set_path_job_status(cur, STATUS_RUNNING)
+
+    def _record_result_to_session(self, result):
+        sess = self._batch_session
+        if sess is None or not sess.supports_resume:
+            return
+        path = getattr(result, "input_path", "") or ""
+        if not path or path.startswith("分组:") or path == "批量处理":
+            return
+        if result.success:
+            sess.mark_success(path, getattr(result, "output_path", "") or "")
+            self._set_path_job_status(path, STATUS_SUCCESS)
+        else:
+            err = str(getattr(result, "error", "") or "")
+            sess.mark_failed(path, err)
+            self._set_path_job_status(path, STATUS_FAILED, error=err)
 
     def _on_image_done(self, result):
+        self._record_result_to_session(result)
         name = Path(result.input_path).name
         if result.success:
             d = result.details or {}
@@ -1318,7 +1853,12 @@ class MainWindow(QMainWindow):
                 parts.append(f"抠图→{d['matting_model']}{refine}")
             if "trimmed_size" in d:
                 parts.append(f"裁剪→{d['trimmed_size'][0]}×{d['trimmed_size'][1]}")
-            if "resized_size" in d:
+            if "layout_display_size" in d:
+                size = d["layout_display_size"]
+                parts.append(
+                    f"主体→{size[0]}×{size[1]}（画布占比 {d.get('subject_percent', '?')}%）"
+                )
+            elif "resized_size" in d:
                 parts.append(f"缩放→{d['resized_size'][0]}×{d['resized_size'][1]}")
             if "canvas_size" in d:
                 parts.append(f"画布→{d['canvas_size'][0]}×{d['canvas_size'][1]}")
@@ -1352,6 +1892,7 @@ class MainWindow(QMainWindow):
                 self._on_worker_debug(f"{name} 完整错误信息:\n{error}")
 
     def _on_file_done(self, result):
+        self._record_result_to_session(result)
         name = Path(result.input_path).name
         if result.success:
             d = result.details or {}
@@ -1377,18 +1918,111 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        """将秒数格式化为可读时长，如 12.3 秒 / 1 分 05.2 秒 / 1 小时 02 分 03.1 秒。"""
+        if seconds < 0:
+            seconds = 0.0
+        total_ms = int(round(seconds * 1000))
+        s_whole, ms = divmod(total_ms, 1000)
+        h, rem = divmod(s_whole, 3600)
+        m, s = divmod(rem, 60)
+        frac = f"{s}.{ms:03d}".rstrip("0").rstrip(".")
+        if h > 0:
+            return f"{h} 小时 {m:02d} 分 {frac} 秒（共 {seconds:.3f} 秒）"
+        if m > 0:
+            return f"{m} 分 {frac} 秒（共 {seconds:.3f} 秒）"
+        return f"{frac} 秒"
+
+    def _on_worker_finished(self):
+        """仅在 QThread 已完全退出后结算，避免销毁仍处于清理阶段的线程对象。"""
+        worker = self.worker
+        if worker is None:
+            return
+        results = list(getattr(worker, "results", []) or [])
+        self._on_all_done(results)
+
     def _on_all_done(self, results):
-        success = sum(1 for r in results if r.success)
-        fail = len(results) - success
+        # 取消时可能仍有 running 未落到 cancelled
+        if self._batch_session is not None and self._batch_session.user_cancelled:
+            self._batch_session.mark_cancelled_running()
+            self._sync_list_from_session()
+
+        sess = self._batch_session
+        if sess is not None and sess.supports_resume:
+            s = sess.summary()
+            success = s["success"]
+            fail = s["failed"]
+            unfinished = s["pending"] + s["cancelled"]
+            run_success = sum(1 for r in results if r.success)
+            run_fail = len(results) - run_success
+        else:
+            success = sum(1 for r in results if r.success)
+            fail = len(results) - success
+            unfinished = 0
+            run_success, run_fail = success, fail
+            s = None
+
+        end_wall = datetime.now()
+        elapsed = None
+        if self._process_t0_mono is not None:
+            elapsed = time.monotonic() - self._process_t0_mono
+        start_text = (
+            self._process_t0_wall.strftime("%Y-%m-%d %H:%M:%S")
+            if self._process_t0_wall is not None
+            else "—"
+        )
+        end_text = end_wall.strftime("%Y-%m-%d %H:%M:%S")
         self._log("─" * 50)
-        self._log(f"处理完成!  成功: {success}  失败: {fail}")
+        if sess is not None and sess.supports_resume:
+            self._log(
+                f"处理结束!  本轮成功: {run_success}  本轮失败: {run_fail}"
+                f"  |  累计成功: {success}  失败: {fail}  未完成: {unfinished}"
+            )
+            if sess.user_cancelled:
+                self._log("状态: 用户已取消")
+        else:
+            self._log(f"处理完成!  成功: {success}  失败: {fail}")
+        self._log(f"开始时间: {start_text}")
+        self._log(f"结束时间: {end_text}")
+        if elapsed is not None:
+            self._log(f"处理耗时: {self._format_duration(elapsed)}")
+        self._process_t0_mono = None
+        self._process_t0_wall = None
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+        self.btn_cancel.setVisible(False)
         self.worker = None
-        if fail == 0:
-            QMessageBox.information(self, "完成", f"全部 {success} 个文件处理成功!")
+        self._update_resume_buttons()
+
+        # 全部成功且无未完成
+        if fail == 0 and unfinished == 0:
+            if elapsed is not None:
+                QMessageBox.information(
+                    self, "完成",
+                    f"全部 {success} 个文件处理成功!\n耗时: {self._format_duration(elapsed)}"
+                )
+            else:
+                QMessageBox.information(self, "完成", f"全部 {success} 个文件处理成功!")
+            return
+
+        # 取消：仅提示结果，不在弹窗里放继续/重试（需要时用底部按钮）
+        lines = []
+        if sess is not None and sess.supports_resume and s is not None:
+            lines.append(f"累计成功: {success}    失败: {fail}    未完成: {unfinished}")
         else:
-            QMessageBox.warning(self, "完成", f"成功: {success}  失败: {fail}\n请查看日志")
+            lines.append(f"成功: {success}    失败: {fail}")
+        if elapsed is not None:
+            lines.append(f"耗时: {self._format_duration(elapsed)}")
+
+        if sess is not None and sess.user_cancelled:
+            lines.append("任务已取消。如需接着处理，可使用底部「继续」。")
+            QMessageBox.information(self, "已取消", "\n".join(lines))
+            return
+
+        # 自然结束且有失败：提示可用底部「重试失败」
+        lines.append("可查看后台日志；失败项可用底部「重试失败」重新处理。")
+        QMessageBox.warning(self, "完成", "\n".join(lines))
 
     def _log(self, text: str):
         self.log_text.append(text)

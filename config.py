@@ -8,7 +8,7 @@ from pathlib import Path
 # ─── 应用基本信息 ───
 APP_NAME = "PixelFlow"
 APP_TITLE = "PixelFlow - 图像处理工作台"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_DESCRIPTION = "图像处理工作台"
 APP_PUBLISHER = "PixelFlow"
 

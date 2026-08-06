@@ -4,6 +4,12 @@
 
 ## 2026-08-06
 
+### 打包配置 — 修复 exe 启动 `No module named 'html'`
+
+- 从 PyInstaller `excludes` 移除标准库 `html`（主窗口 HTML 抽图 / 粘贴依赖 `html`、`html.parser`）
+- 在 `hiddenimports` 中显式加入 `html`、`html.parser`、`html.entities`，避免安装后启动即崩溃
+- 同步排查 DOCX/PDF 抽图与排版导出：DOCX 抽图仅用 `zipfile`（未排除）；PDF 抽图依赖延迟导入的 `pypdf`，已补入 `hiddenimports`；并显式收集 `docx` / `pptx` / `reportlab` / `zipfile`，避免打包后抽图静默失败或导出缺模块
+
 ### 文件列表 — 粘贴与拖放导入
 
 - 支持 Ctrl+V 粘贴：资源管理器中的文件/文件夹、截图等剪贴板图片（落盘为临时 PNG）、以及文本形式的本地路径

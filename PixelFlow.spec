@@ -101,6 +101,27 @@ a = Analysis(
         'email.mime',
         'email.mime.text',
         'email.mime.multipart',
+        # 主窗口 HTML 抽图 / 粘贴：import html、html.parser
+        'html',
+        'html.parser',
+        'html.entities',
+        # 主窗口 PDF 抽图（函数内延迟 import，需显式收集）
+        'pypdf',
+        'pypdf.generic',
+        # 排版导出等函数内延迟 import（与 openpyxl 同理）
+        'docx',
+        'docx.shared',
+        'pptx',
+        'pptx.util',
+        'pptx.dml.color',
+        'reportlab',
+        'reportlab.pdfgen',
+        'reportlab.pdfgen.canvas',
+        'reportlab.lib.units',
+        'reportlab.lib.colors',
+        'reportlab.lib.utils',
+        # DOCX 抽图用标准库 zipfile（防分析遗漏）
+        'zipfile',
         'PySide6.QtCore',
         'PySide6.QtGui',
         'PySide6.QtWidgets',
@@ -111,7 +132,9 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[str(ROOT / 'packaging' / 'rthook_pyside6.py')],
     excludes=[
-        'tkinter', 'unittest', 'html',
+        # 不可排除：html（抽图/粘贴）；http/email/xml（pptx/docx）；zipfile（DOCX 抽图）
+        # 注意：excludes 里的 PySide6.QtPdf 是 Qt 模块，与第三方 pypdf 无关
+        'tkinter', 'unittest',
         'pydoc', 'doctest', 'difflib',
         # 明确排除用不到的大型 Qt 模块（分析阶段减少误收集）
         'PySide6.Qt3DAnimation',

@@ -61,7 +61,7 @@ MATTING_MODELS: dict[str, MattingModelInfo] = {
         ),
         python_version="3.12",
         env_packages=(
-            # CPU 默认轮子，兼容性最好；有 NVIDIA 时可在环境页提示改装 CUDA 版
+            # torch/torchvision 由 RuntimeManager 按本机 GPU 选择 CUDA 或 CPU 索引安装
             "torch",
             "torchvision",
             "numpy",
@@ -122,6 +122,7 @@ MATTING_MODELS: dict[str, MattingModelInfo] = {
         ),
         python_version="3.12",
         env_packages=(
+            # torch/torchvision 由 RuntimeManager 按本机 GPU 选择 CUDA 或 CPU 索引安装
             "torch",
             "torchvision",
             "numpy",

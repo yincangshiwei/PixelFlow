@@ -9,10 +9,11 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QObject, Signal, Slot, QTimer, QThread
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel, QPushButton,
     QComboBox, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget,
-    QFileDialog, QProgressBar, QTextEdit, QMessageBox,
+    QFileDialog, QProgressBar, QTextEdit, QMessageBox, QDialog,
     QScrollArea, QFrame, QSizePolicy,
 )
 
@@ -27,6 +28,12 @@ from core.runtime.env_manager import (
     ModelEnvStatus,
     DEFAULT_PIP_INDEX_URL,
     PIP_INDEX_PRESETS,
+    VC_REDIST_X64_URL,
+    VC_REDIST_HELP_URL,
+    NVIDIA_DRIVER_URL,
+    plan_torch_install,
+    build_ai_setup_prompt,
+    match_local_gpu,
 )
 
 
@@ -54,9 +61,12 @@ class _DevScanWorker(QThread):
     def run(self):
         rt = get_runtime_manager()
         if self.force:
-            rt.invalidate_caches(pythons=True, uv=True)
+            rt.invalidate_caches(pythons=True, uv=True, vc=True)
         pys = rt.discover_pythons(force=self.force)
         uv = rt.resolve_uv(force=self.force)
+        # 强制刷新时同步重检 VC++，写入诊断文本
+        if self.force:
+            rt.get_vc_redist(force=True)
         diag = rt.diagnose_text()
         self.done.emit(pys, uv, diag)
 
@@ -247,6 +257,41 @@ class SettingsPanel(QWidget):
         gu.addWidget(self.lbl_dev_msg)
         lay.addWidget(grp_uv)
 
+        # VC++ 运行库（Windows / PyTorch 必需）
+        grp_vc = QGroupBox("VC++ 运行库（Windows）")
+        gv = QVBoxLayout(grp_vc)
+        gv.setSpacing(8)
+        vc_tip = QLabel(
+            "PyTorch 等原生扩展依赖系统 <b>Microsoft Visual C++ 2015–2022</b> 运行库。"
+            "即使 pip 安装成功，运行库过旧/损坏也会导致 "
+            "<code>WinError 1114</code> / <code>c10.dll</code> 加载失败（与网络无关）。"
+        )
+        vc_tip.setWordWrap(True)
+        vc_tip.setStyleSheet("color:#8a90b0;font-size:12px;")
+        gv.addWidget(vc_tip)
+        self.lbl_vc = QLabel("状态: —")
+        self.lbl_vc.setWordWrap(True)
+        self.lbl_vc.setStyleSheet("color:#c0c6d8;")
+        gv.addWidget(self.lbl_vc)
+        vc_row = QHBoxLayout()
+        self.btn_refresh_vc = QPushButton("重新检测 VC++")
+        self.btn_refresh_vc.clicked.connect(self._refresh_vc_status)
+        vc_row.addWidget(self.btn_refresh_vc)
+        self.btn_open_vc_download = QPushButton("下载 VC++ x64")
+        self.btn_open_vc_download.setToolTip(VC_REDIST_X64_URL)
+        self.btn_open_vc_download.clicked.connect(
+            lambda: self._open_url(VC_REDIST_X64_URL)
+        )
+        vc_row.addWidget(self.btn_open_vc_download)
+        self.btn_open_vc_help = QPushButton("官方说明")
+        self.btn_open_vc_help.clicked.connect(
+            lambda: self._open_url(VC_REDIST_HELP_URL)
+        )
+        vc_row.addWidget(self.btn_open_vc_help)
+        vc_row.addStretch()
+        gv.addLayout(vc_row)
+        lay.addWidget(grp_vc)
+
         # PyPI 镜像（仅本应用 uv pip install -i，不改用户全局配置）
         grp_mirror = QGroupBox("依赖安装镜像源")
         gm = QVBoxLayout(grp_mirror)
@@ -404,8 +449,9 @@ class SettingsPanel(QWidget):
         ge.setSpacing(8)
         env_tip = QLabel(
             "每个模型使用独立虚拟环境，避免依赖版本冲突。"
-            "创建环境会安装 torch 及对应模型依赖（如 BEN2 / transformers 等），"
-            "体积较大、耗时较长，请保持网络畅通。"
+            "创建环境会按本机是否有 NVIDIA 自动安装 CUDA 或 CPU 版 PyTorch"
+            "（有独显装 CUDA 版即可，配置里仍可强制用 CPU），"
+            "并安装对应模型依赖；体积较大、耗时较长，请保持网络畅通。"
             "进度详情请查看「后台日志」。"
         )
         env_tip.setWordWrap(True)
@@ -430,11 +476,26 @@ class SettingsPanel(QWidget):
         self.btn_recreate_env = QPushButton("强制重建环境")
         self.btn_recreate_env.clicked.connect(lambda: self._setup_model_env(True))
         env_btn.addWidget(self.btn_recreate_env)
+        self.btn_ai_setup = QPushButton("AI 帮装")
+        self.btn_ai_setup.setMinimumHeight(34)
+        self.btn_ai_setup.setToolTip(
+            "生成通用「帮装任务」说明（含复核环境、选 CUDA、安装与验收），"
+            "可复制到 Codex / CodeBuddy 等；附录附本机探测快照供参考"
+        )
+        self.btn_ai_setup.clicked.connect(self._show_ai_setup_dialog)
+        env_btn.addWidget(self.btn_ai_setup)
         self.btn_open_env = QPushButton("打开环境目录")
         self.btn_open_env.clicked.connect(self._open_env_folder)
         env_btn.addWidget(self.btn_open_env)
         env_btn.addStretch()
         ge.addLayout(env_btn)
+
+        # GPU 系列匹配摘要（一行，不占纵向）
+        self.lbl_gpu_match = QLabel("")
+        self.lbl_gpu_match.setWordWrap(True)
+        self.lbl_gpu_match.setStyleSheet("color:#8a90b0;font-size:12px;")
+        self.lbl_gpu_match.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        ge.addWidget(self.lbl_gpu_match)
 
         self.progress_env = QProgressBar()
         self.progress_env.setRange(0, 100)
@@ -691,9 +752,51 @@ class SettingsPanel(QWidget):
             self.lbl_uv.setStyleSheet("color:#e0a060;font-weight:bold;")
             self.btn_install_uv.setText("安装 uv")
 
+        self._apply_vc_status()
         self.txt_diag.setPlainText(diag or "")
         # 开发环境状态变化后，同步模型页门禁
         self._apply_matting_gate()
+
+    def _refresh_vc_status(self):
+        """手动重检 VC++ 并刷新标签 + 诊断区。"""
+        self._rt.invalidate_caches(vc=True)
+        self._apply_vc_status()
+        # 诊断文本含 VC++ 段落，一并刷新（不重扫 Python，避免卡顿）
+        try:
+            self.txt_diag.setPlainText(self._rt.diagnose_text())
+        except Exception:
+            pass
+
+    def _apply_vc_status(self):
+        """更新开发环境页 VC++ 状态标签。"""
+        if not hasattr(self, "lbl_vc"):
+            return
+        if sys.platform != "win32":
+            self.lbl_vc.setText("状态: 非 Windows，无需检测")
+            self.lbl_vc.setStyleSheet("color:#8a90b0;")
+            return
+        try:
+            vc = self._rt.get_vc_redist()
+        except Exception as e:
+            self.lbl_vc.setText(f"状态: 检测失败 — {e}")
+            self.lbl_vc.setStyleSheet("color:#e0a060;font-weight:bold;")
+            return
+        if vc.level == "ok":
+            self.lbl_vc.setText(f"状态: 正常  ·  {vc.display}")
+            self.lbl_vc.setStyleSheet("color:#6dcea0;font-weight:bold;")
+        elif vc.level == "warn":
+            self.lbl_vc.setText(
+                f"状态: 建议升级  ·  {vc.display}\n"
+                "可点击「下载 VC++ x64」安装最新运行库后重启。"
+            )
+            self.lbl_vc.setStyleSheet("color:#e0a060;font-weight:bold;")
+        else:
+            self.lbl_vc.setText(
+                f"状态: 异常  ·  {vc.display}\n"
+                "请点击「下载 VC++ x64」安装/修复，重启后再创建模型环境。"
+                "此问题与网络无关，反复「创建/修复环境」无法解决。"
+            )
+            self.lbl_vc.setStyleSheet("color:#e07070;font-weight:bold;")
 
     # ── 模型区刷新（轻量同步 + 可选后台校验）──
     def _schedule_model_refresh(self, force_env: bool = False):
@@ -757,14 +860,49 @@ class SettingsPanel(QWidget):
         # 快速环境状态（无子进程）；完整结果由后台 worker 覆盖
         st = self._rt.get_model_env_status(mid, quick=True)
         self._apply_env_status(st, pending_verify=True)
+        self._refresh_gpu_match_label()
 
         self.btn_setup_env.setEnabled(not self._rt.is_busy)
         self.btn_recreate_env.setEnabled(not self._rt.is_busy)
+        self.btn_ai_setup.setEnabled(True)
         self.btn_download.setEnabled(not mgr.is_downloading(mid))
         self.btn_download.setText(
             "下载中…" if mgr.is_downloading(mid) else "下载权重"
         )
         self._model_loaded = True
+
+    def _refresh_gpu_match_label(self):
+        """刷新 GPU 系列匹配一行摘要。"""
+        try:
+            m = match_local_gpu(force_detect=False)
+        except Exception as e:
+            self.lbl_gpu_match.setText(f"GPU 匹配: 检测失败（{e}）")
+            self.lbl_gpu_match.setStyleSheet("color:#e07070;font-size:12px;")
+            return
+        if not m.has_gpu:
+            self.lbl_gpu_match.setText(
+                "GPU 匹配: 未检测到 NVIDIA · 将装 CPU 版 PyTorch"
+            )
+            self.lbl_gpu_match.setStyleSheet("color:#8a90b0;font-size:12px;")
+            self.lbl_gpu_match.setToolTip("")
+            return
+        text = m.summary or m.series_name
+        if m.driver_hint and not m.driver_ok_for_series:
+            text = f"⚠ {text}"
+            self.lbl_gpu_match.setStyleSheet("color:#e0a060;font-size:12px;font-weight:bold;")
+        elif m.driver_hint:
+            self.lbl_gpu_match.setStyleSheet("color:#e0c060;font-size:12px;")
+        else:
+            self.lbl_gpu_match.setStyleSheet("color:#6dcea0;font-size:12px;")
+        self.lbl_gpu_match.setText(f"GPU 匹配: {text}")
+        tip_parts = [m.summary or ""]
+        if m.notes:
+            tip_parts.append(m.notes)
+        if m.driver_hint:
+            tip_parts.append(m.driver_hint)
+        if m.candidate_tags:
+            tip_parts.append("候选: " + " → ".join(m.candidate_tags))
+        self.lbl_gpu_match.setToolTip("\n".join(p for p in tip_parts if p))
 
     def _schedule_env_check(self):
         mid = self._current_model_id()
@@ -800,37 +938,73 @@ class SettingsPanel(QWidget):
         if st.ready:
             self.lbl_env_msg.setText(st.detail or "依赖校验通过")
         else:
-            miss = ", ".join(st.missing_packages) if st.missing_packages else st.detail
-            self.lbl_env_msg.setText(
-                f"依赖未齐: {miss}。请点击「创建/修复环境」安装完整依赖。"
-            )
+            # detail 已含分类建议；DLL 问题不再引导「再装依赖」
+            msg = (st.detail or "").strip()
+            if st.fail_kind == "dll" or "DLL" in msg or "WinError 1114" in msg or "c10.dll" in msg:
+                self.lbl_env_msg.setText(msg or "DLL/运行库问题，请到「开发环境」检查 VC++")
+            elif st.missing_packages and st.fail_kind in ("", "missing"):
+                miss = ", ".join(st.missing_packages)
+                self.lbl_env_msg.setText(
+                    f"依赖未齐: {miss}。请点击「创建/修复环境」安装完整依赖。"
+                    + (f"\n{msg}" if msg and miss not in msg else "")
+                )
+            else:
+                self.lbl_env_msg.setText(msg or "环境未就绪")
 
     def _apply_env_status(self, st: ModelEnvStatus, pending_verify: bool = False):
         # 清理可能的脏字符
         detail = (st.detail or "").replace("\x1b", "").strip()
         if st.ready:
             ver = f"  ·  Python {st.python_version}" if st.python_version else ""
-            self.lbl_env_status.setText(f"环境: 就绪{ver}")
-            self.lbl_env_status.setStyleSheet("color:#6dcea0;font-weight:bold;")
+            torch_bit = ""
+            if getattr(st, "torch_version", ""):
+                build = (st.torch_build or "?").upper()
+                if st.torch_cuda_available:
+                    cu = st.torch_cuda_version or "OK"
+                    torch_bit = f"  ·  torch {st.torch_version} [{build}/可用 {cu}]"
+                else:
+                    torch_bit = f"  ·  torch {st.torch_version} [{build}]"
+            self.lbl_env_status.setText(f"环境: 就绪{ver}{torch_bit}")
+            # CPU 构建但用户可能期望 GPU：用偏黄提示构建类型
+            if getattr(st, "torch_build", "") == "cpu":
+                self.lbl_env_status.setStyleSheet("color:#e0c060;font-weight:bold;")
+                self.lbl_env_status.setToolTip(
+                    "当前隔离环境为 CPU 版 PyTorch。"
+                    "若本机有 NVIDIA 独显，请点「强制重建环境」以安装 CUDA 版；"
+                    "CUDA 版也可在配置中强制使用 CPU。"
+                )
+            elif getattr(st, "torch_build", "") == "cuda" and not st.torch_cuda_available:
+                self.lbl_env_status.setStyleSheet("color:#e0c060;font-weight:bold;")
+                self.lbl_env_status.setToolTip(
+                    "已安装 CUDA 版 PyTorch，但 torch.cuda 当前不可用。"
+                    "请检查 NVIDIA 驱动是否正常，或查看开发环境诊断。"
+                )
+            else:
+                self.lbl_env_status.setStyleSheet("color:#6dcea0;font-weight:bold;")
+                self.lbl_env_status.setToolTip(detail or "")
         elif st.python_path:
             if pending_verify and "缺少" not in detail:
                 self.lbl_env_status.setText("环境: 已创建 · 依赖校验中…")
                 self.lbl_env_status.setStyleSheet("color:#8a90b0;font-weight:bold;")
             else:
-                # 只显示干净的缺失包名
-                if st.missing_packages:
+                # DLL/运行库问题与「缺包」区分，避免误导
+                if getattr(st, "fail_kind", "") == "dll" or "WinError 1114" in detail or "c10.dll" in detail:
+                    text = "环境: DLL/运行库异常"
+                    self.lbl_env_status.setStyleSheet("color:#e07070;font-weight:bold;")
+                elif st.missing_packages:
                     miss = ", ".join(
                         m for m in st.missing_packages
                         if m.isidentifier() or all(c.isalnum() or c in "-_." for c in m)
                     )
                     text = f"环境: 缺少 {miss}" if miss else f"环境: {detail or '不完整'}"
+                    self.lbl_env_status.setStyleSheet("color:#e0c060;font-weight:bold;")
                 else:
-                    text = f"环境: {detail or '已创建'}"
+                    text = f"环境: {detail.splitlines()[0] if detail else '已创建'}"
+                    self.lbl_env_status.setStyleSheet("color:#e0c060;font-weight:bold;")
                 # 截断，避免撑宽
                 if len(text) > 48:
                     text = text[:45] + "…"
                 self.lbl_env_status.setText(text)
-                self.lbl_env_status.setStyleSheet("color:#e0c060;font-weight:bold;")
                 self.lbl_env_status.setToolTip(detail)
         else:
             self.lbl_env_status.setText("环境: 未创建")
@@ -979,11 +1153,6 @@ class SettingsPanel(QWidget):
         d = self._rt.runtime_root()
         self._open_path(d)
 
-    def _open_url(self, url: str):
-        from PySide6.QtGui import QDesktopServices
-        from PySide6.QtCore import QUrl
-        QDesktopServices.openUrl(QUrl(url))
-
     # ── 模型环境 ──
     def _setup_model_env(self, force: bool):
         mid = self._current_model_id()
@@ -1019,11 +1188,80 @@ class SettingsPanel(QWidget):
             self.open_menu(0)
             return
 
+        # Windows：VC++ 异常时提前提示（不强制阻断，允许用户仍尝试安装）
+        if sys.platform == "win32":
+            try:
+                vc = self._rt.get_vc_redist(force=True)
+            except Exception:
+                vc = None
+            if vc is not None and not vc.ok:
+                ret = QMessageBox.warning(
+                    self,
+                    "VC++ 运行库异常",
+                    f"{vc.detail}\n\n"
+                    "在此状态下即使依赖下载成功，import torch 也很可能失败"
+                    "（WinError 1114 / c10.dll），与网络无关。\n\n"
+                    "建议先到「开发环境」下载并修复 VC++ x64，重启后再创建环境。\n"
+                    "仍要继续安装依赖吗？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if ret != QMessageBox.Yes:
+                    self.open_menu(0)
+                    self._refresh_vc_status()
+                    return
+
+        # 预检 torch 安装方案（主流系列清单）
+        try:
+            torch_plan = plan_torch_install(force_detect=True)
+        except Exception:
+            torch_plan = None
+
+        # 驱动不足以支撑本系列最低 CUDA 时，先提示升级
+        if (
+            torch_plan is not None
+            and torch_plan.flavor == "cuda"
+            and not torch_plan.driver_ok
+            and torch_plan.driver_hint
+        ):
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("建议先升级显卡驱动")
+            box.setText(
+                "当前 NVIDIA 驱动可能无法安装本机 GPU 所需的 CUDA 版 PyTorch。\n\n"
+                f"{torch_plan.driver_hint}"
+            )
+            box.setInformativeText(
+                f"驱动下载：{NVIDIA_DRIVER_URL}\n\n"
+                "建议：升级驱动并重启 → 再点「创建/修复环境」。\n"
+                "也可打开「AI 帮装」复制指令，交给其它 AI 工具处理。\n"
+                "仍要继续尝试安装吗？"
+            )
+            btn_cont = box.addButton("仍继续安装", QMessageBox.AcceptRole)
+            btn_ai = box.addButton("打开 AI 帮装", QMessageBox.ActionRole)
+            btn_cancel = box.addButton("取消", QMessageBox.RejectRole)
+            box.setDefaultButton(btn_cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is btn_ai:
+                self._show_ai_setup_dialog()
+                return
+            if clicked is not btn_cont:
+                return
+
         if force:
+            plan_tip = ""
+            if torch_plan is not None:
+                plan_tip = (
+                    f"\n\nPyTorch 将安装: {torch_plan.display}\n"
+                    f"{torch_plan.reason}"
+                )
+                if torch_plan.candidate_tags:
+                    plan_tip += "\n候选: " + " → ".join(torch_plan.candidate_tags)
             ret = QMessageBox.question(
                 self,
                 "强制重建",
-                f"将删除并重建模型 {meta.name} 的隔离环境，是否继续？",
+                f"将删除并重建模型 {meta.name} 的隔离环境，是否继续？{plan_tip}",
             )
             if ret != QMessageBox.Yes:
                 return
@@ -1043,6 +1281,22 @@ class SettingsPanel(QWidget):
         self._emit_log(f"依赖包数: {len(pkgs)}")
         if pkgs:
             self._emit_log("依赖列表: " + ", ".join(pkgs[:12]) + ("…" if len(pkgs) > 12 else ""))
+        if torch_plan is not None:
+            self._emit_log(f"PyTorch 方案: {torch_plan.display}")
+            self._emit_log(f"方案说明: {torch_plan.reason}")
+            if torch_plan.candidate_tags:
+                self._emit_log(
+                    "CUDA 优选→备选: " + " → ".join(torch_plan.candidate_tags)
+                )
+            if torch_plan.driver_hint:
+                self._emit_log(f"驱动提示: {torch_plan.driver_hint}")
+            if torch_plan.flavor == "cuda" and torch_plan.index_url:
+                self._emit_log(f"CUDA 索引: {torch_plan.index_url}")
+            if torch_plan.match is not None:
+                self._emit_log(
+                    f"系列匹配: {torch_plan.match.series_name} "
+                    f"[{torch_plan.match.match_method}]"
+                )
         if base:
             self._emit_log(f"基础解释器: {base.display}")
         if uv.found:
@@ -1063,6 +1317,152 @@ class SettingsPanel(QWidget):
             finished=fin,
             force_recreate=force,
         )
+
+    def _show_ai_setup_dialog(self):
+        """弹出 AI 帮装指令窗口，供复制到 Codex / CodeBuddy 等。"""
+        mid = self._current_model_id()
+        meta = get_model_info(mid)
+        try:
+            prompt = build_ai_setup_prompt(mid, force_recreate=True)
+        except Exception as e:
+            QMessageBox.warning(self, "生成失败", f"无法生成帮装指令:\n{e}")
+            return
+
+        try:
+            matched = match_local_gpu(force_detect=True)
+        except Exception:
+            matched = None
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(
+            f"AI 帮装 — {(meta.name if meta else mid)} 环境指令"
+        )
+        dlg.resize(780, 620)
+        dlg.setMinimumSize(560, 420)
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
+
+        tip = QLabel(
+            "将下方任务说明复制到 <b>Codex / CodeBuddy / Cursor</b> 等 AI 工具。"
+            "正文是<strong>通用流程</strong>（先复核环境与最新 PyTorch 兼容性，再安装），"
+            "不写死某一代显卡；文末附录附带本机探测快照，供 AI 参考，可少做重复检测。"
+        )
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#a8b0d0;font-size:12px;")
+        root.addWidget(tip)
+
+        # 匹配摘要条
+        summary = QLabel("")
+        summary.setWordWrap(True)
+        summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        if matched is not None and matched.has_gpu:
+            sum_txt = matched.summary or matched.series_name
+            if matched.driver_hint:
+                sum_txt += f"\n{matched.driver_hint}"
+            summary.setText(sum_txt)
+            if not matched.driver_ok_for_series:
+                summary.setStyleSheet(
+                    "color:#e0a060;font-size:12px;font-weight:bold;"
+                    "padding:8px;background:rgba(80,50,20,120);border-radius:8px;"
+                )
+            else:
+                summary.setStyleSheet(
+                    "color:#b8d0a0;font-size:12px;"
+                    "padding:8px;background:rgba(30,50,40,120);border-radius:8px;"
+                )
+        elif matched is not None:
+            summary.setText("未检测到 NVIDIA GPU → 指令将引导安装 CPU 版 PyTorch")
+            summary.setStyleSheet("color:#a8b0d0;font-size:12px;")
+        else:
+            summary.setText("硬件匹配信息不可用，指令内仍含通用步骤")
+            summary.setStyleSheet("color:#a8b0d0;font-size:12px;")
+        root.addWidget(summary)
+
+        editor = QTextEdit()
+        editor.setReadOnly(True)
+        editor.setPlainText(prompt)
+        editor.setStyleSheet(
+            "QTextEdit {"
+            "background-color: rgba(14, 14, 28, 200);"
+            "color: #e0e4f0;"
+            "border: 1px solid rgba(100, 110, 170, 0.25);"
+            "border-radius: 8px;"
+            "font-family: Consolas, 'Courier New', monospace;"
+            "font-size: 12px;"
+            "padding: 8px;"
+            "}"
+        )
+        root.addWidget(editor, 1)
+
+        btn_row = QHBoxLayout()
+        btn_copy = QPushButton("复制全部指令")
+        btn_copy.setObjectName("btn_start")
+        btn_copy.setMinimumHeight(36)
+        btn_copy.setMinimumWidth(140)
+
+        def _do_copy():
+            QGuiApplication.clipboard().setText(prompt)
+            btn_copy.setText("已复制")
+            QTimer.singleShot(1600, lambda: btn_copy.setText("复制全部指令"))
+
+        btn_copy.clicked.connect(_do_copy)
+        btn_row.addWidget(btn_copy)
+
+        btn_driver = QPushButton("打开驱动下载页")
+        btn_driver.setMinimumHeight(36)
+        btn_driver.clicked.connect(
+            lambda: self._open_url(NVIDIA_DRIVER_URL)
+        )
+        btn_row.addWidget(btn_driver)
+
+        btn_row.addStretch()
+        btn_close = QPushButton("关闭")
+        btn_close.setMinimumHeight(36)
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_close)
+        root.addLayout(btn_row)
+
+        # 深色对话框底
+        dlg.setStyleSheet(
+            "QDialog { background-color: rgba(22, 22, 40, 245); color: #e0e4f0; }"
+            "QLabel { color: #e0e4f0; }"
+            "QPushButton {"
+            "background-color: rgba(38, 38, 62, 180);"
+            "color: #e0e4f0;"
+            "border: 1px solid rgba(100, 110, 170, 0.25);"
+            "border-radius: 8px;"
+            "padding: 6px 14px;"
+            "}"
+            "QPushButton:hover {"
+            "border: 1px solid rgba(100, 150, 255, 0.55);"
+            "}"
+            "QPushButton#btn_start {"
+            "background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            "stop:0 #5b8af5, stop:1 #7c6cf5);"
+            "border: 1px solid rgba(120, 150, 255, 0.5);"
+            "font-weight: bold;"
+            "}"
+        )
+        dlg.exec()
+
+    def _open_url(self, url: str):
+        try:
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            QDesktopServices.openUrl(QUrl(url))
+        except Exception:
+            try:
+                if sys.platform == "win32":
+                    os_start = getattr(__import__("os"), "startfile", None)
+                    if os_start:
+                        os_start(url)
+                    else:
+                        subprocess.Popen(["cmd", "/c", "start", url], shell=True)
+                else:
+                    subprocess.Popen(["xdg-open", url])
+            except Exception as e:
+                QMessageBox.information(self, "打开链接", f"请手动打开:\n{url}\n\n{e}")
 
     def _open_env_folder(self):
         d = self._rt.model_env_dir(self._current_model_id())
@@ -1277,6 +1677,7 @@ class SettingsPanel(QWidget):
             self.btn_recreate_env.setEnabled(True)
             self._rt.invalidate_caches(env=self._current_model_id())
             self._schedule_model_refresh(force_env=True)
+            self._refresh_gpu_match_label()
             if ok:
                 self.progress_env.setValue(100)
                 self.lbl_env_msg.setText(message)

@@ -406,6 +406,8 @@ class TransparentImageProcessor(BaseProcessor):
             "enable_matting": self._grp_matting.isChecked(),
             "matting_model": mid,
             "matting_refine": bool(self.chk_refine.isChecked()) and supports_refine,
+            # keep_matting 由主窗口输出设置注入（仅 AI 抠图开启时可见）
+            "keep_matting": False,
             "enable_trim": self._grp_trim.isChecked(),
             "alpha_threshold": self.spin_alpha.value(),
             "enable_layout": self._grp_layout.isChecked(),
@@ -425,6 +427,7 @@ class TransparentImageProcessor(BaseProcessor):
             "enable_matting": False,
             "matting_model": "ben2",
             "matting_refine": False,
+            "keep_matting": False,
             "enable_trim": True,
             "alpha_threshold": 0,
             "enable_layout": False,
@@ -510,11 +513,16 @@ class TransparentImageProcessor(BaseProcessor):
     ) -> tuple[Image.Image, dict]:
         """抠图之后的 trim + 画布布局（单张）。"""
         img = img.convert("RGBA")
+        did_matting = bool(options.get("enable_matting") or details.get("matting_model"))
 
         if options.get("enable_trim"):
             img, bbox = trim_transparent(img, options.get("alpha_threshold", 0))
             details["trim_bbox"] = bbox
             details["trimmed_size"] = img.size
+
+        # 保留抠图：在 trim 之后、画布布局之前缓存透明主体（布局会改背景/尺寸）
+        if did_matting and options.get("keep_matting"):
+            details["_matting_keep_img"] = img.copy()
 
         # 智能对象式布局：asset 锁定为当前全分辨率主体，只把变换参数交给
         # place_subject_on_canvas，导出时预乘 Alpha 后一次栅格化到画布。

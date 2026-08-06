@@ -465,7 +465,7 @@ class MainWindow(QMainWindow):
         self.lbl_src_hint.setVisible(False)
         out_lay.addWidget(self.lbl_src_hint)
 
-        # 自动创建文件夹 + 保留目录结构（水平并排）
+        # 自动创建文件夹 + 保留目录结构 + 覆盖同名 + 保留抠图（水平并排）
         out_opt_row = QHBoxLayout()
         out_opt_row.setSpacing(16)
         self.chk_auto_folder = QCheckBox("在该路径下自动创建文件夹保存")
@@ -480,6 +480,25 @@ class MainWindow(QMainWindow):
             "单独添加的文件或无相对路径时仍平铺输出。"
         )
         out_opt_row.addWidget(self.chk_keep_structure)
+        self.chk_overwrite_file = QCheckBox("覆盖同名文件")
+        self.chk_overwrite_file.setChecked(False)
+        self.chk_overwrite_file.setToolTip(
+            "勾选后若输出目录已存在同名文件则直接覆盖；\n"
+            "未勾选时自动在文件名后追加 _1、_2… 后缀避免覆盖。\n"
+            "仅桌面路径 / 自定义路径模式有效。"
+        )
+        out_opt_row.addWidget(self.chk_overwrite_file)
+        # 透明图 + AI 抠图时显示：额外保留一份抠图结果
+        self.chk_keep_matting = QCheckBox("保留抠图结果")
+        self.chk_keep_matting.setChecked(False)
+        self.chk_keep_matting.setVisible(False)
+        self.chk_keep_matting.setToolTip(
+            "额外保存一份 AI 抠图后的透明图（PNG）。\n"
+            "若同时开启「裁剪透明边缘」，保留的是裁剪后的透明主体。\n"
+            "文件名在主输出名后追加 _matted（例如 photo.png → photo_matted.png，\n"
+            "若主输出因重名变为 photo_1.png，则为 photo_1_matted.png）。"
+        )
+        out_opt_row.addWidget(self.chk_keep_matting)
         out_opt_row.addStretch()
         out_lay.addLayout(out_opt_row)
 
@@ -593,9 +612,18 @@ class MainWindow(QMainWindow):
         self.btn_tab_changelog.clicked.connect(lambda: self._switch_tab(3))
         self.btn_clear_log.clicked.connect(self._clear_current_log)
 
+        # 透明图 AI 抠图开关变化时，同步「保留抠图结果」可见性
+        for p in self._processors:
+            if getattr(p, "preset_id", "") == "transparent_image":
+                grp = getattr(p, "_grp_matting", None)
+                if grp is not None:
+                    grp.toggled.connect(lambda _checked: self._update_output_extra_opts())
+
         # 初始状态
         if self._processors:
             self._on_processor_changed(0)
+        else:
+            self._update_output_extra_opts()
 
     # ─── 样式 ───
     def _apply_style(self):
@@ -975,6 +1003,8 @@ class MainWindow(QMainWindow):
         cur = self.file_list.currentItem()
         path = cur.data(ROLE_PATH) if cur is not None else None
         self._notify_processor_selection(path)
+        # 输出区：保留抠图等选项随功能切换显隐
+        self._update_output_extra_opts()
 
     # ─── Tab 切换 ───
     def _switch_tab(self, idx):
@@ -1106,9 +1136,6 @@ class MainWindow(QMainWindow):
         self.txt_output_dir.setVisible(show_input)
         self.btn_browse.setVisible(show_browse)
         self.lbl_src_hint.setVisible(show_src_hint)
-        show_out_opts = btn_id in (0, 1)
-        self.chk_auto_folder.setVisible(show_out_opts)
-        self.chk_keep_structure.setVisible(show_out_opts)
 
         if btn_id == 0:
             self.txt_output_dir.setText(_get_desktop_path())
@@ -1117,8 +1144,33 @@ class MainWindow(QMainWindow):
                 self.txt_output_dir.setText("")
                 self.txt_output_dir.setPlaceholderText("选择或输入自定义输出目录...")
 
+        self._update_output_extra_opts()
+
+    def _update_output_extra_opts(self):
+        """按路径模式 / 当前功能，刷新输出区附加选项可见性。"""
+        mode_id = self.path_group.checkedId()
+        show_out_opts = mode_id in (0, 1)
+        self.chk_auto_folder.setVisible(show_out_opts)
+        self.chk_keep_structure.setVisible(show_out_opts)
+        self.chk_overwrite_file.setVisible(show_out_opts)
+
+        show_keep_matting = False
+        proc = self._current_processor
+        if (
+            proc is not None
+            and getattr(proc, "preset_id", "") == "transparent_image"
+        ):
+            grp = getattr(proc, "_grp_matting", None)
+            if grp is not None and grp.isChecked():
+                show_keep_matting = True
+        self.chk_keep_matting.setVisible(show_keep_matting)
+
     def _resolve_output_dir(self, src_path: str) -> tuple[str, bool]:
-        """根据当前路径模式，返回 (output_dir, is_overwrite)"""
+        """根据当前路径模式，返回 (output_dir, is_src_overwrite)。
+
+        is_src_overwrite 仅表示「原图路径(覆盖原图)」模式，
+        与桌面/自定义下的「覆盖同名文件」勾选无关。
+        """
         mode_id = self.path_group.checkedId()
         if mode_id == 0:  # 桌面
             return self.txt_output_dir.text().strip() or _get_desktop_path(), False
@@ -1129,6 +1181,15 @@ class MainWindow(QMainWindow):
             return str(Path(src_path).parent), True
         else:  # 原图路径另存副本
             return str(Path(src_path).parent), False
+
+    def _resolve_file_overwrite(self, is_src_overwrite: bool) -> bool:
+        """是否允许覆盖同名输出文件。"""
+        if is_src_overwrite:
+            return True
+        mode_id = self.path_group.checkedId()
+        if mode_id in (0, 1):
+            return self.chk_overwrite_file.isChecked()
+        return False
 
     # ─── 文件操作 ───
     def _add_files(self):
@@ -1533,7 +1594,8 @@ class MainWindow(QMainWindow):
             file_index_map = sess.order_map()
             output_dir = sess.output_dir
             auto_folder = sess.auto_subfolder
-            is_overwrite = sess.overwrite
+            is_src_overwrite = sess.overwrite
+            file_overwrite = bool(getattr(sess, "file_overwrite", is_src_overwrite))
             options = dict(sess.options)
             count = len(file_list)
 
@@ -1560,6 +1622,8 @@ class MainWindow(QMainWindow):
             self._log(f"参数: 沿用该批次快照")
             if options.get("enable_matting"):
                 self._log(self._format_matting_start_log(options))
+            if options.get("keep_matting"):
+                self._log("保留抠图结果: 是（文件名追加 _matted）")
             self._log(f"开始时间: {start_text}")
             self._log("─" * 50)
 
@@ -1567,7 +1631,8 @@ class MainWindow(QMainWindow):
                 self.worker = ProcessWorker(
                     file_list, output_dir, proc, options,
                     auto_subfolder=auto_folder,
-                    overwrite=is_overwrite,
+                    overwrite=is_src_overwrite,
+                    file_overwrite=file_overwrite,
                     rel_path_map=rel_map,
                     file_index_map=file_index_map,
                 )
@@ -1636,7 +1701,8 @@ class MainWindow(QMainWindow):
             return
 
         count = len(file_list)
-        output_dir, is_overwrite = self._resolve_output_dir(file_list[0])
+        output_dir, is_src_overwrite = self._resolve_output_dir(file_list[0])
+        allow_file_overwrite = self._resolve_file_overwrite(is_src_overwrite)
 
         proc_for_log = self._current_processor or self._current_file_processor
         if proc_for_log is not None:
@@ -1644,11 +1710,12 @@ class MainWindow(QMainWindow):
         self.log_text.clear()
         self._switch_tab(1)
         scope_name = "仅选中" if scope_selected else "全部文件"
-        auto_folder = self.chk_auto_folder.isChecked() and not is_overwrite
+        # 原图路径覆盖模式不建子文件夹；桌面/自定义下「覆盖同名」不影响自动文件夹
+        auto_folder = self.chk_auto_folder.isChecked() and not is_src_overwrite
         # 仅桌面/自定义路径模式支持按相对路径重建子目录
         keep_structure = (
             self.chk_keep_structure.isChecked()
-            and not is_overwrite
+            and not is_src_overwrite
             and mode_id in (0, 1)
         )
         rel_map = {p: rel for p, rel in entries if rel} if keep_structure else {}
@@ -1673,6 +1740,16 @@ class MainWindow(QMainWindow):
             proc = self._current_processor
             options = proc.gather_options()
             options["_output_format"] = proc.get_output_format()
+            # 输出设置：保留抠图（仅透明图 + 已开 AI 抠图时生效）
+            if (
+                getattr(proc, "preset_id", "") == "transparent_image"
+                and options.get("enable_matting")
+                and self.chk_keep_matting.isVisible()
+                and self.chk_keep_matting.isChecked()
+            ):
+                options["keep_matting"] = True
+            else:
+                options["keep_matting"] = False
             supports = self._processor_supports_resume(proc)
             self._batch_session = BatchSession.create(
                 kind="image",
@@ -1682,7 +1759,8 @@ class MainWindow(QMainWindow):
                 options=options,
                 output_dir=output_dir,
                 auto_subfolder=auto_folder,
-                overwrite=is_overwrite,
+                overwrite=is_src_overwrite,
+                file_overwrite=allow_file_overwrite,
                 keep_structure=keep_structure,
                 path_mode_id=mode_id,
                 entries=entries,
@@ -1694,8 +1772,14 @@ class MainWindow(QMainWindow):
             self._log(f"功能: {proc.icon}  {proc.name}")
             self._log(f"处理范围: {scope_name}  共 {count} 个文件")
             self._log(f"输出模式: {mode_names[mode_id]}  →  {output_dir}")
+            if mode_id in (0, 1):
+                self._log(
+                    f"同名文件: {'覆盖' if allow_file_overwrite else '自动加后缀 (_1/_2…)'}"
+                )
             if keep_structure:
                 self._log(f"保留目录结构: 是（{len(rel_map)} 个文件含相对路径）")
+            if options.get("keep_matting"):
+                self._log("保留抠图结果: 是（文件名追加 _matted）")
             if not supports:
                 self._log("说明: 当前为批量合并功能，不支持中途续跑/按文件重试")
             # AI 抠图开启时，启动摘要先写一版（Worker 内会再写设备/batch 实测值）
@@ -1706,7 +1790,8 @@ class MainWindow(QMainWindow):
             self.worker = ProcessWorker(
                 file_list, output_dir, proc, options,
                 auto_subfolder=auto_folder,
-                overwrite=is_overwrite,
+                overwrite=is_src_overwrite,
+                file_overwrite=allow_file_overwrite,
                 rel_path_map=rel_map,
                 file_index_map=self._batch_session.order_map(),
             )
@@ -1728,7 +1813,8 @@ class MainWindow(QMainWindow):
                 options=options,
                 output_dir=output_dir,
                 auto_subfolder=auto_folder,
-                overwrite=is_overwrite,
+                overwrite=is_src_overwrite,
+                file_overwrite=allow_file_overwrite,
                 keep_structure=keep_structure,
                 path_mode_id=mode_id,
                 entries=entries,
@@ -1740,6 +1826,10 @@ class MainWindow(QMainWindow):
             self._log(f"功能: {proc.icon}  {proc.name}")
             self._log(f"处理范围: {scope_name}  共 {count} 个文件")
             self._log(f"输出模式: {mode_names[mode_id]}  →  {output_dir}")
+            if mode_id in (0, 1):
+                self._log(
+                    f"同名文件: {'覆盖' if allow_file_overwrite else '自动加后缀 (_1/_2…)'}"
+                )
             if keep_structure:
                 self._log(f"保留目录结构: 是（{len(rel_map)} 个文件含相对路径）")
             self._log(f"开始时间: {start_text}")
@@ -1872,6 +1962,10 @@ class MainWindow(QMainWindow):
                 parts.append(" · ".join(matting_bits))
             if "trimmed_size" in d:
                 parts.append(f"裁剪→{d['trimmed_size'][0]}×{d['trimmed_size'][1]}")
+            if d.get("matting_keep_path"):
+                parts.append(f"抠图副本→{Path(d['matting_keep_path']).name}")
+            elif d.get("matting_keep_error"):
+                parts.append(f"抠图副本失败:{d['matting_keep_error']}")
             if "layout_display_size" in d:
                 size = d["layout_display_size"]
                 parts.append(
@@ -2129,6 +2223,7 @@ class MainWindow(QMainWindow):
             return
         proc = self._get_current_any_processor()
         proc.apply_options(data)
+        self._update_output_extra_opts()
         display = "默认" if name == "default" else name
         self._log(f"已加载预设: {display}")
 
@@ -2207,7 +2302,8 @@ class MainWindow(QMainWindow):
         # 应用参数
         proc = self._get_current_any_processor()
         proc.apply_options(data)
-        
+        self._update_output_extra_opts()
+
         display = "默认" if preset_name == "default" else preset_name
         self._log(f"已从文件加载预设: {display}")
         QMessageBox.information(self, "成功", f"预设 '{display}' 加载成功！")
@@ -2252,6 +2348,7 @@ class MainWindow(QMainWindow):
         defaults = proc.default_options()
         mgr.save_default(defaults)
         proc.apply_options(defaults)
+        self._update_output_extra_opts()
         for i in range(self.combo_preset.count()):
             if self.combo_preset.itemData(i) == "default":
                 self.combo_preset.setCurrentIndex(i)

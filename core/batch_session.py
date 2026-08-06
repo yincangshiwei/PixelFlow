@@ -42,9 +42,10 @@ class BatchSession:
     options: dict
     output_dir: str
     auto_subfolder: bool
-    overwrite: bool
-    keep_structure: bool
-    path_mode_id: int
+    overwrite: bool  # 原图路径(覆盖原图) 模式
+    file_overwrite: bool = False  # 桌面/自定义：覆盖同名输出文件
+    keep_structure: bool = False
+    path_mode_id: int = 0
     rel_path_map: dict = field(default_factory=dict)
     files: list[FileJobState] = field(default_factory=list)
     user_cancelled: bool = False
@@ -67,11 +68,14 @@ class BatchSession:
         keep_structure: bool,
         path_mode_id: int,
         entries: list[tuple[str, str | None]],
+        file_overwrite: bool | None = None,
     ) -> "BatchSession":
         jobs = [
             FileJobState(path=p, rel_path=rel or None, order=i + 1)
             for i, (p, rel) in enumerate(entries)
         ]
+        # 未显式传入时：原图覆盖模式等同允许覆盖文件
+        fo = overwrite if file_overwrite is None else bool(file_overwrite)
         return cls(
             kind=kind,
             processor_preset_id=processor_preset_id,
@@ -81,6 +85,7 @@ class BatchSession:
             output_dir=output_dir,
             auto_subfolder=auto_subfolder,
             overwrite=overwrite,
+            file_overwrite=fo,
             keep_structure=keep_structure,
             path_mode_id=path_mode_id,
             rel_path_map={p: rel for p, rel in entries if rel},

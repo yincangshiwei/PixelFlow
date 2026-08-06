@@ -63,6 +63,7 @@ class ProcessWorker(QThread):
     def __init__(self, file_list: list[str], output_dir: str,
                  processor: BaseProcessor, options: dict,
                  auto_subfolder: bool = True, overwrite: bool = False,
+                 file_overwrite: bool | None = None,
                  rel_path_map: dict | None = None,
                  file_index_map: dict | None = None,
                  parent=None):
@@ -72,7 +73,11 @@ class ProcessWorker(QThread):
         self.processor = processor
         self.options = options
         self.auto_subfolder = auto_subfolder
+        # overwrite: 原图路径覆盖模式（batch 元数据等写回源文件）
         self.overwrite = overwrite
+        # file_overwrite: 输出目录同名是否直接覆盖（桌面/自定义的「覆盖同名文件」）
+        # 未显式传入时与 overwrite 一致，兼容旧调用
+        self.file_overwrite = overwrite if file_overwrite is None else bool(file_overwrite)
         self.rel_path_map = rel_path_map or {}
         # 续跑/重试时保持原批次序号（重命名、_image_index）
         self.file_index_map = file_index_map or {}
@@ -462,6 +467,20 @@ class ProcessWorker(QThread):
 
         return results
 
+    def _unique_out_path(self, file_out_dir: Path, stem: str, ext: str) -> Path:
+        """按是否覆盖生成最终输出路径。
+
+        file_overwrite 开启时直接使用 stem+ext；否则存在同名则追加 _1/_2…
+        """
+        out_path = file_out_dir / (stem + ext)
+        if self.file_overwrite:
+            return out_path
+        counter = 1
+        while out_path.exists():
+            out_path = file_out_dir / f"{stem}_{counter}{ext}"
+            counter += 1
+        return out_path
+
     def _save_processed_image(
         self,
         img,
@@ -485,11 +504,7 @@ class ProcessWorker(QThread):
         # 构建输出文件名（支持重命名）；按相对路径落到对应子目录
         file_out_dir = resolve_file_out_dir(out_dir, fpath, self.rel_path_map)
         stem = _build_stem(src.stem, self.options, order)
-        out_path = file_out_dir / (stem + ext)
-        counter = 1
-        while out_path.exists():
-            out_path = file_out_dir / f"{stem}_{counter}{ext}"
-            counter += 1
+        out_path = self._unique_out_path(file_out_dir, stem, ext)
 
         # 保存参数：DPI 仅写入 density 元数据，不缩放像素；
         # 未开压缩时 JPG/WEBP 仍用 quality=95（与既有最优质量策略一致）
@@ -540,6 +555,18 @@ class ProcessWorker(QThread):
         else:
             # PNG：dpi 写入 pHYs 块，像素数据仍为 PNG 无损编码
             img.save(str(out_path), "PNG", **_dpi_kw())
+
+        # 额外保留抠图透明图：在主输出最终 stem 后追加 _matted（含 _1/_2 情况）
+        matting_keep = details.pop("_matting_keep_img", None)
+        if matting_keep is not None and self.options.get("keep_matting"):
+            try:
+                matted_stem = f"{out_path.stem}_matted"
+                matted_path = self._unique_out_path(file_out_dir, matted_stem, ".png")
+                keep_img = matting_keep.convert("RGBA")
+                keep_img.save(str(matted_path), "PNG", **_dpi_kw())
+                details["matting_keep_path"] = str(matted_path)
+            except Exception as e:
+                details["matting_keep_error"] = str(e)
 
         result.output_path = str(out_path)
         result.success = True

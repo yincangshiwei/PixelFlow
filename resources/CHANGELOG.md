@@ -2,6 +2,14 @@
 
 ---
 
+## 2026-08-06
+
+### 配置中心 — Git 检测与 GitHub 代理
+
+- 「开发环境」增加 Git 客户端检测（状态展示 / 重新检测 / 下载页），BEN2 等 git+https 依赖在创建环境前会提示安装 Git
+- 增加 GitHub 访问代理配置（默认 ghfast，可切换 ghproxy / gitclone 或自定义 / 直连），仅影响本应用安装，不改系统 git 全局配置
+- 创建模型环境与下载 uv 时自动按代理改写 github.com 地址，缓解国内直连 GitHub 不稳定
+
 ## 2026-08-05
 
 ### 配置中心 — 创建环境自动安装 CUDA/CPU 版 PyTorch

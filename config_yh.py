@@ -6,15 +6,15 @@ import sys
 from pathlib import Path
 
 # ─── 应用基本信息 ───
-APP_NAME = "PixelFlow"
-APP_TITLE = "PixelFlow - 图像处理工作台"
+APP_NAME = "YHPixelFlow"
+APP_TITLE = "YHPixelFlow - 盈浩图像处理工作台"
 APP_VERSION = "1.1.0"
-APP_DESCRIPTION = "图像处理工作台"
-APP_PUBLISHER = "PixelFlow"
+APP_DESCRIPTION = "盈浩图像处理工作台"
+APP_PUBLISHER = "YHPixelFlow"
 
 # ─── 版权信息 ───
-APP_COPYRIGHT = "SEQL"
-APP_COPYRIGHT_URL = "https://github.com/yincangshiwei"
+APP_COPYRIGHT = "广东盈浩工艺制品有限公司"
+APP_COPYRIGHT_URL = "https://www.eaglegifts.com.cn/"
 
 # ─── 路径 ───
 # 项目/安装根目录

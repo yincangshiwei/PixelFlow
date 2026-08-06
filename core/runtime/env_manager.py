@@ -38,6 +38,20 @@ PIP_INDEX_PRESETS: tuple[tuple[str, str], ...] = (
     ("官方 PyPI", "https://pypi.org/simple"),
 )
 
+# GitHub 访问代理（前缀模式：proxy + 原始 https URL）
+# 用于 git+https://github.com/... 依赖与从 GitHub 下载资源；不改用户全局 git 配置
+DEFAULT_GITHUB_PROXY = "https://ghfast.top/"
+
+GITHUB_PROXY_PRESETS: tuple[tuple[str, str], ...] = (
+    ("ghfast（推荐）", "https://ghfast.top/"),
+    ("ghproxy", "https://mirror.ghproxy.com/"),
+    ("gitclone", "https://gitclone.com/"),
+    ("不使用代理（直连 GitHub）", ""),
+)
+
+# Git for Windows 官方下载页
+GIT_DOWNLOAD_URL = "https://git-scm.com/downloads/win"
+
 # PyTorch 官方 wheel / GPU 系列清单（见 gpu_catalog）
 from core.runtime.gpu_catalog import (  # noqa: E402
     PYTORCH_WHL_BASE,
@@ -102,6 +116,21 @@ class UvInfo:
         if not self.found:
             return "未安装"
         return f"{self.version or 'ok'}  ·  {self.path}  [{self.source}]"
+
+
+@dataclass
+class GitInfo:
+    """本机 Git 客户端检测结果（安装 git+https 依赖必需）。"""
+    path: str = ""
+    version: str = ""
+    found: bool = False
+
+    @property
+    def display(self) -> str:
+        if not self.found:
+            return "未安装"
+        ver = self.version or "ok"
+        return f"{ver}  ·  {self.path}" if self.path else ver
 
 
 @dataclass
@@ -582,7 +611,14 @@ def build_ai_setup_prompt(
     a("```")
     a(f"\"{uv_bin}\" pip install --python \"<venv_python>\" --upgrade -i {pypi} <packages...>")
     a("```")
-    a("- 含 `git+https://...` 的包需要本机网络可访问对应 git 托管；失败时说明原因并给替代方案。")
+    a("- 含 `git+https://...` 的包需要本机已安装 Git，且能访问对应 git 托管。")
+    gh_proxy = rt.get_github_proxy()
+    if gh_proxy:
+        a(f"- 当前 GitHub 代理: `{gh_proxy}`（安装时会改写 github.com 地址，不改用户全局 git 配置）。")
+        a("- 也可手动把 `git+https://github.com/...` 改成 `git+{proxy}https://github.com/...` 再装。")
+    else:
+        a("- 当前未启用 GitHub 代理（直连）；国内网络失败时可改用 ghfast 等前缀代理。")
+    a("- 失败时说明原因并给替代方案（换代理 / 检查 Git / 确认仓库地址）。")
     a("")
     a("### 步骤 E — 最终验收与收尾")
     a("- 批量 import 检查（模块名见附录 env_check_packages）。")
@@ -1227,6 +1263,203 @@ def _probe_uv(exe: str | Path, *, use_cache: bool = True) -> UvInfo | None:
     return info
 
 
+_git_cache: GitInfo | None = None
+_git_probe_cache: dict[str, GitInfo | None] = {}
+
+
+def _normalize_github_proxy(proxy: str) -> str:
+    """规范化代理前缀：去空白；非空时保证以 / 结尾。"""
+    p = (proxy or "").strip()
+    if not p:
+        return ""
+    if not p.endswith("/"):
+        p += "/"
+    return p
+
+
+def rewrite_github_url(url: str, proxy: str = "") -> str:
+    """
+    将 GitHub URL 改写为经代理访问的形式（前缀模式）。
+
+    - 空 proxy：原样返回
+    - ghfast / ghproxy 等：``{proxy}https://github.com/...``
+    - gitclone：``https://gitclone.com/github.com/...``（特判）
+    - 已带当前代理前缀：不重复叠加
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return raw
+    proxy = _normalize_github_proxy(proxy)
+    if not proxy:
+        return raw
+
+    # 拆分 pip 的 git+ 前缀
+    git_prefix = ""
+    body = raw
+    if body.lower().startswith("git+"):
+        git_prefix = body[:4]  # git+
+        body = body[4:]
+
+    lower = body.lower()
+    # 已是经代理改写过的地址
+    if lower.startswith(proxy.lower()):
+        return raw
+    # 已含常见代理前缀（防止重复套娃）
+    for known in (
+        "https://ghfast.top/",
+        "http://ghfast.top/",
+        "https://mirror.ghproxy.com/",
+        "https://ghproxy.com/",
+        "https://ghproxy.net/",
+        "https://gitclone.com/",
+    ):
+        if lower.startswith(known):
+            return raw
+
+    # gitclone：https://gitclone.com/github.com/user/repo.git
+    if "gitclone.com" in proxy.lower():
+        m = re.match(
+            r"^(https?://)(github\.com/)(.+)$",
+            body,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            return raw
+        rewritten = f"https://gitclone.com/github.com/{m.group(3)}"
+        return f"{git_prefix}{rewritten}"
+
+    # 通用前缀：proxy + 完整 https URL
+    if re.match(r"^https?://(www\.)?github\.com/", body, flags=re.IGNORECASE):
+        # 统一成 https://github.com/...
+        body_norm = re.sub(
+            r"^https?://(www\.)?github\.com/",
+            "https://github.com/",
+            body,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        return f"{git_prefix}{proxy}{body_norm}"
+
+    return raw
+
+
+def rewrite_git_package_specs(packages: list[str], proxy: str = "") -> list[str]:
+    """对依赖规格中的 GitHub git+/https 地址应用代理改写。"""
+    proxy = _normalize_github_proxy(proxy)
+    if not proxy:
+        return list(packages)
+    out: list[str] = []
+    for p in packages:
+        s = (p or "").strip()
+        if not s:
+            continue
+        if s.lower().startswith("git+") or "github.com" in s.lower():
+            out.append(rewrite_github_url(s, proxy))
+        else:
+            out.append(s)
+    return out
+
+
+def packages_need_git(packages: list[str] | None) -> bool:
+    """依赖列表是否包含需 git 客户端克隆的规格。"""
+    for p in packages or []:
+        s = (p or "").strip().lower()
+        if s.startswith("git+") or s.endswith(".git"):
+            return True
+    return False
+
+
+def github_proxy_env(proxy: str = "") -> dict[str, str]:
+    """
+    为子进程构造临时 git insteadOf 环境变量，不修改用户全局 ~/.gitconfig。
+    使 git clone https://github.com/... 自动走代理前缀。
+    """
+    proxy = _normalize_github_proxy(proxy)
+    if not proxy:
+        return {}
+    # gitclone 已在 URL 层特判，insteadOf 用通用前缀即可覆盖直连
+    if "gitclone.com" in proxy.lower():
+        # url.https://gitclone.com/github.com/.insteadOf = https://github.com/
+        key = "url.https://gitclone.com/github.com/.insteadOf"
+        val = "https://github.com/"
+    else:
+        # url.https://ghfast.top/https://github.com/.insteadOf = https://github.com/
+        key = f"url.{proxy}https://github.com/.insteadOf"
+        val = "https://github.com/"
+    return {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": key,
+        "GIT_CONFIG_VALUE_0": val,
+    }
+
+
+def _probe_git(exe: str | Path, *, use_cache: bool = True) -> GitInfo | None:
+    exe = str(exe or "").strip()
+    if not exe:
+        return None
+    try:
+        key = str(Path(exe).resolve()).lower()
+    except Exception:
+        key = exe.lower()
+    if use_cache and key in _git_probe_cache:
+        return _git_probe_cache[key]
+    # which 结果可能无完整路径存在性；仍尝试 --version
+    info = None
+    try:
+        r = _run([exe, "--version"], timeout=8)
+        if r.returncode == 0:
+            ver = (r.stdout or r.stderr or "").strip()
+            # "git version 2.45.1.windows.1" → 保留整行，便于诊断
+            try:
+                resolved = str(Path(exe).resolve()) if Path(exe).exists() else exe
+            except Exception:
+                resolved = exe
+            info = GitInfo(path=resolved, version=ver, found=True)
+    except Exception:
+        info = None
+    _git_probe_cache[key] = info
+    return info
+
+
+def detect_git(*, force: bool = False) -> GitInfo:
+    """检测 PATH 上的 git 客户端。"""
+    global _git_cache
+    if not force and _git_cache is not None:
+        return _git_cache
+
+    candidates: list[str] = []
+    which = shutil.which("git")
+    if which:
+        candidates.append(which)
+
+    if sys.platform == "win32":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        local = os.environ.get("LOCALAPPDATA", "")
+        for base in (pf, pf86, local):
+            if not base:
+                continue
+            for rel in (
+                r"Git\cmd\git.exe",
+                r"Git\bin\git.exe",
+                r"Programs\Git\cmd\git.exe",
+                r"Programs\Git\bin\git.exe",
+            ):
+                p = str(Path(base) / rel)
+                if p not in candidates:
+                    candidates.append(p)
+
+    for c in candidates:
+        info = _probe_git(c, use_cache=not force)
+        if info and info.found:
+            _git_cache = info
+            return info
+
+    info = GitInfo(found=False)
+    _git_cache = info
+    return info
+
+
 def _settings_path() -> Path:
     p = Path(config.RUNTIME_DIR)
     p.mkdir(parents=True, exist_ok=True)
@@ -1253,6 +1486,7 @@ class RuntimeManager:
         # UI 友好缓存
         self._py_list_cache: list[PythonInfo] | None = None
         self._uv_cache: UvInfo | None = None
+        self._git_cache: GitInfo | None = None
         self._env_status_cache: dict[str, ModelEnvStatus] = {}
         # 最近一次 ensure_model_env 的 torch 安装方案（写入 env_meta）
         self._last_torch_plan: TorchInstallPlan | None = None
@@ -1269,6 +1503,7 @@ class RuntimeManager:
             "python_path": "",
             "uv_path": "",
             "pip_index_url": DEFAULT_PIP_INDEX_URL,
+            "github_proxy": DEFAULT_GITHUB_PROXY,
         }
 
     def save_settings(self):
@@ -1315,6 +1550,46 @@ class RuntimeManager:
             return []
         return ["-i", url]
 
+    def get_github_proxy(self) -> str:
+        """
+        返回 GitHub 访问代理前缀。
+        空字符串表示直连 GitHub；键缺失时默认 ghfast。
+        """
+        if "github_proxy" not in self._settings:
+            return DEFAULT_GITHUB_PROXY
+        return _normalize_github_proxy(
+            str(self._settings.get("github_proxy", "") or "")
+        )
+
+    def set_github_proxy(self, proxy: str):
+        # 持久化时保留用户输入形态；读取时再规范化
+        self._settings["github_proxy"] = (proxy or "").strip()
+        self.save_settings()
+
+    def rewrite_github_url(self, url: str) -> str:
+        """按当前设置改写 GitHub URL。"""
+        return rewrite_github_url(url, self.get_github_proxy())
+
+    def rewrite_git_package_specs(self, packages: list[str]) -> list[str]:
+        """按当前代理改写依赖中的 GitHub 地址。"""
+        return rewrite_git_package_specs(packages, self.get_github_proxy())
+
+    def git_proxy_env(self) -> dict[str, str]:
+        """安装 git 依赖时注入的临时 insteadOf 环境变量。"""
+        return github_proxy_env(self.get_github_proxy())
+
+    def resolve_git(self, *, force: bool = False) -> GitInfo:
+        """检测本机 Git（带实例缓存）。"""
+        global _git_cache
+        if force:
+            self._git_cache = None
+            _git_cache = None
+        if self._git_cache is not None and not force:
+            return self._git_cache
+        info = detect_git(force=force)
+        self._git_cache = info
+        return info
+
     def invalidate_caches(
         self,
         *,
@@ -1322,14 +1597,19 @@ class RuntimeManager:
         uv: bool = False,
         env: str | bool = False,
         vc: bool = False,
+        git: bool = False,
         all_: bool = False,
     ):
         """清除探测缓存。env=True 清全部模型；env='ben2' 清指定模型。"""
-        global _vc_redist_cache
+        global _vc_redist_cache, _git_cache, _git_probe_cache
         if all_ or pythons:
             self._py_list_cache = None
         if all_ or uv:
             self._uv_cache = None
+        if all_ or git:
+            self._git_cache = None
+            _git_cache = None
+            _git_probe_cache.clear()
         if all_ or vc:
             _vc_redist_cache = None
         if all_ or env is True:
@@ -1590,11 +1870,21 @@ class RuntimeManager:
         import tempfile
         import zipfile
 
-        # 固定使用较新的稳定版；若网络失败可回退官方脚本
-        urls = [
-            "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip",
-            "https://ghfast.top/https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip",
-        ]
+        # 固定使用较新的稳定版；优先走用户配置的 GitHub 代理，再回退直连与常见镜像
+        official = (
+            "https://github.com/astral-sh/uv/releases/latest/download/"
+            "uv-x86_64-pc-windows-msvc.zip"
+        )
+        urls: list[str] = []
+        proxied = self.rewrite_github_url(official)
+        if proxied and proxied != official:
+            urls.append(proxied)
+        urls.append(official)
+        # 额外兜底（与默认代理不同时才加）
+        fallback = rewrite_github_url(official, DEFAULT_GITHUB_PROXY)
+        if fallback not in urls:
+            urls.append(fallback)
+
         last_err = None
         for url in urls:
             try:
@@ -2244,8 +2534,12 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
                     packages = list(meta.env_packages)
             except Exception:
                 packages = packages or []
-        packages = list(packages or [])
-        required_check = self.resolve_required_packages(model_id, packages)
+        # 原始规格（写入 meta / 校验映射）；安装规格可经 GitHub 代理改写
+        packages_orig = list(packages or [])
+        packages = self.rewrite_git_package_specs(packages_orig)
+        required_check = self.resolve_required_packages(model_id, packages_orig)
+        need_git = packages_need_git(packages_orig)
+        git_env = self.git_proxy_env() if need_git else {}
 
         with self._busy_lock:
             if self._busy:
@@ -2261,6 +2555,32 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
                 if progress:
                     progress(model_id, 5, "未找到 uv，开始自动安装…")
                 uv = self.install_uv(progress=progress)
+
+            # git+https 依赖（如 BEN2）需要本机 git
+            if need_git:
+                if progress:
+                    progress(model_id, 8, "检查 Git…")
+                git = self.resolve_git(force=True)
+                if not git.found:
+                    raise RuntimeError(
+                        "未检测到 Git 客户端。\n"
+                        "BEN2 等模型需通过 git+https 拉取代码包，请先安装 Git 并确保 "
+                        "git 在 PATH 中可用。\n"
+                        f"下载: {GIT_DOWNLOAD_URL}\n"
+                        "安装后请重启 PixelFlow，再到「开发环境」重新检测。"
+                    )
+                gh_proxy = self.get_github_proxy()
+                if progress:
+                    if gh_proxy:
+                        progress(
+                            model_id, 9,
+                            f"Git 已就绪 · GitHub 代理: {gh_proxy}",
+                        )
+                    else:
+                        progress(
+                            model_id, 9,
+                            "Git 已就绪 · 直连 GitHub（可在开发环境配置代理）",
+                        )
 
             if progress:
                 progress(model_id, 12, "解析基础 Python…")
@@ -2387,7 +2707,7 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
                     # 记录实际安装方案，供 meta / UI
                     self._last_torch_plan = torch_plan
 
-                # ② 其余依赖走 PyPI 镜像
+                # ② 其余依赖走 PyPI 镜像（git+ 规格已按代理改写；子进程注入 insteadOf）
                 done = 0
                 total = max(len(non_torch), 1)
                 for batch in pypi_batches:
@@ -2404,10 +2724,18 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
                         *index_args,
                         *batch,
                     ]
-                    r = _run(cmd, timeout=None, cwd=env_dir)
+                    # 仅当本批含 git 规格时注入 git 代理环境
+                    batch_env = git_env if packages_need_git(batch) else None
+                    r = _run(cmd, timeout=None, cwd=env_dir, env=batch_env)
                     if r.returncode != 0:
                         err = _strip_ansi((r.stderr or r.stdout or "")[-2500:])
-                        raise RuntimeError(f"依赖安装失败:\n{err}")
+                        hint = ""
+                        if packages_need_git(batch):
+                            hint = (
+                                "\n\n若失败与 GitHub 访问有关，请到「开发环境」："
+                                "确认已安装 Git，并配置 GitHub 代理（如 ghfast）后重试。"
+                            )
+                        raise RuntimeError(f"依赖安装失败:\n{err}{hint}")
                     done += len(batch)
 
             if progress:
@@ -2424,15 +2752,15 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
                         model_id, 92,
                         f"补装缺失依赖: {', '.join(st.missing_packages)}",
                     )
-                # 把 missing 映射回原始 install 规格
+                # 把 missing 映射回「安装规格」（已含代理改写）
                 retry_specs = []
                 miss_set = {m.lower() for m in st.missing_packages}
-                for p in packages:
-                    key = _normalize_check_names([p])
+                for p_orig, p_inst in zip(packages_orig, packages):
+                    key = _normalize_check_names([p_orig])
                     if key and key[0].lower() in miss_set:
-                        retry_specs.append(p)
-                    elif "ben2" in p.lower() and "ben2" in miss_set:
-                        retry_specs.append(p)
+                        retry_specs.append(p_inst)
+                    elif "ben2" in p_orig.lower() and "ben2" in miss_set:
+                        retry_specs.append(p_inst)
                 if not retry_specs:
                     # 回退：直接用缺失名
                     retry_specs = list(st.missing_packages)
@@ -2443,7 +2771,8 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
                     *self.pip_index_args(),
                     *retry_specs,
                 ]
-                r = _run(cmd, timeout=None, cwd=env_dir)
+                retry_env = git_env if packages_need_git(retry_specs) else None
+                r = _run(cmd, timeout=None, cwd=env_dir, env=retry_env)
                 if r.returncode != 0:
                     err = _strip_ansi((r.stderr or r.stdout or "")[-2000:])
                     raise RuntimeError(
@@ -2457,7 +2786,7 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
             self.write_env_meta(
                 model_id,
                 base_python=base.path,
-                packages=packages,
+                packages=packages_orig,
                 status=st,
                 torch_plan=getattr(self, "_last_torch_plan", None),
             )
@@ -2597,6 +2926,27 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
         lines.append(f"默认推荐: {DEFAULT_PIP_INDEX_URL}")
         lines.append("")
 
+        lines.append("— Git（git+https 依赖 / BEN2 等）—")
+        git = self.resolve_git()
+        if git.found:
+            lines.append(f"✓ {git.display}")
+        else:
+            lines.append("✗ 未检测到 Git 客户端")
+            lines.append(f"  下载安装: {GIT_DOWNLOAD_URL}")
+            lines.append("  安装时勾选加入 PATH，完成后重启 PixelFlow 再检测。")
+        gh = self.get_github_proxy()
+        if gh:
+            lines.append(f"GitHub 代理: {gh}")
+            sample = "git+https://github.com/yincangshiwei/BEN2.git"
+            lines.append(f"改写示例: {rewrite_github_url(sample, gh)}")
+        else:
+            lines.append("GitHub 代理: （未启用，直连 github.com）")
+            lines.append(
+                "  国内网络访问 GitHub 不稳定时，建议在开发环境启用 ghfast 等代理。"
+            )
+        lines.append("说明: 代理仅影响本应用安装过程，不修改系统 git 全局配置。")
+        lines.append("")
+
         lines.append("— NVIDIA / PyTorch 安装策略（主流系列清单）—")
         nv = detect_nvidia_gpu()
         plan = plan_torch_install()
@@ -2644,6 +2994,8 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
             "而是为每个模型维护独立 uv 环境，通过子进程调用 worker 脚本，"
             "这样打包 exe 体积不受影响，且不同模型依赖互不冲突。"
             "安装依赖时使用上方镜像 -i，不会修改系统 pip/uv 全局配置。"
+            "git+https（如 BEN2）需要本机 Git；GitHub 代理将地址改写为镜像前缀，"
+            "同样不改用户全局 gitconfig。"
             "torch/torchvision 按本机 GPU 从 PyTorch 官方索引或 PyPI 安装。"
             "Windows 上 torch 还依赖系统 VC++ 运行库，与 pip 是否成功无关。"
         )

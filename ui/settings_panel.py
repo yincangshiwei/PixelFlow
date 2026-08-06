@@ -25,15 +25,21 @@ from core.matting.inference import clear_model_cache
 from core.runtime.env_manager import (
     get_runtime_manager,
     UvInfo,
+    GitInfo,
     ModelEnvStatus,
     DEFAULT_PIP_INDEX_URL,
     PIP_INDEX_PRESETS,
+    DEFAULT_GITHUB_PROXY,
+    GITHUB_PROXY_PRESETS,
+    GIT_DOWNLOAD_URL,
     VC_REDIST_X64_URL,
     VC_REDIST_HELP_URL,
     NVIDIA_DRIVER_URL,
     plan_torch_install,
     build_ai_setup_prompt,
     match_local_gpu,
+    rewrite_github_url,
+    packages_need_git,
 )
 
 
@@ -51,8 +57,8 @@ class _AsyncBridge(QObject):
 
 
 class _DevScanWorker(QThread):
-    """后台扫描 Python / uv，避免阻塞 UI"""
-    done = Signal(object, object, str)
+    """后台扫描 Python / uv / git，避免阻塞 UI"""
+    done = Signal(object, object, object, str)  # pys, uv, git, diagnose
 
     def __init__(self, force: bool = False, parent=None):
         super().__init__(parent)
@@ -61,14 +67,15 @@ class _DevScanWorker(QThread):
     def run(self):
         rt = get_runtime_manager()
         if self.force:
-            rt.invalidate_caches(pythons=True, uv=True, vc=True)
+            rt.invalidate_caches(pythons=True, uv=True, vc=True, git=True)
         pys = rt.discover_pythons(force=self.force)
         uv = rt.resolve_uv(force=self.force)
+        git = rt.resolve_git(force=self.force)
         # 强制刷新时同步重检 VC++，写入诊断文本
         if self.force:
             rt.get_vc_redist(force=True)
         diag = rt.diagnose_text()
-        self.done.emit(pys, uv, diag)
+        self.done.emit(pys, uv, git, diag)
 
 
 class _EnvCheckWorker(QThread):
@@ -257,6 +264,36 @@ class SettingsPanel(QWidget):
         gu.addWidget(self.lbl_dev_msg)
         lay.addWidget(grp_uv)
 
+        # Git（git+https 依赖 / BEN2 等）
+        grp_git = QGroupBox("Git 客户端")
+        gg = QVBoxLayout(grp_git)
+        gg.setSpacing(8)
+        git_tip = QLabel(
+            "部分抠图模型（如 <b>BEN2</b>）通过 <code>git+https://github.com/…</code> 安装代码包，"
+            "需要本机已安装 <b>Git</b> 且可在 PATH 中调用。"
+            "Git 不参与主程序运行，仅在创建/修复模型环境时使用。"
+        )
+        git_tip.setWordWrap(True)
+        git_tip.setStyleSheet("color:#8a90b0;font-size:12px;")
+        gg.addWidget(git_tip)
+        self.lbl_git = QLabel("状态: —")
+        self.lbl_git.setWordWrap(True)
+        self.lbl_git.setStyleSheet("color:#c0c6d8;")
+        gg.addWidget(self.lbl_git)
+        git_row = QHBoxLayout()
+        self.btn_refresh_git = QPushButton("重新检测 Git")
+        self.btn_refresh_git.clicked.connect(self._refresh_git_status)
+        git_row.addWidget(self.btn_refresh_git)
+        self.btn_open_git_download = QPushButton("打开 Git 下载页")
+        self.btn_open_git_download.setToolTip(GIT_DOWNLOAD_URL)
+        self.btn_open_git_download.clicked.connect(
+            lambda: self._open_url(GIT_DOWNLOAD_URL)
+        )
+        git_row.addWidget(self.btn_open_git_download)
+        git_row.addStretch()
+        gg.addLayout(git_row)
+        lay.addWidget(grp_git)
+
         # VC++ 运行库（Windows / PyTorch 必需）
         grp_vc = QGroupBox("VC++ 运行库（Windows）")
         gv = QVBoxLayout(grp_vc)
@@ -337,6 +374,56 @@ class SettingsPanel(QWidget):
         gm.addWidget(self.lbl_pip_index_hint)
         lay.addWidget(grp_mirror)
         self._load_pip_index_ui()
+
+        # GitHub 代理（git+https / 从 GitHub 下载资源）
+        grp_gh = QGroupBox("GitHub 访问代理")
+        ggh = QVBoxLayout(grp_gh)
+        ggh.setSpacing(8)
+        gh_tip = QLabel(
+            "国内网络直连 GitHub 常不稳定。<b>BEN2</b> 等 <code>git+https://github.com/…</code> "
+            "依赖会按此处配置改写地址（前缀代理，如 "
+            "<code>https://ghfast.top/https://github.com/…</code>）。"
+            "仅影响本应用安装过程，<b>不</b>修改系统 git 全局配置。"
+            "下载 uv 时也会优先尝试该代理。"
+        )
+        gh_tip.setWordWrap(True)
+        gh_tip.setStyleSheet("color:#8a90b0;font-size:12px;")
+        ggh.addWidget(gh_tip)
+
+        gh_row = QHBoxLayout()
+        gh_row.addWidget(QLabel("快捷选择:"))
+        self.combo_gh_preset = QComboBox()
+        self.combo_gh_preset.setStyleSheet(config.COMBOBOX_STYLE)
+        self.combo_gh_preset.setMinimumWidth(160)
+        for name, url in GITHUB_PROXY_PRESETS:
+            self.combo_gh_preset.addItem(name, url)
+        self.combo_gh_preset.addItem("自定义", "__custom__")
+        self.combo_gh_preset.currentIndexChanged.connect(self._on_gh_preset_changed)
+        gh_row.addWidget(self.combo_gh_preset)
+        gh_row.addWidget(QLabel("代理前缀:"))
+        self.edit_github_proxy = QLineEdit()
+        self.edit_github_proxy.setPlaceholderText(
+            "例如 https://ghfast.top/ ；留空=直连 GitHub"
+        )
+        self.edit_github_proxy.setMinimumWidth(260)
+        gh_row.addWidget(self.edit_github_proxy, 1)
+        self.btn_save_github_proxy = QPushButton("保存代理")
+        self.btn_save_github_proxy.clicked.connect(self._save_github_proxy)
+        gh_row.addWidget(self.btn_save_github_proxy)
+        self.btn_reset_github_proxy = QPushButton("恢复默认")
+        self.btn_reset_github_proxy.setToolTip(
+            f"恢复为 ghfast\n{DEFAULT_GITHUB_PROXY}"
+        )
+        self.btn_reset_github_proxy.clicked.connect(self._reset_github_proxy)
+        gh_row.addWidget(self.btn_reset_github_proxy)
+        ggh.addLayout(gh_row)
+
+        self.lbl_github_proxy_hint = QLabel("")
+        self.lbl_github_proxy_hint.setWordWrap(True)
+        self.lbl_github_proxy_hint.setStyleSheet("color:#8a90b0;font-size:12px;")
+        ggh.addWidget(self.lbl_github_proxy_hint)
+        lay.addWidget(grp_gh)
+        self._load_github_proxy_ui()
 
         # 诊断
         grp_diag = QGroupBox("环境诊断")
@@ -676,6 +763,9 @@ class SettingsPanel(QWidget):
         self.lbl_py_hint.setStyleSheet("color:#8a90b0;font-size:12px;")
         self.lbl_uv.setText("状态: 检测中…")
         self.lbl_uv.setStyleSheet("color:#8a90b0;")
+        if hasattr(self, "lbl_git"):
+            self.lbl_git.setText("状态: 检测中…")
+            self.lbl_git.setStyleSheet("color:#8a90b0;")
         self.txt_diag.setPlainText("正在后台扫描开发环境…")
 
     def _apply_model_placeholder(self):
@@ -685,31 +775,45 @@ class SettingsPanel(QWidget):
     # ── 开发环境刷新（异步）──
     def _schedule_dev_refresh(self, force: bool = False):
         # 有缓存且非强制：直接画 UI，零等待
-        if not force and self._rt._py_list_cache is not None and self._rt._uv_cache is not None:
+        if (
+            not force
+            and self._rt._py_list_cache is not None
+            and self._rt._uv_cache is not None
+            and self._rt._git_cache is not None
+        ):
             self._apply_dev_snapshot(
                 self._rt.discover_pythons(),
                 self._rt.resolve_uv(),
+                self._rt.resolve_git(),
                 self._rt.diagnose_text(),
             )
             return
         if self._scan_worker is not None and self._scan_worker.isRunning():
             return
-        self.lbl_dev_msg.setText("正在后台检测 Python / uv…")
+        self.lbl_dev_msg.setText("正在后台检测 Python / uv / Git…")
         self.btn_refresh_py.setEnabled(False)
+        if hasattr(self, "btn_refresh_git"):
+            self.btn_refresh_git.setEnabled(False)
         worker = _DevScanWorker(force=force, parent=self)
         self._scan_worker = worker
         worker.done.connect(self._on_dev_scan_done)
-        worker.finished.connect(lambda: self.btn_refresh_py.setEnabled(True))
+        worker.finished.connect(self._on_dev_scan_finished)
         worker.start()
 
-    @Slot(object, object, str)
-    def _on_dev_scan_done(self, pys, uv, diag: str):
-        self._apply_dev_snapshot(pys, uv, diag)
+    def _on_dev_scan_finished(self):
+        self.btn_refresh_py.setEnabled(True)
+        if hasattr(self, "btn_refresh_git"):
+            self.btn_refresh_git.setEnabled(True)
+
+    @Slot(object, object, object, str)
+    def _on_dev_scan_done(self, pys, uv, git, diag: str):
+        self._apply_dev_snapshot(pys, uv, git, diag)
         self.lbl_dev_msg.setText("")
 
-    def _apply_dev_snapshot(self, pys, uv: UvInfo, diag: str):
+    def _apply_dev_snapshot(self, pys, uv: UvInfo, git: GitInfo | None, diag: str):
         self._dev_loaded = True
         self._load_pip_index_ui()
+        self._load_github_proxy_ui()
         saved = self._rt.get_saved_python_path()
         self.combo_python.blockSignals(True)
         self.combo_python.clear()
@@ -752,10 +856,41 @@ class SettingsPanel(QWidget):
             self.lbl_uv.setStyleSheet("color:#e0a060;font-weight:bold;")
             self.btn_install_uv.setText("安装 uv")
 
+        self._apply_git_status(git)
         self._apply_vc_status()
         self.txt_diag.setPlainText(diag or "")
         # 开发环境状态变化后，同步模型页门禁
         self._apply_matting_gate()
+
+    def _refresh_git_status(self):
+        """手动重检 Git 并刷新标签 + 诊断区。"""
+        self._rt.invalidate_caches(git=True)
+        self._apply_git_status(self._rt.resolve_git(force=True))
+        try:
+            self.txt_diag.setPlainText(self._rt.diagnose_text())
+        except Exception:
+            pass
+
+    def _apply_git_status(self, git: GitInfo | None = None):
+        """更新开发环境页 Git 状态标签。"""
+        if not hasattr(self, "lbl_git"):
+            return
+        if git is None:
+            try:
+                git = self._rt.resolve_git()
+            except Exception as e:
+                self.lbl_git.setText(f"状态: 检测失败 — {e}")
+                self.lbl_git.setStyleSheet("color:#e0a060;font-weight:bold;")
+                return
+        if git and git.found:
+            self.lbl_git.setText(f"状态: 已就绪  ·  {git.display}")
+            self.lbl_git.setStyleSheet("color:#6dcea0;font-weight:bold;")
+        else:
+            self.lbl_git.setText(
+                "状态: 未安装 — BEN2 等 git+https 依赖将无法安装\n"
+                "请安装 Git for Windows，勾选加入 PATH，重启后再检测。"
+            )
+            self.lbl_git.setStyleSheet("color:#e0a060;font-weight:bold;")
 
     def _refresh_vc_status(self):
         """手动重检 VC++ 并刷新标签 + 诊断区。"""
@@ -1122,6 +1257,100 @@ class SettingsPanel(QWidget):
             f"已恢复为清华大学源:\n{DEFAULT_PIP_INDEX_URL}",
         )
 
+    def _load_github_proxy_ui(self):
+        """从 runtime_settings 回填 GitHub 代理控件。"""
+        if not hasattr(self, "edit_github_proxy"):
+            return
+        proxy = self._rt.get_github_proxy()
+        self.edit_github_proxy.blockSignals(True)
+        self.edit_github_proxy.setText(proxy)
+        self.edit_github_proxy.blockSignals(False)
+
+        self.combo_gh_preset.blockSignals(True)
+        matched = False
+        for i in range(self.combo_gh_preset.count()):
+            data = self.combo_gh_preset.itemData(i)
+            if data == "__custom__":
+                continue
+            # 规范化比较（尾部 /）
+            a = (data or "").rstrip("/")
+            b = (proxy or "").rstrip("/")
+            if a == b:
+                self.combo_gh_preset.setCurrentIndex(i)
+                matched = True
+                break
+        if not matched:
+            for i in range(self.combo_gh_preset.count()):
+                if self.combo_gh_preset.itemData(i) == "__custom__":
+                    self.combo_gh_preset.setCurrentIndex(i)
+                    break
+        self.combo_gh_preset.blockSignals(False)
+        self._update_github_proxy_hint()
+
+    def _on_gh_preset_changed(self, _idx: int = 0):
+        data = self.combo_gh_preset.currentData()
+        if data == "__custom__":
+            self._update_github_proxy_hint()
+            return
+        # 含「不使用代理」的空字符串
+        self.edit_github_proxy.setText(str(data or ""))
+        self._update_github_proxy_hint()
+
+    def _update_github_proxy_hint(self):
+        if not hasattr(self, "lbl_github_proxy_hint"):
+            return
+        proxy = (self.edit_github_proxy.text() or "").strip()
+        sample = "git+https://github.com/yincangshiwei/BEN2.git"
+        if proxy:
+            rewritten = rewrite_github_url(sample, proxy)
+            self.lbl_github_proxy_hint.setText(
+                f"安装 git 依赖时将改写为:\n{rewritten}"
+            )
+        else:
+            self.lbl_github_proxy_hint.setText(
+                "当前未使用代理：git 依赖将直连 github.com。"
+            )
+
+    def _save_github_proxy(self):
+        proxy = (self.edit_github_proxy.text() or "").strip()
+        if proxy and not (
+            proxy.startswith("http://") or proxy.startswith("https://")
+        ):
+            QMessageBox.warning(
+                self, "无效地址",
+                "代理前缀需以 http:// 或 https:// 开头，或留空表示直连 GitHub。",
+            )
+            return
+        self._rt.set_github_proxy(proxy)
+        self._load_github_proxy_ui()
+        if proxy:
+            sample = rewrite_github_url(
+                "git+https://github.com/yincangshiwei/BEN2.git", proxy
+            )
+            QMessageBox.information(
+                self, "已保存",
+                f"已保存 GitHub 代理:\n{proxy}\n\n"
+                f"示例改写:\n{sample}\n\n"
+                "下次「创建/修复环境」安装 git 依赖时生效。",
+            )
+        else:
+            QMessageBox.information(
+                self, "已保存",
+                "已关闭 GitHub 代理：安装时直连 github.com。",
+            )
+        if hasattr(self, "txt_diag"):
+            self.txt_diag.setPlainText(self._rt.diagnose_text())
+
+    def _reset_github_proxy(self):
+        self._rt.set_github_proxy(DEFAULT_GITHUB_PROXY)
+        self._load_github_proxy_ui()
+        if hasattr(self, "txt_diag"):
+            self.txt_diag.setPlainText(self._rt.diagnose_text())
+        QMessageBox.information(
+            self, "已恢复默认",
+            f"已恢复为 ghfast 代理:\n{DEFAULT_GITHUB_PROXY}",
+        )
+
     def _install_uv(self):
         if self._rt.is_busy:
             QMessageBox.information(self, "请稍候", "已有任务进行中")
@@ -1187,6 +1416,27 @@ class SettingsPanel(QWidget):
             )
             self.open_menu(0)
             return
+
+        # git+https 依赖（如 BEN2）需要 Git
+        pkgs = list(meta.env_packages or ())
+        if packages_need_git(pkgs):
+            git = self._rt.resolve_git(force=True)
+            if not git.found:
+                ret = QMessageBox.warning(
+                    self,
+                    "需要 Git",
+                    "当前模型依赖含 git+https 包（如 BEN2），但未检测到 Git 客户端。\n\n"
+                    "请先安装 Git for Windows，安装时勾选加入 PATH，"
+                    "重启 PixelFlow 后到「开发环境」重新检测。\n\n"
+                    f"下载页: {GIT_DOWNLOAD_URL}\n\n"
+                    "是否打开下载页？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if ret == QMessageBox.Yes:
+                    self._open_url(GIT_DOWNLOAD_URL)
+                self.open_menu(0)
+                return
 
         # Windows：VC++ 异常时提前提示（不强制阻断，允许用户仍尝试安装）
         if sys.platform == "win32":

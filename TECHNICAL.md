@@ -338,7 +338,14 @@ python <model>_worker.py --serve --device auto --weights-dir ...
 **开发环境 · 依赖镜像：**  
 `runtime/runtime_settings.json` 字段 `pip_index_url`（默认清华 `https://pypi.tuna.tsinghua.edu.cn/simple`）。  
 `RuntimeManager.ensure_model_env` 执行 `uv pip install` 时附加 `-i <url>`，**不**修改用户全局 pip/uv 配置。  
-留空则不附加 `-i`。git+https 包（如 BEN2）仍走 Git，不受 PyPI 镜像影响。
+留空则不附加 `-i`。
+
+**开发环境 · Git / GitHub 代理：**  
+- 检测本机 Git 客户端（PATH + Windows 常见安装路径）；BEN2 等 `git+https` 依赖创建环境前会校验。  
+- `runtime_settings.json` 字段 `github_proxy`（默认 `https://ghfast.top/`，留空=直连）。  
+- 安装时将 `git+https://github.com/...` 改写为代理前缀形式，并通过临时 `GIT_CONFIG_*` insteadOf 注入子进程，**不**改用户全局 gitconfig。  
+- 下载 uv（GitHub releases）时同样优先走该代理。  
+- git+https 包不受 PyPI 镜像影响，需 Git +（可选）GitHub 代理。
 
 **BEN2 安装源：** 代码包 `git+https://github.com/yincangshiwei/BEN2.git`（fork）；权重仍 ModelScope `PramaLLC/BEN2`。
 

@@ -6,6 +6,7 @@ from core.runtime.env_manager import (
     get_runtime_manager,
     PythonInfo,
     UvInfo,
+    GitInfo,
     ModelEnvStatus,
 )
 
@@ -14,5 +15,6 @@ __all__ = [
     "get_runtime_manager",
     "PythonInfo",
     "UvInfo",
+    "GitInfo",
     "ModelEnvStatus",
 ]

@@ -248,6 +248,12 @@ class SettingsPanel(QWidget):
         self.btn_install_uv.setMinimumHeight(34)
         self.btn_install_uv.clicked.connect(self._install_uv)
         uv_row.addWidget(self.btn_install_uv)
+        self.btn_refresh_uv = QPushButton("重新检测 uv")
+        self.btn_refresh_uv.setToolTip(
+            "刷新系统 PATH 并重新探测 uv（手动安装/拷贝到 runtime/uv 后无需重启）"
+        )
+        self.btn_refresh_uv.clicked.connect(self._refresh_uv_status)
+        uv_row.addWidget(self.btn_refresh_uv)
         self.btn_open_runtime = QPushButton("打开 runtime 目录")
         self.btn_open_runtime.clicked.connect(self._open_runtime_dir)
         uv_row.addWidget(self.btn_open_runtime)
@@ -714,14 +720,15 @@ class SettingsPanel(QWidget):
     def _check_dev_ready(self) -> tuple[bool, str]:
         """返回 (是否可配置模型, 说明文案)。"""
         uv = self._rt.resolve_uv()
-        base = self._rt.resolve_base_python()
-        missing = []
-        if base is None:
-            missing.append("可用 Python 3.10–3.12（64 位）")
+        base = self._rt.resolve_base_python(min_ver=(3, 10), max_ver=(3, 12))
+        # uv 可按版本号托管下载 CPython 3.12，故「仅有 uv」也视为可配置模型；
+        # 本机 3.10–3.12 为加分项（离线更快），不再与 uv 同时强依赖。
         if not uv.found:
-            missing.append("包管理工具 uv")
-        if missing:
-            return False, "缺少: " + "、".join(missing)
+            if base is None:
+                return False, "缺少: 包管理工具 uv，以及可用 Python 3.10–3.12（64 位）"
+            return False, "缺少: 包管理工具 uv（创建模型环境必需）"
+        if base is None:
+            return True, "开发环境已就绪（uv 可用；将按目标版本托管下载 Python 3.12）"
         return True, "开发环境已就绪"
 
     def _update_dev_ready_flag(self):
@@ -792,6 +799,8 @@ class SettingsPanel(QWidget):
             return
         self.lbl_dev_msg.setText("正在后台检测 Python / uv / Git…")
         self.btn_refresh_py.setEnabled(False)
+        if hasattr(self, "btn_refresh_uv"):
+            self.btn_refresh_uv.setEnabled(False)
         if hasattr(self, "btn_refresh_git"):
             self.btn_refresh_git.setEnabled(False)
         worker = _DevScanWorker(force=force, parent=self)
@@ -802,6 +811,8 @@ class SettingsPanel(QWidget):
 
     def _on_dev_scan_finished(self):
         self.btn_refresh_py.setEnabled(True)
+        if hasattr(self, "btn_refresh_uv"):
+            self.btn_refresh_uv.setEnabled(True)
         if hasattr(self, "btn_refresh_git"):
             self.btn_refresh_git.setEnabled(True)
 
@@ -847,29 +858,87 @@ class SettingsPanel(QWidget):
             )
             self.lbl_py_hint.setStyleSheet("color:#e0a060;font-size:12px;")
 
-        if uv and uv.found:
-            self.lbl_uv.setText(f"状态: 已就绪  ·  {uv.display}")
-            self.lbl_uv.setStyleSheet("color:#6dcea0;font-weight:bold;")
-            self.btn_install_uv.setText("重新安装 uv")
-        else:
-            self.lbl_uv.setText("状态: 未安装 — 可一键下载到 runtime/uv/")
-            self.lbl_uv.setStyleSheet("color:#e0a060;font-weight:bold;")
-            self.btn_install_uv.setText("安装 uv")
-
+        self._apply_uv_status(uv)
         self._apply_git_status(git)
         self._apply_vc_status()
         self.txt_diag.setPlainText(diag or "")
         # 开发环境状态变化后，同步模型页门禁
         self._apply_matting_gate()
 
-    def _refresh_git_status(self):
-        """手动重检 Git 并刷新标签 + 诊断区。"""
-        self._rt.invalidate_caches(git=True)
-        self._apply_git_status(self._rt.resolve_git(force=True))
+    def _refresh_uv_status(self):
+        """手动重检 uv（刷新 PATH + 清缓存），无需重启。"""
+        self.lbl_uv.setText("状态: 检测中…")
+        self.lbl_uv.setStyleSheet("color:#8a90b0;")
+        if hasattr(self, "btn_refresh_uv"):
+            self.btn_refresh_uv.setEnabled(False)
         try:
-            self.txt_diag.setPlainText(self._rt.diagnose_text())
-        except Exception:
-            pass
+            self._rt.invalidate_caches(uv=True)
+            uv = self._rt.resolve_uv(force=True)
+            self._apply_uv_status(uv)
+            # 同步门禁（模型页依赖 uv 就绪）
+            self._apply_matting_gate()
+            try:
+                self.txt_diag.setPlainText(self._rt.diagnose_text())
+            except Exception:
+                pass
+            if uv and uv.found:
+                self.lbl_dev_msg.setText(f"uv 已重新检测到: {uv.display}")
+            else:
+                self.lbl_dev_msg.setText(
+                    "仍未检测到 uv。可将 uv.exe 放到 runtime/uv/ 后再点重新检测，"
+                    "或使用「安装 / 修复 uv」。"
+                )
+        finally:
+            if hasattr(self, "btn_refresh_uv"):
+                self.btn_refresh_uv.setEnabled(True)
+
+    def _apply_uv_status(self, uv: UvInfo | None = None):
+        """更新开发环境页 uv 状态标签。"""
+        if uv is None:
+            try:
+                uv = self._rt.resolve_uv()
+            except Exception as e:
+                self.lbl_uv.setText(f"状态: 检测失败 — {e}")
+                self.lbl_uv.setStyleSheet("color:#e0a060;font-weight:bold;")
+                return
+        if uv and uv.found:
+            self.lbl_uv.setText(f"状态: 已就绪  ·  {uv.display}")
+            self.lbl_uv.setStyleSheet("color:#6dcea0;font-weight:bold;")
+            self.btn_install_uv.setText("重新安装 uv")
+        else:
+            self.lbl_uv.setText(
+                "状态: 未安装 — 可一键下载到 runtime/uv/\n"
+                "手动放置 uv.exe 后点「重新检测 uv」即可，无需重启。"
+            )
+            self.lbl_uv.setStyleSheet("color:#e0a060;font-weight:bold;")
+            self.btn_install_uv.setText("安装 uv")
+
+    def _refresh_git_status(self):
+        """手动重检 Git（刷新系统 PATH + 清缓存），无需重启。"""
+        self.lbl_git.setText("状态: 检测中…")
+        self.lbl_git.setStyleSheet("color:#8a90b0;")
+        if hasattr(self, "btn_refresh_git"):
+            self.btn_refresh_git.setEnabled(False)
+        try:
+            self._rt.invalidate_caches(git=True)
+            git = self._rt.resolve_git(force=True)
+            self._apply_git_status(git)
+            # 同步门禁/诊断，保证模型配置页创建环境读到同一缓存
+            self._apply_matting_gate()
+            try:
+                self.txt_diag.setPlainText(self._rt.diagnose_text())
+            except Exception:
+                pass
+            if git and git.found:
+                self.lbl_dev_msg.setText(f"Git 已重新检测到: {git.display}")
+            else:
+                self.lbl_dev_msg.setText(
+                    "仍未检测到 Git。请确认已安装 Git for Windows，"
+                    "然后再次点「重新检测 Git」（一般无需重启软件）。"
+                )
+        finally:
+            if hasattr(self, "btn_refresh_git"):
+                self.btn_refresh_git.setEnabled(True)
 
     def _apply_git_status(self, git: GitInfo | None = None):
         """更新开发环境页 Git 状态标签。"""
@@ -888,7 +957,8 @@ class SettingsPanel(QWidget):
         else:
             self.lbl_git.setText(
                 "状态: 未安装 — BEN2 等 git+https 依赖将无法安装\n"
-                "请安装 Git for Windows，勾选加入 PATH，重启后再检测。"
+                "请安装 Git for Windows（建议勾选加入 PATH），"
+                "装完后点「重新检测 Git」即可，一般无需重启软件。"
             )
             self.lbl_git.setStyleSheet("color:#e0a060;font-weight:bold;")
 
@@ -1392,27 +1462,46 @@ class SettingsPanel(QWidget):
             QMessageBox.information(self, "请稍候", "已有环境任务进行中")
             return
 
-        # 前置检查
-        uv = self._rt.resolve_uv()
+        # 前置检查：force 刷新 PATH + 清缓存，与开发环境「重新检测」同源，避免状态不同步
+        uv = self._rt.resolve_uv(force=True)
         if not uv.found:
             ret = QMessageBox.question(
                 self,
                 "需要 uv",
-                "尚未安装 uv，是否先自动安装？",
+                "尚未检测到 uv。\n\n"
+                "若已手动放到 runtime/uv/，请先到「开发环境」点「重新检测 uv」。\n"
+                "是否现在自动安装 uv？",
             )
             if ret != QMessageBox.Yes:
                 return
             self.open_menu(0)
             self._install_uv()
             return
+        # 刷新 UI 标签，保持与探测结果一致
+        self._apply_uv_status(uv)
 
-        base = self._rt.resolve_base_python()
+        # 优先本机 3.10–3.12；若无，创建环境时由 uv 按目标版本（如 3.12）托管下载，
+        # 不再因只有 3.13/3.14 而直接拦截（那些版本无 torch wheel，不能用作 venv 基座）。
+        target_py = (meta.python_version or "3.12").strip() or "3.12"
+        try:
+            tp = target_py.split(".")
+            tmaj, tmin = int(tp[0]), int(tp[1]) if len(tp) > 1 else 12
+        except ValueError:
+            tmaj, tmin = 3, 12
+            target_py = "3.12"
+        base = self._rt.resolve_base_python(
+            min_ver=(tmaj, tmin), max_ver=(tmaj, tmin),
+        )
         if base is None:
+            base = self._rt.resolve_base_python(min_ver=(3, 10), max_ver=(3, 12))
+        if base is None and not uv.found:
             QMessageBox.warning(
                 self,
-                "需要 Python",
-                "未找到可用的 Python 3.10–3.12（64 位）。\n"
-                "请到「开发环境」安装/选择 Python 后再试。",
+                "需要 Python 或 uv",
+                f"未找到可用的 Python 3.10–3.12（64 位），且 uv 未就绪。\n"
+                f"请到「开发环境」安装 uv（可自动下载 Python {target_py}），\n"
+                "或安装本机 Python 3.10–3.12 后再试。\n"
+                "请勿使用 3.13/3.14 作为模型环境（无对应 PyTorch 轮子）。",
             )
             self.open_menu(0)
             return
@@ -1421,13 +1510,15 @@ class SettingsPanel(QWidget):
         pkgs = list(meta.env_packages or ())
         if packages_need_git(pkgs):
             git = self._rt.resolve_git(force=True)
+            self._apply_git_status(git)
             if not git.found:
                 ret = QMessageBox.warning(
                     self,
                     "需要 Git",
                     "当前模型依赖含 git+https 包（如 BEN2），但未检测到 Git 客户端。\n\n"
-                    "请先安装 Git for Windows，安装时勾选加入 PATH，"
-                    "重启 PixelFlow 后到「开发环境」重新检测。\n\n"
+                    "请先安装 Git for Windows（建议勾选加入 PATH）。\n"
+                    "安装完成后无需重启：到「开发环境」点「重新检测 Git」，\n"
+                    "确认状态为已就绪后再点「创建/修复环境」。\n\n"
                     f"下载页: {GIT_DOWNLOAD_URL}\n\n"
                     "是否打开下载页？",
                     QMessageBox.Yes | QMessageBox.No,
@@ -1527,7 +1618,7 @@ class SettingsPanel(QWidget):
             f"settings_matting_{mid}",
             f"配置 · {action}模型环境 — {meta.name} ({mid})",
         )
-        self._emit_log(f"目标 Python: {meta.python_version}")
+        self._emit_log(f"目标 Python: {target_py}（严格 3.10–3.12，拒绝更高版本 ABI）")
         self._emit_log(f"依赖包数: {len(pkgs)}")
         if pkgs:
             self._emit_log("依赖列表: " + ", ".join(pkgs[:12]) + ("…" if len(pkgs) > 12 else ""))
@@ -1549,6 +1640,10 @@ class SettingsPanel(QWidget):
                 )
         if base:
             self._emit_log(f"基础解释器: {base.display}")
+        else:
+            self._emit_log(
+                f"本机无 3.10–3.12：将由 uv 按版本号托管下载 Python {target_py}"
+            )
         if uv.found:
             self._emit_log(f"uv: {uv.display}")
         bridge = self._bridge
@@ -1913,7 +2008,15 @@ class SettingsPanel(QWidget):
 
         if key == "uv":
             self.btn_install_uv.setEnabled(True)
+            if hasattr(self, "btn_refresh_uv"):
+                self.btn_refresh_uv.setEnabled(True)
             self._rt.invalidate_caches(uv=True)
+            # 安装完成后强制重探并同步门禁
+            try:
+                self._apply_uv_status(self._rt.resolve_uv(force=True))
+                self._apply_matting_gate()
+            except Exception:
+                pass
             self._schedule_dev_refresh(force=True)
             if ok:
                 self.progress_dev.setValue(100)

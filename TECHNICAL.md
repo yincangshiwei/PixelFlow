@@ -49,13 +49,14 @@ PixelFlow/
 │   │   ├── hardware.py         # 硬件评估
 │   │   └── workers/            # 子进程脚本（在隔离 venv 中跑）
 │   └── runtime/
-│       └── env_manager.py      # uv / Python / 模型 venv
+│       ├── env_manager.py      # uv / Python / Git / 模型 venv / PATH 同步
+│       └── gpu_catalog.py      # 主流 GPU ↔ PyTorch CUDA 标签清单
 ├── ui/
 ├── models/matting/<id>/        # 模型权重（本地数据）
 ├── runtime/                    # AI 运行时数据（gitignore）
-│   ├── uv/
-│   ├── envs/<id>/.venv/
-│   └── runtime_settings.json
+│   ├── uv/                     # 便携 uv.exe（可一键安装或手动放置）
+│   ├── envs/<id>/.venv/        # 每模型隔离环境（Python 严格 3.10–3.12）
+│   └── runtime_settings.json   # python_path / uv_path / pip_index_url / github_proxy
 ├── presets/<preset_id>/        # 用户预设
 ├── resources/                  # 图标、CHANGELOG、截图
 └── PixelFlow.spec              # 打包配置
@@ -188,9 +189,10 @@ runtime/envs/<model_id>/.venv/python.exe
 
 | 组件 | 职责 |
 |------|------|
-| `model_registry.py` | 模型 id、依赖包、worker 脚本、硬件建议 |
+| `model_registry.py` | 模型 id、依赖包、`python_version`、worker 脚本、硬件建议 |
 | `model_manager.py` | 权重路径、下载、就绪判断、设备偏好 |
-| `env_manager.py` | 系统 Python、uv、每模型 venv 创建/校验 |
+| `env_manager.py` | 系统 Python、uv、Git、PATH 刷新、每模型 venv 创建/校验、PyTorch CUDA/CPU 安装 |
+| `gpu_catalog.py` | 主流 NVIDIA 系列 ↔ 优选/备选 `cuXXX` 标签与驱动门槛 |
 | `inference.py` | `remove_background` / batch / 常驻会话 |
 | `ben2_worker.py` | BEN2：子进程内 load + infer / infer_batch |
 | `rmbg2_worker.py` | RMBG 2.0（BiRefNet/transformers）：同上协议 |
@@ -201,10 +203,41 @@ runtime/envs/<model_id>/.venv/python.exe
 
 | id | 名称 | 来源 | worker | 备注 |
 |----|------|------|--------|------|
-| `ben2` | BEN2 | ModelScope `PramaLLC/BEN2` | `ben2_worker.py` | 支持边缘精炼 |
+| `ben2` | BEN2 | ModelScope `PramaLLC/BEN2` | `ben2_worker.py` | 支持边缘精炼；代码包 git+https fork |
 | `rmbg2` | RMBG 2.0 | ModelScope `briaai/RMBG-2.0` | `rmbg2_worker.py` | 无 refine；非商用 CC BY-NC |
 
-**配置准备顺序：** 开发环境（Python + uv）→ 创建模型环境 → 下载权重 → 透明图勾选 AI 抠图。
+**配置准备顺序：** 开发环境（uv 必需；本机 Python 3.10–3.12 可选）→ 创建模型环境 → 下载权重 → 透明图勾选 AI 抠图。
+
+### 5.2.1 模型 venv 与 Python 版本（重要）
+
+| 约定 | 说明 |
+|------|------|
+| 目标版本 | 注册表 `python_version`，默认 **3.12**；允许范围 **仅 3.10–3.12** |
+| 创建方式 | 优先 `uv venv --python 3.12`（uv 可**托管下载** CPython）；本机已有精确 3.12 时可用其路径 |
+| 禁止 | 不得用本机 **3.13 / 3.14** 作 base：当前 PyTorch 官方 wheel 无 `cp313`/`cp314`，会报 ABI 不匹配 |
+| 历史环境 | 已有 venv 若版本越界，「创建/修复」会**自动删建**，不必只靠强制重建 |
+| `resolve_base_python` | **不再**放宽到 `>3.12`（曾导致有 CUDA 却误退 CPU） |
+
+**PyTorch 安装策略（`ensure_model_env`）：**
+
+1. `nvidia-smi` 探测 GPU → `gpu_catalog.match_gpu` 得优选/备选 `cuXXX`。  
+2. 按候选标签从 PyTorch 官方索引安装 CUDA 版；失败再试下一标签。  
+3. 全部 CUDA 失败 → 回退 CPU 版；日志区分 **ABI/网络/架构** 与「GPU 未匹配」（勿混为一谈）。  
+4. 安装后 `probe_torch_build`：校验 import、cuda 构建、以及 wheel 是否含本机 compute capability（如 sm_120）。
+
+### 5.2.2 开发工具检测与 PATH 同步
+
+用户在 **PixelFlow 运行期间** 安装 Git / 手动放置 uv 时，安装器只更新注册表 PATH，进程内仍是启动时的旧 PATH。因此：
+
+| API | 作用 |
+|-----|------|
+| `refresh_process_path()` | 从 Windows 注册表合并最新用户/系统 PATH 到 `os.environ` |
+| `ensure_exe_dir_on_path(exe)` | 将已找到的 git/uv 目录前置进 PATH，供后续 `uv pip` / 子进程 `which` |
+| `resolve_uv(force=True)` / `resolve_git(force=True)` | 刷新 PATH + 清空 probe 缓存后重探 |
+| `invalidate_caches(uv=…, git=…)` | 同时清实例缓存与模块级 `_uv_probe_cache` / `_git_probe_cache` |
+
+**UI：** 开发环境提供「重新检测 uv」「重新检测 Git」「重新检测 Python」；手动安装后**一般无需重启应用**。  
+**创建/修复环境前：** 强制 `resolve_uv(force=True)`、`resolve_git(force=True)`，与开发环境页状态同源，避免「页面显示已就绪、创建时却报未安装」。
 
 ### 5.3 常驻 Worker 协议
 
@@ -274,11 +307,20 @@ python <model>_worker.py --serve --device auto --weights-dir ...
 
 ### 5.5 透明图后处理算法
 
-**裁剪透明边缘 `trim_transparent`**
+**裁剪透明边缘 `trim_transparent`（`core/image_processor.py`）**
 
 - 不用单纯 `alpha.getbbox()`（边缘断裂半透明噪点会撑满 bbox）。  
-- 行列投影取最长连续主体 → 收紧精确 bbox；短空隙可桥接。  
-- 依赖主环境 `numpy`。
+- **常规策略（多物品安全）：** 对 `alpha > alpha_threshold` 的行列投影桥接主体内部细缝，收集所有「显著连续段」取**并集**，再在并集范围内收紧精确 bbox。  
+  - 显著段：长度 ≥ max(3px, 最长段 × 12%)，滤掉四角短噪点。  
+  - 短空隙桥接：约 0.15% 边长，限制在 1–8px。  
+- **边界低 Alpha 底噪处理：** AI mask 缩放后，Alpha 1~几十的残留可能沿整条图像边界铺开，使常规投影仍覆盖整图。满足以下条件时，改用 `alpha > max(alpha_threshold, 64)` 的可信掩码定位：  
+  1. 用户阈值掩码已触碰图像边界；  
+  2. 边界上没有 Alpha 大于可信阈值的像素（说明是低透明底噪，而不是真实物体贴边）；  
+  3. 图内存在可信内容。  
+- 可信掩码仍经过「所有显著段并集」，因此双物品/多物品都会保留；得到范围后向四周外扩一个 `bridge`，保留少量抗锯齿半透明边缘。最终仍用用户阈值掩码在候选范围内收紧。  
+- 若边界存在可信 Alpha 内容，视为真实贴边物体，继续使用常规策略，不启用底噪过滤。  
+- **历史坑：** 曾只取「最长连续投影段」。双物品中间有透明缝时会只保留一侧主体（另一侧被裁掉）。多 SKU / 对放产品图必须用并集，禁止再改回 longest-only。  
+- 用户阈值 `alpha_threshold` 始终生效；依赖主环境 `numpy`。
 
 **画布布局 `place_subject_on_canvas`（智能对象式）**
 
@@ -287,6 +329,20 @@ python <model>_worker.py --serve --device auto --weights-dir ...
 - 主体按占比完整放入安全框并居中；始终可放大（批量标准化）。  
 - 重采样：缩小 scale&lt;0.5 用 BOX，&lt;1 LANCZOS，放大 BICUBIC；细节恢复不锐化 Alpha。  
 - 物理限制：画布/显示小于源时放大查看仍丢细节；源分辨率不足无法凭空变清。
+
+**画布颜色 `_ColorBlock` / `hex_to_rgba`（易踩坑）**
+
+| 约定 | 说明 |
+|------|------|
+| 存储格式 | `#RRGGBB` 或不透明省略 Alpha；半透明/透明为 `#RRGGBBAA`（与 PIL 一致） |
+| 默认值 | 不透明白 `#FFFFFF`（`default_options` / 面板初始） |
+| Qt StyleSheet | 8 位 hex 按 **`#AARRGGBB`** 解析，色块显示须经 `rgba_to_css_hex`，禁止直接把存储串塞进 `background:` |
+| 取色对话框 | `QColorDialog` + `ShowAlphaChannel` + **`DontUseNativeDialog`**（规避部分 Windows 原生框 Alpha 异常） |
+| 全透明再选色 | 当前 Alpha=0 时，对话框**初始 Alpha 提到 255**，避免用户只点色板得到 `#FFFFFF00`（透明白，看起来像没生效） |
+| 透底需求 | 取色框把 Alpha 拉到 0，或点自定义快捷「全透明」→ `#00000000` |
+| 旧值兼容 | 曾用 `QColor.name(HexArgb)` 写入 `#AARRGGBB`；`hex_to_rgba` 对「末字节=FF 且引导字节&lt;FF」的 8 位串按 ARGB 解（如 `#00FFFFFF`） |
+
+相关 API：`hex_to_rgba` / `rgba_to_hex` / `rgba_to_css_hex`（`image_processor.py`）；UI 在 `transparent_processor._ColorBlock`。
 
 ### 5.6 后台日志中的 AI 信息
 
@@ -335,17 +391,39 @@ python <model>_worker.py --serve --device auto --weights-dir ...
 `MainWindow.open_settings(row)` 支持从透明图链接跳转：  
 `pixelflow://settings/dev` / `pixelflow://settings/matting`。
 
+**开发环境门禁（进入抠图模型配置页）：**
+
+| 条件 | 是否可进入模型配置 |
+|------|-------------------|
+| 已检测到 **uv** | 是（可无本机 3.10–3.12；创建 venv 时由 uv 托管下载 Python） |
+| 无 uv | 否；引导安装 uv 或本机 Python 3.10–3.12 |
+| Git | **不**作为门禁；仅在创建含 `git+https` 的模型环境时校验 |
+
+**开发环境 · uv：**
+
+- 一键安装到 `runtime/uv/`（Windows：GitHub releases zip；优先走 GitHub 代理）。  
+- **重新检测 uv**：`refresh_process_path` + 清缓存后重探；支持用户手动把 `uv.exe` 放到 `runtime/uv/` 后立即生效。  
+- 探测顺序：已保存路径 → `runtime/uv/uv.exe` → PATH / `where`。
+
 **开发环境 · 依赖镜像：**  
 `runtime/runtime_settings.json` 字段 `pip_index_url`（默认清华 `https://pypi.tuna.tsinghua.edu.cn/simple`）。  
-`RuntimeManager.ensure_model_env` 执行 `uv pip install` 时附加 `-i <url>`，**不**修改用户全局 pip/uv 配置。  
-留空则不附加 `-i`。
+`RuntimeManager.ensure_model_env` 对**非 torch** 包执行 `uv pip install -i <url>`；CUDA 版 torch 走官方 `https://download.pytorch.org/whl/cuXXX` 索引，**不**与普通 PyPI 混用（避免装成 `+cpu`）。  
+**不**修改用户全局 pip/uv 配置。留空则非 torch 包不附加 `-i`。
 
-**开发环境 · Git / GitHub 代理：**  
-- 检测本机 Git 客户端（PATH + Windows 常见安装路径）；BEN2 等 `git+https` 依赖创建环境前会校验。  
+**开发环境 · Git / GitHub 代理：**
+
+- 检测：刷新后的 PATH + `where git` + Windows 常见安装路径（`Program Files\Git\cmd` 等）。  
+- **重新检测 Git**：刷新注册表 PATH 并注入 git 目录；装完 Git **一般无需重启** PixelFlow。  
+- BEN2 等 `git+https`：创建环境前 `resolve_git(force=True)`；失败提示引导「重新检测」而非笼统要求重启。  
 - `runtime_settings.json` 字段 `github_proxy`（默认 `https://ghfast.top/`，留空=直连）。  
-- 安装时将 `git+https://github.com/...` 改写为代理前缀形式，并通过临时 `GIT_CONFIG_*` insteadOf 注入子进程，**不**改用户全局 gitconfig。  
+- 安装时改写 `git+https://github.com/...` 为代理前缀，并通过临时 `GIT_CONFIG_*` insteadOf 注入子进程，**不**改用户全局 gitconfig；同时把当前（已刷新的）`PATH` 并入该子进程 env。  
 - 下载 uv（GitHub releases）时同样优先走该代理。  
 - git+https 包不受 PyPI 镜像影响，需 Git +（可选）GitHub 代理。
+
+**开发环境 · 其它：**
+
+- **VC++ 2015–2022 x64**：Windows 上 torch 原生扩展依赖；过旧/损坏常见 `WinError 1114` / `c10.dll`。提供检测与下载入口；修复后通常需**重启电脑**（与 Git/uv 的「无需重启应用」不同）。  
+- **GPU 匹配 / AI 帮装**：按 `gpu_catalog` 展示系列与 CUDA 标签建议；可生成可复制的帮装说明（通用流程 + 本机快照附录）。
 
 **BEN2 安装源：** 代码包 `git+https://github.com/yincangshiwei/BEN2.git`（fork）；权重仍 ModelScope `PramaLLC/BEN2`。
 
@@ -380,11 +458,12 @@ python <model>_worker.py --serve --device auto --weights-dir ...
 
 新增抠图模型时：
 
-1. 在 `model_registry.py` 注册：`id`、依赖、`worker_script`、权重文件名、硬件建议。  
-2. 实现 `core/matting/workers/<name>_worker.py`（支持 `--serve` + JSON 更佳）。  
-3. 配置页可创建环境、下载权重。  
-4. 透明图模型下拉自动来自 `list_models()`。  
-5. 若支持 batch，在 worker 实现 `infer_batch` 并在 ready 中上报 `recommend_batch`。
+1. 在 `model_registry.py` 注册：`id`、依赖、`python_version`（建议 `"3.12"`，勿超 3.12）、`worker_script`、权重文件名、硬件建议。  
+2. `env_packages` 中的 `torch`/`torchvision` 由 `RuntimeManager` 按 GPU 选 CUDA/CPU 索引安装，勿写死 `+cuXXX` 到普通 PyPI 规格。  
+3. 若依赖 `git+https`，创建环境会要求本机 Git；注册表注明即可。  
+4. 实现 `core/matting/workers/<name>_worker.py`（支持 `--serve` + JSON 更佳）。  
+5. 配置页可创建环境、下载权重；透明图模型下拉自动来自 `list_models()`。  
+6. 若支持 batch，在 worker 实现 `infer_batch` 并在 ready 中上报 `recommend_batch`。
 
 ---
 
@@ -402,6 +481,12 @@ python <model>_worker.py --serve --device auto --weights-dir ...
 | `place_subject_on_canvas(...)` | `image_processor.py` | 智能对象式布局 |
 | `detect_true_format(path)` | `metadata_utils.py` | 真实格式 |
 | `resolve_file_out_dir(...)` | `worker.py` | 输出子目录 |
+| `get_runtime_manager()` | `env_manager.py` | 运行时单例 |
+| `RuntimeManager.ensure_model_env(...)` | `env_manager.py` | 创建/修复隔离 venv + 装依赖 |
+| `RuntimeManager.resolve_uv/git(force=)` | `env_manager.py` | 探测 uv / Git（force 刷新 PATH） |
+| `refresh_process_path()` | `env_manager.py` | 注册表 PATH → 当前进程 |
+| `ensure_exe_dir_on_path(exe)` | `env_manager.py` | 可执行目录注入 PATH |
+| `plan_torch_install()` / `match_gpu(...)` | `env_manager` / `gpu_catalog` | CUDA/CPU 安装方案 |
 
 ---
 

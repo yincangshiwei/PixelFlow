@@ -545,7 +545,9 @@ def build_ai_setup_prompt(
     a("### 步骤 A — 复核环境（请先做）")
     a("1. 确认工作目录为项目根（见附录）。")
     a("2. 检查：`uv --version`；没有则安装 uv，或使用附录中的 uv 路径。")
-    a("3. 检查：可用于创建 venv 的 Python 3.10–3.12 **64-bit**。")
+    a("3. 检查 Python：**必须** 3.10–3.12 **64-bit**（推荐精确 " + py_ver + "）。")
+    a("   - **禁止** 用 3.13/3.14 建环境：当前 PyTorch 官方 wheel 无 cp313/cp314，会报 ABI 不匹配并误退 CPU。")
+    a("   - 本机没有 3.10–3.12 时，优先：`uv venv --python " + py_ver + "`（让 uv 托管下载）。")
     a("4. Windows：关注 VC++ 是否正常（见上）。")
     a("5. GPU：运行 `nvidia-smi`（及可选 `--query-gpu=name,driver_version,compute_cap --format=csv`）。")
     a("6. 对照附录快照：若一致可沿用；若不一致或 GPU 为清单未覆盖的新系列，按第 3 节重新决策。")
@@ -554,17 +556,18 @@ def build_ai_setup_prompt(
     a("### 步骤 B — 准备虚拟环境")
     a(f"- 模型 ID: `{model_id}`（显示名: {model_name}）")
     a(f"- 环境目录: 附录中的 env_dir / venv_dir")
-    a(f"- 目标 Python: {py_ver}（64-bit）")
+    a(f"- 目标 Python: {py_ver}（64-bit，严格 ≤3.12）")
     if force_recreate:
         a("- 用户选择了倾向「重建」：若旧 venv 存在且依赖混乱，可删除 `.venv` 后重建；")
         a("  若仅需换 torch 构建，也可只 uninstall/reinstall torch，不必强删全环境。")
     else:
         a("- 以修复/升级为主：尽量保留环境，重装缺失或错误的包。")
-    a("- 创建示例（路径以附录为准，uv/python 以你找到的为准）：")
+    a("- 创建示例（**优先版本号**，路径以附录为准）：")
     a("```")
-    a(f"\"{uv_bin}\" venv --python \"{base_py}\" \"<venv_dir>\"")
-    a("# 或: uv venv --python " + py_ver + " \"<venv_dir>\"")
+    a(f"\"{uv_bin}\" venv --python {py_ver} \"<venv_dir>\"")
+    a(f"# 本机已有精确 {py_ver} 时也可: \"{uv_bin}\" venv --python \"{base_py}\" \"<venv_dir>\"")
     a("```")
+    a("- 创建后务必确认：`\"<venv_python>\" -c \"import sys; print(sys.version)\"` 为 3.10–3.12。")
     a("- 之后所有 pip 都通过：`uv pip install --python \"<venv_python>\" ...`")
     a("")
     a("### 步骤 C — 安装 PyTorch")
@@ -1105,6 +1108,79 @@ def format_env_failure_hint(
     )
 
 
+def refresh_process_path() -> str:
+    """
+    将系统/用户 PATH（Windows 注册表）合并回当前进程 os.environ['PATH']。
+
+    用户在 PixelFlow 运行期间安装 Git / Python / uv 后，安装器会更新注册表 PATH，
+    但本进程仍持有启动时的旧 PATH，导致 shutil.which 与子进程找不到新装工具。
+    重新检测 / 创建环境前调用本函数，无需重启应用。
+    """
+    current = os.environ.get("PATH", "") or ""
+    blocks: list[str] = []
+    if sys.platform == "win32":
+        try:
+            import winreg
+            for root, subkey in (
+                (
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+                ),
+                (winreg.HKEY_CURRENT_USER, r"Environment"),
+            ):
+                try:
+                    with winreg.OpenKey(root, subkey) as key:
+                        val, _ = winreg.QueryValueEx(key, "Path")
+                        if val:
+                            blocks.append(str(val))
+                except OSError:
+                    pass
+        except Exception:
+            pass
+    # 注册表在前（含新装路径），当前进程 PATH 在后（保留运行期注入）
+    blocks.append(current)
+    merged: list[str] = []
+    seen: set[str] = set()
+    for block in blocks:
+        for part in str(block).split(os.pathsep):
+            p = part.strip().strip('"')
+            if not p:
+                continue
+            key = p.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(p)
+    new_path = os.pathsep.join(merged)
+    os.environ["PATH"] = new_path
+    return new_path
+
+
+def ensure_exe_dir_on_path(exe: str | Path | None) -> str:
+    """
+    将可执行文件所在目录前置到进程 PATH。
+    用于经固定路径找到 git/uv 后，让后续 shutil.which / uv 子进程也能解析到同名命令。
+    """
+    if not exe:
+        return os.environ.get("PATH", "") or ""
+    try:
+        d = str(Path(exe).resolve().parent)
+    except Exception:
+        try:
+            d = str(Path(str(exe)).parent)
+        except Exception:
+            return os.environ.get("PATH", "") or ""
+    if not d or not Path(d).is_dir():
+        return os.environ.get("PATH", "") or ""
+    cur = os.environ.get("PATH", "") or ""
+    parts = [p for p in cur.split(os.pathsep) if p.strip()]
+    if any(p.lower() == d.lower() for p in parts):
+        return cur
+    new_path = d + os.pathsep + cur
+    os.environ["PATH"] = new_path
+    return new_path
+
+
 def _run(
     args: list[str],
     *,
@@ -1117,6 +1193,7 @@ def _run(
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     full_env = os.environ.copy()
     if env:
+        # 调用方 env 覆盖同名键；但 PATH 若调用方未提供，保留已刷新的进程 PATH
         full_env.update(env)
     # 避免 uv/python 输出被系统代码页/颜色码搞乱
     full_env.setdefault("PYTHONUTF8", "1")
@@ -1422,21 +1499,44 @@ def _probe_git(exe: str | Path, *, use_cache: bool = True) -> GitInfo | None:
 
 
 def detect_git(*, force: bool = False) -> GitInfo:
-    """检测 PATH 上的 git 客户端。"""
+    """
+    检测本机 git 客户端。
+    force=True 时先刷新进程 PATH（拾取刚安装的 Git），并跳过 probe 缓存。
+    找到后会把 git 目录注入 PATH，供后续 uv/git 子进程使用。
+    """
     global _git_cache
     if not force and _git_cache is not None:
         return _git_cache
+
+    if force:
+        refresh_process_path()
+        _git_probe_cache.clear()
 
     candidates: list[str] = []
     which = shutil.which("git")
     if which:
         candidates.append(which)
+    # Windows 上 where.exe 有时比 shutil.which 更能反映刷新后的 PATH
+    if sys.platform == "win32":
+        try:
+            r = _run(
+                ["where.exe", "git"],
+                timeout=5,
+            )
+            if r.returncode == 0:
+                for line in (r.stdout or "").splitlines():
+                    p = line.strip().strip('"')
+                    if p and p.lower().endswith("git.exe") and p not in candidates:
+                        candidates.append(p)
+        except Exception:
+            pass
 
     if sys.platform == "win32":
         pf = os.environ.get("ProgramFiles", r"C:\Program Files")
         pf86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
         local = os.environ.get("LOCALAPPDATA", "")
-        for base in (pf, pf86, local):
+        user = os.environ.get("USERPROFILE", "")
+        for base in (pf, pf86, local, user):
             if not base:
                 continue
             for rel in (
@@ -1444,14 +1544,35 @@ def detect_git(*, force: bool = False) -> GitInfo:
                 r"Git\bin\git.exe",
                 r"Programs\Git\cmd\git.exe",
                 r"Programs\Git\bin\git.exe",
+                r"AppData\Local\Programs\Git\cmd\git.exe",
+                r"AppData\Local\Programs\Git\bin\git.exe",
             ):
                 p = str(Path(base) / rel)
                 if p not in candidates:
                     candidates.append(p)
 
     for c in candidates:
+        try:
+            cp = Path(c)
+            # 绝对路径且文件不存在则跳过；命令名（git）仍交给 _probe_git
+            if cp.is_absolute() and not cp.is_file():
+                continue
+        except Exception:
+            pass
         info = _probe_git(c, use_cache=not force)
         if info and info.found:
+            # 注入 PATH，保证 uv pip install git+https 能找到 git 命令
+            ensure_exe_dir_on_path(info.path)
+            try:
+                parent = Path(info.path).resolve().parent
+                for sib in (
+                    parent.parent / "bin" / "git.exe",
+                    parent.parent / "cmd" / "git.exe",
+                ):
+                    if sib.is_file():
+                        ensure_exe_dir_on_path(sib)
+            except Exception:
+                pass
             _git_cache = info
             return info
 
@@ -1579,12 +1700,19 @@ class RuntimeManager:
         return github_proxy_env(self.get_github_proxy())
 
     def resolve_git(self, *, force: bool = False) -> GitInfo:
-        """检测本机 Git（带实例缓存）。"""
+        """
+        检测本机 Git（带实例缓存）。
+        force=True：刷新系统 PATH + 清空缓存后重探，供「重新检测」与创建环境使用。
+        """
         global _git_cache
         if force:
             self._git_cache = None
             _git_cache = None
+            _git_probe_cache.clear()
         if self._git_cache is not None and not force:
+            # 缓存命中时仍确保 git 目录在 PATH（供后续子进程）
+            if self._git_cache.found and self._git_cache.path:
+                ensure_exe_dir_on_path(self._git_cache.path)
             return self._git_cache
         info = detect_git(force=force)
         self._git_cache = info
@@ -1601,11 +1729,13 @@ class RuntimeManager:
         all_: bool = False,
     ):
         """清除探测缓存。env=True 清全部模型；env='ben2' 清指定模型。"""
-        global _vc_redist_cache, _git_cache, _git_probe_cache
+        global _vc_redist_cache, _git_cache, _git_probe_cache, _uv_probe_cache, _python_probe_cache
         if all_ or pythons:
             self._py_list_cache = None
+            _python_probe_cache.clear()
         if all_ or uv:
             self._uv_cache = None
+            _uv_probe_cache.clear()
         if all_ or git:
             self._git_cache = None
             _git_cache = None
@@ -1776,11 +1906,8 @@ class RuntimeManager:
         for info in self.discover_pythons():
             if self._version_ok(info, min_ver, max_ver):
                 return info
-        # 放宽：只要 >= min
-        for info in self.discover_pythons():
-            if (info.major, info.minor) >= min_ver and info.is_64bit:
-                info.note = "版本高于推荐上限，部分包可能无预编译轮子"
-                return info
+        # 不再放宽到 3.13+：PyTorch 等 AI 轮子常无对应 ABI（如 cp314），
+        # 会导致 CUDA 安装失败后被误判为「GPU 不匹配」。更高版本由 uv 托管下载目标小版本。
         return None
 
     @staticmethod
@@ -1796,31 +1923,62 @@ class RuntimeManager:
 
     # ── uv 发现 / 安装 ──
     def resolve_uv(self, *, force: bool = False) -> UvInfo:
+        """
+        解析 uv 可执行文件。
+        force=True：刷新 PATH、清空 probe 缓存后重探（手动安装/拷贝后无需重启）。
+        """
+        if force:
+            self._uv_cache = None
+            _uv_probe_cache.clear()
+            refresh_process_path()
         if not force and self._uv_cache is not None:
+            if self._uv_cache.found and self._uv_cache.path:
+                ensure_exe_dir_on_path(self._uv_cache.path)
             return self._uv_cache
 
         saved = self.get_saved_uv_path()
         if saved:
-            info = _probe_uv(saved)
+            info = _probe_uv(saved, use_cache=not force)
             if info:
                 info.source = "saved"
+                ensure_exe_dir_on_path(info.path)
                 self._uv_cache = info
                 return info
 
         bundled = self.bundled_uv_path()
-        info = _probe_uv(bundled)
+        info = _probe_uv(bundled, use_cache=not force)
         if info:
             info.source = "bundled"
+            ensure_exe_dir_on_path(info.path)
             self._uv_cache = info
             return info
 
         which = shutil.which("uv")
         if which:
-            info = _probe_uv(which)
+            info = _probe_uv(which, use_cache=not force)
             if info:
                 info.source = "path"
+                ensure_exe_dir_on_path(info.path)
                 self._uv_cache = info
                 return info
+
+        # Windows：where + 常见用户目录兜底
+        if sys.platform == "win32":
+            try:
+                r = _run(["where.exe", "uv"], timeout=5)
+                if r.returncode == 0:
+                    for line in (r.stdout or "").splitlines():
+                        p = line.strip().strip('"')
+                        if not p:
+                            continue
+                        info = _probe_uv(p, use_cache=not force)
+                        if info:
+                            info.source = "path"
+                            ensure_exe_dir_on_path(info.path)
+                            self._uv_cache = info
+                            return info
+            except Exception:
+                pass
 
         info = UvInfo(found=False, source="not_found")
         self._uv_cache = info
@@ -2320,7 +2478,14 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
         if r.returncode != 0:
             err = _strip_ansi((r.stderr or r.stdout or "")[-2000:])
             if progress:
-                progress(model_id, 40, f"PyTorch 安装失败: {err[:180]}")
+                abi_hint = ""
+                err_l = err.lower()
+                if "abi tag" in err_l or "cp31" in err_l or "no wheels with a matching python" in err_l:
+                    abi_hint = (
+                        "（当前 venv 的 Python ABI 无对应 torch 轮子，"
+                        "请使用 Python 3.10–3.12 重建环境）"
+                    )
+                progress(model_id, 40, f"PyTorch 安装失败{abi_hint}: {err[:180]}")
             return False
 
         # 校验是否真的装上、CUDA 构建是否符合预期
@@ -2452,7 +2617,8 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
         if progress:
             progress(
                 model_id, 42,
-                "所有 CUDA 标签均未匹配本机 GPU 或安装失败，回退 CPU 版…",
+                "CUDA 版 PyTorch 安装失败（标签轮询均未成功，"
+                "常见原因：Python 版本过新无 wheel / 网络 / 架构不匹配），回退 CPU 版…",
             )
         cpu_plan = TorchInstallPlan(
             flavor="cpu",
@@ -2548,13 +2714,19 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
 
         self._last_torch_plan = None
         try:
+            # 创建环境前刷新 PATH：用户可能刚装 Git/uv 且只点了「重新检测」
+            refresh_process_path()
+
             if progress:
                 progress(model_id, 2, "检查 uv…")
-            uv = self.resolve_uv()
+            # force：拾取手动拷贝到 runtime/uv 或 PATH 新装的 uv，并清 probe 缓存
+            uv = self.resolve_uv(force=True)
             if not uv.found:
                 if progress:
                     progress(model_id, 5, "未找到 uv，开始自动安装…")
                 uv = self.install_uv(progress=progress)
+            if uv.found and uv.path:
+                ensure_exe_dir_on_path(uv.path)
 
             # git+https 依赖（如 BEN2）需要本机 git
             if need_git:
@@ -2564,74 +2736,167 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
                 if not git.found:
                     raise RuntimeError(
                         "未检测到 Git 客户端。\n"
-                        "BEN2 等模型需通过 git+https 拉取代码包，请先安装 Git 并确保 "
-                        "git 在 PATH 中可用。\n"
-                        f"下载: {GIT_DOWNLOAD_URL}\n"
-                        "安装后请重启 PixelFlow，再到「开发环境」重新检测。"
+                        "BEN2 等模型需通过 git+https 拉取代码包，请先安装 Git。\n"
+                        "安装后无需重启：到「开发环境」点「重新检测 Git」，"
+                        "确认状态为已就绪后再创建环境。\n"
+                        f"下载: {GIT_DOWNLOAD_URL}"
                     )
+                # 再次确保 git 在 PATH（uv 子进程继承）
+                if git.path:
+                    ensure_exe_dir_on_path(git.path)
+                # 安装 git 依赖时把当前 PATH 并入代理 env，避免 only insteadOf 丢 PATH
+                if git_env is not None:
+                    git_env = {
+                        **git_env,
+                        "PATH": os.environ.get("PATH", ""),
+                    }
                 gh_proxy = self.get_github_proxy()
                 if progress:
+                    git_label = git.version or git.path or "ok"
                     if gh_proxy:
                         progress(
                             model_id, 9,
-                            f"Git 已就绪 · GitHub 代理: {gh_proxy}",
+                            f"Git 已就绪（{git_label}）· GitHub 代理: {gh_proxy}",
                         )
                     else:
                         progress(
                             model_id, 9,
-                            "Git 已就绪 · 直连 GitHub（可在开发环境配置代理）",
+                            f"Git 已就绪（{git_label}）· 直连 GitHub（可在开发环境配置代理）",
                         )
 
+            # 目标小版本（注册表如 3.12）；严格限制在 3.10–3.12，避免 cp313/cp314 无 torch wheel
+            target_py = (python_version or "3.12").strip() or "3.12"
+            parts = target_py.split(".")
+            try:
+                target_major = int(parts[0])
+                target_minor = int(parts[1]) if len(parts) > 1 else 12
+            except ValueError:
+                target_major, target_minor = 3, 12
+                target_py = "3.12"
+            if (target_major, target_minor) < (3, 10) or (target_major, target_minor) > (3, 12):
+                if progress:
+                    progress(
+                        model_id, 12,
+                        f"目标 Python {target_py} 超出支持范围，改用 3.12",
+                    )
+                target_py = "3.12"
+                target_major, target_minor = 3, 12
+
             if progress:
-                progress(model_id, 12, "解析基础 Python…")
-            parts = python_version.split(".")
-            min_v = (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
-            base = self.resolve_base_python(min_ver=min_v, max_ver=(min_v[0], min_v[1]))
+                progress(model_id, 12, f"解析基础 Python（目标 {target_py}）…")
+            # 仅接受目标小版本；找不到本机解释器时仍可用 uv 按版本号托管下载
+            base = self.resolve_base_python(
+                min_ver=(target_major, target_minor),
+                max_ver=(target_major, target_minor),
+            )
             if base is None:
+                # 同主版本内可接受的兜底：3.10–3.12 中任意已安装版本（仍不接受 3.13+）
                 base = self.resolve_base_python(
                     min_ver=(3, 10),
                     max_ver=(3, 12),
                 )
-            if base is None:
-                raise RuntimeError(
-                    "未找到可用的 Python 3.10–3.12（64 位）。\n"
-                    "请先安装 Python：https://www.python.org/downloads/\n"
-                    "安装时勾选 “Add python.exe to PATH”，然后在「开发环境」中重新检测。"
-                )
-            if not self.get_saved_python_path():
+            if base is not None and not self.get_saved_python_path():
                 self.set_python_path(base.path)
 
             env_dir = self.model_env_dir(model_id)
             venv_dir = self.model_venv_dir(model_id)
             env_dir.mkdir(parents=True, exist_ok=True)
 
-            if force_recreate and venv_dir.exists():
+            need_recreate = bool(force_recreate)
+            if venv_dir.exists() and not need_recreate:
+                # 已有环境若 Python 不在 3.10–3.12，自动重建（修复历史误用 3.14 的环境）
+                existing_py = self.model_python(model_id)
+                if existing_py is not None:
+                    ex_info = _probe_python(existing_py, use_cache=False)
+                    if (
+                        ex_info is None
+                        or not ex_info.executable_ok
+                        or (ex_info.major, ex_info.minor) < (3, 10)
+                        or (ex_info.major, ex_info.minor) > (3, 12)
+                    ):
+                        ver = ex_info.version if ex_info else "?"
+                        if progress:
+                            progress(
+                                model_id, 14,
+                                f"已有 venv Python={ver} 不在 3.10–3.12，将自动重建为 {target_py}…",
+                            )
+                        need_recreate = True
+                else:
+                    need_recreate = True
+
+            if need_recreate and venv_dir.exists():
                 if progress:
                     progress(model_id, 15, "删除旧环境…")
                 shutil.rmtree(venv_dir, ignore_errors=True)
 
             if not self.model_python(model_id):
-                if progress:
-                    progress(model_id, 20, f"创建虚拟环境 ({base.version})…")
-                r = _run(
-                    [uv.path, "venv", "--python", base.path, str(venv_dir)],
-                    timeout=180,
-                    cwd=env_dir,
-                )
-                if r.returncode != 0:
+                # 优先按版本号创建：uv 可自动下载托管 CPython，避免误用本机 3.13/3.14
+                # 本机已有精确匹配时再用其路径（更快、离线友好）
+                create_attempts: list[tuple[str, str]] = []
+                if base is not None and (base.major, base.minor) == (target_major, target_minor):
+                    create_attempts.append((base.path, f"本机 {base.version}"))
+                create_attempts.append((target_py, f"uv 托管 {target_py}"))
+                if base is not None and (base.major, base.minor) != (target_major, target_minor):
+                    # 仅当目标版本托管失败时，才退到本机 3.10–3.12 其它小版本
+                    create_attempts.append(
+                        (base.path, f"本机兜底 {base.version}")
+                    )
+
+                last_err = ""
+                created = False
+                for py_spec, label in create_attempts:
+                    if progress:
+                        progress(model_id, 20, f"创建虚拟环境（{label}）…")
+                    # 托管下载可能较慢
+                    timeout = 300 if py_spec == target_py else 180
                     r = _run(
-                        [uv.path, "venv", "--python", python_version, str(venv_dir)],
-                        timeout=300,
+                        [uv.path, "venv", "--python", py_spec, str(venv_dir)],
+                        timeout=timeout,
                         cwd=env_dir,
                     )
-                if r.returncode != 0:
+                    if r.returncode == 0 and self.model_python(model_id):
+                        created = True
+                        break
+                    last_err = _strip_ansi(r.stderr or r.stdout or "")
+                    # 失败残留目录清理后再试下一种
+                    if venv_dir.exists():
+                        shutil.rmtree(venv_dir, ignore_errors=True)
+
+                if not created:
+                    hint = (
+                        f"无法创建 Python {target_py} 虚拟环境。\n"
+                        "请确认：\n"
+                        "1. 已安装 uv，且网络可访问 Python 构建源（uv 可自动下载）；或\n"
+                        "2. 本机已安装 64 位 Python 3.10–3.12，并在「开发环境」中选中。\n"
+                        "https://www.python.org/downloads/\n"
+                        "勿使用 3.13/3.14：当前 PyTorch 官方轮子无对应 ABI，会导致 CUDA 安装失败。"
+                    )
                     raise RuntimeError(
-                        f"创建 venv 失败:\n{_strip_ansi(r.stderr or r.stdout)}"
+                        f"创建 venv 失败:\n{last_err}\n\n{hint}"
                     )
 
             py = self.model_python(model_id)
             if py is None:
                 raise RuntimeError("venv 创建后未找到 python 可执行文件")
+
+            # 校验 venv 实际 Python 版本（双重保险）
+            venv_info = _probe_python(py, use_cache=False)
+            if venv_info is None or not venv_info.executable_ok:
+                raise RuntimeError(f"无法探测 venv Python: {py}")
+            if (venv_info.major, venv_info.minor) > (3, 12) or (
+                venv_info.major, venv_info.minor
+            ) < (3, 10):
+                raise RuntimeError(
+                    f"模型环境 Python 为 {venv_info.version}，不在支持范围 3.10–3.12。\n"
+                    f"PyTorch 等依赖需要匹配的 ABI（如 cp312），"
+                    f"请使用「强制重建」指定 Python {target_py}。\n"
+                    f"环境目录: {venv_dir}"
+                )
+            if progress:
+                progress(
+                    model_id, 22,
+                    f"venv Python: {venv_info.version}  ·  {py}",
+                )
 
             # Windows：创建前检测 VC++（torch 强依赖）；不阻断安装，但提前提示
             if sys.platform == "win32":
@@ -2876,7 +3141,13 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
 
         lines.append("— uv —")
         uv = self.resolve_uv()
-        lines.append(uv.display)
+        lines.append(uv.display if uv.found else "✗ 未检测到 uv")
+        if not uv.found:
+            lines.append(f"  目标目录: {self.bundled_uv_path().parent}")
+            lines.append(
+                "  可点「安装 / 修复 uv」，或手动放置 uv.exe 后点「重新检测 uv」"
+                "（刷新 PATH，无需重启）。"
+            )
         lines.append("")
 
         lines.append("— 系统 Python（可用于创建隔离环境）—")
@@ -2933,7 +3204,10 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
         else:
             lines.append("✗ 未检测到 Git 客户端")
             lines.append(f"  下载安装: {GIT_DOWNLOAD_URL}")
-            lines.append("  安装时勾选加入 PATH，完成后重启 PixelFlow 再检测。")
+            lines.append(
+                "  安装时建议勾选加入 PATH；装完后点「重新检测 Git」即可"
+                "（会刷新系统 PATH，一般无需重启软件）。"
+            )
         gh = self.get_github_proxy()
         if gh:
             lines.append(f"GitHub 代理: {gh}")

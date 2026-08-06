@@ -256,8 +256,9 @@ def trim_transparent(img: Image.Image, alpha_threshold: int = 0):
     不只做简单的 alpha.getbbox()：AI 抠图后边缘常残留与主体不相连的半透明噪点，
     会把包围盒撑满整张图，导致某一侧已贴边、另一侧仍有大片空白却裁不掉。
 
-    策略：对行列投影收集「所有显著连续内容段」取并集（多物品中间透明缝不会互裁），
-    再在并集范围内求精确 bbox，从而忽略四角/对边的断裂短噪点。
+    策略：对行列投影收集「所有显著连续内容段」取并集（多物品中间透明缝不会互裁）。
+    若低 Alpha 残留沿图像边界形成长带，则改用较可信的 Alpha 像素定位所有主体，
+    并保留少量抗锯齿余量；避免整圈底噪被误当作物品。
     """
     img = img.convert("RGBA")
     alpha = np.asarray(img.getchannel("A"))
@@ -271,13 +272,31 @@ def trim_transparent(img: Image.Image, alpha_threshold: int = 0):
     # 短空隙桥接：约 0.15% 边长，最少 1px、最多 8px，避免主体 antialias 细缝拆段
     bridge = max(1, min(8, int(round(min(w, h) * 0.0015))))
 
-    col_run = _significant_run_span(content.any(axis=0), bridge_gap=bridge)
-    row_run = _significant_run_span(content.any(axis=1), bridge_gap=bridge)
+    projection_content = content
+    preserve_margin = 0
+    border_alpha = np.concatenate((alpha[0, :], alpha[-1, :], alpha[1:-1, 0], alpha[1:-1, -1]))
+    touches_border = bool((border_alpha > thr).any())
+    confidence_thr = max(thr, 64)
+    trusted_content = alpha > confidence_thr
+    # AI 遮罩缩放后可能让 Alpha 1~几十的底噪铺到整条边。只有边界没有可信内容时
+    # 才启用可信掩码，避免影响本来就应贴边的实体；可信掩码仍保留所有显著段。
+    if touches_border and not bool((border_alpha > confidence_thr).any()) and trusted_content.any():
+        projection_content = trusted_content
+        preserve_margin = bridge
+
+    col_run = _significant_run_span(projection_content.any(axis=0), bridge_gap=bridge)
+    row_run = _significant_run_span(projection_content.any(axis=1), bridge_gap=bridge)
     if col_run is None or row_run is None:
         raise ValueError("图片内容为空：整张图都是透明的")
 
     left, right = col_run
     top, bottom = row_run
+    if preserve_margin:
+        left = max(0, left - preserve_margin)
+        right = min(w - 1, right + preserve_margin)
+        top = max(0, top - preserve_margin)
+        bottom = min(h - 1, bottom + preserve_margin)
+
     # 在主体投影带内再收紧到真实像素（去掉投影带内局部全透明边）
     sub = content[top : bottom + 1, left : right + 1]
     ys, xs = np.where(sub)

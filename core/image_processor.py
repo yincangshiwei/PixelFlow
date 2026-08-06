@@ -12,10 +12,13 @@ import numpy as np
 def hex_to_rgba(color):
     """
     支持:
-    - '#FFFFFF'
-    - '#FFFFFFFF'
-    - (255,255,255)
-    - (255,255,255,255)
+    - '#FFFFFF' / '#RRGGBB'
+    - '#RRGGBBAA'（CSS / 本项目存储约定）
+    - '#AARRGGBB'（兼容旧版 Qt HexArgb 误存）
+    - (255,255,255) / (255,255,255,255)
+
+    8 位色值优先按 RRGGBBAA 解析；若 Alpha 为 0 且 RGB 非全 0，
+    同时按 AARRGGBB 解释更合理时（典型：#00FFFFFF 实为透明白），自动兼容。
     """
     if isinstance(color, tuple):
         if len(color) == 3:
@@ -26,20 +29,57 @@ def hex_to_rgba(color):
             raise ValueError("颜色元组必须是 RGB 或 RGBA")
 
     if isinstance(color, str):
-        color = color.strip().lstrip('#')
-        if len(color) == 6:
-            r = int(color[0:2], 16)
-            g = int(color[2:4], 16)
-            b = int(color[4:6], 16)
+        raw = color.strip().lstrip('#')
+        if len(raw) == 6:
+            r = int(raw[0:2], 16)
+            g = int(raw[2:4], 16)
+            b = int(raw[4:6], 16)
             return (r, g, b, 255)
-        elif len(color) == 8:
-            r = int(color[0:2], 16)
-            g = int(color[2:4], 16)
-            b = int(color[4:6], 16)
-            a = int(color[6:8], 16)
+        elif len(raw) == 8:
+            # 主约定：#RRGGBBAA（与 rgba_to_hex / CSS 相反的 Qt HexArgb 区分开）
+            r = int(raw[0:2], 16)
+            g = int(raw[2:4], 16)
+            b = int(raw[4:6], 16)
+            a = int(raw[6:8], 16)
+            # 兼容旧版颜色选择器写入的 Qt HexArgb（#AARRGGBB）：
+            # 旧逻辑仅在 alpha<255 时写 8 位，故引导字节 AA<0xFF；
+            # 若按 RRGGBBAA 解得 a==0xFF 且引导字节 <0xFF，则实为 ARGB。
+            # 典型残值：选白 + 原生框 Alpha=0 → #00FFFFFF
+            aa = int(raw[0:2], 16)
+            rr = int(raw[2:4], 16)
+            gg = int(raw[4:6], 16)
+            bb = int(raw[6:8], 16)
+            if a == 255 and aa < 255:
+                return (rr, gg, bb, aa)
             return (r, g, b, a)
+        elif len(raw) == 4:
+            # #RGBA 短写
+            r = int(raw[0] * 2, 16)
+            g = int(raw[1] * 2, 16)
+            b = int(raw[2] * 2, 16)
+            a = int(raw[3] * 2, 16)
+            return (r, g, b, a)
+        elif len(raw) == 3:
+            r = int(raw[0] * 2, 16)
+            g = int(raw[1] * 2, 16)
+            b = int(raw[2] * 2, 16)
+            return (r, g, b, 255)
 
     raise ValueError("不支持的颜色格式")
+
+
+def rgba_to_hex(color) -> str:
+    """RGBA 元组或已有色值 → 统一存储串：不透明 #RRGGBB，否则 #RRGGBBAA。"""
+    r, g, b, a = hex_to_rgba(color)
+    if a >= 255:
+        return f"#{r:02X}{g:02X}{b:02X}"
+    return f"#{r:02X}{g:02X}{b:02X}{a:02X}"
+
+
+def rgba_to_css_hex(color) -> str:
+    """供 Qt StyleSheet 使用的 #AARRGGBB（Qt 对 8 位 hex 按 ARGB 解析）。"""
+    r, g, b, a = hex_to_rgba(color)
+    return f"#{a:02X}{r:02X}{g:02X}{b:02X}"
 
 
 @dataclass
@@ -134,47 +174,79 @@ def compress_to_target_size(img: Image.Image, target_kb: int, format_name: str, 
 
     return img, best_quality, best_size // 1024
 
-def _longest_true_run(flags: np.ndarray, bridge_gap: int = 0) -> tuple[int, int] | None:
-    """
-    在一维 bool 数组中找最长的连续 True 区间（含端点）。
-    bridge_gap > 0 时，长度不超过该值的 False 空隙会被桥接（避免主体内部细缝被拆开）。
-    """
+def _bridge_short_gaps(flags: np.ndarray, bridge_gap: int) -> np.ndarray:
+    """桥接夹在两段 True 之间、长度不超过 bridge_gap 的 False 空隙。"""
+    if bridge_gap <= 0:
+        return flags
+    flags = flags.copy()
     n = int(flags.size)
-    if n == 0:
-        return None
+    i = 0
+    while i < n:
+        if flags[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not flags[j]:
+            j += 1
+        gap = j - i
+        if gap <= bridge_gap and i > 0 and j < n and flags[i - 1] and flags[j]:
+            flags[i:j] = True
+        i = j
+    return flags
 
-    # 可选：桥接短空隙
-    if bridge_gap > 0:
-        flags = flags.copy()
-        i = 0
-        while i < n:
-            if flags[i]:
-                i += 1
-                continue
-            j = i
-            while j < n and not flags[j]:
-                j += 1
-            gap = j - i
-            # 仅桥接夹在两段 True 之间的短空隙
-            if gap <= bridge_gap and i > 0 and j < n and flags[i - 1] and flags[j]:
-                flags[i:j] = True
-            i = j
 
-    best: tuple[int, int] | None = None
+def _iter_true_runs(flags: np.ndarray) -> list[tuple[int, int]]:
+    """返回一维 bool 数组中所有连续 True 区间 [start, end]（含端点）。"""
+    runs: list[tuple[int, int]] = []
+    n = int(flags.size)
     start: int | None = None
     for i, v in enumerate(flags.tolist()):
         if v and start is None:
             start = i
         elif not v and start is not None:
-            end = i - 1
-            if best is None or (end - start) > (best[1] - best[0]):
-                best = (start, end)
+            runs.append((start, i - 1))
             start = None
     if start is not None:
-        end = n - 1
-        if best is None or (end - start) > (best[1] - best[0]):
-            best = (start, end)
-    return best
+        runs.append((start, n - 1))
+    return runs
+
+
+def _significant_run_span(
+    flags: np.ndarray,
+    bridge_gap: int = 0,
+    *,
+    min_ratio: float = 0.12,
+    min_abs: int = 3,
+) -> tuple[int, int] | None:
+    """
+    在一维投影上求「所有显著内容段」的并集区间。
+
+    旧逻辑只保留最长连续段，双物品/多物品中间有透明缝时会裁掉其余物品。
+    现改为：桥接主体内部细缝后，保留长度达到最长段一定比例（或绝对下限）
+    的所有段，再取并集；边缘断裂半透明噪点通常很短，会被滤掉。
+    """
+    n = int(flags.size)
+    if n == 0 or not bool(flags.any()):
+        return None
+
+    bridged = _bridge_short_gaps(flags, bridge_gap)
+    runs = _iter_true_runs(bridged)
+    if not runs:
+        return None
+
+    lengths = [end - start + 1 for start, end in runs]
+    longest = max(lengths)
+    # 相对最长段过短的视为噪点；绝对下限避免极小图把有效短段滤光
+    thr = max(int(min_abs), int(round(longest * float(min_ratio))))
+    kept = [run for run, L in zip(runs, lengths) if L >= thr]
+    if not kept:
+        # 回退：至少保留最长段
+        idx = int(np.argmax(np.asarray(lengths)))
+        kept = [runs[idx]]
+
+    left = min(s for s, _ in kept)
+    right = max(e for _, e in kept)
+    return left, right
 
 
 def trim_transparent(img: Image.Image, alpha_threshold: int = 0):
@@ -183,8 +255,9 @@ def trim_transparent(img: Image.Image, alpha_threshold: int = 0):
 
     不只做简单的 alpha.getbbox()：AI 抠图后边缘常残留与主体不相连的半透明噪点，
     会把包围盒撑满整张图，导致某一侧已贴边、另一侧仍有大片空白却裁不掉。
-    这里按行列投影取「最长连续不透明主体」，再在该主体范围内求精确 bbox，
-    从而忽略四角/对边的断裂噪点（横图、竖图同样适用）。
+
+    策略：对行列投影收集「所有显著连续内容段」取并集（多物品中间透明缝不会互裁），
+    再在并集范围内求精确 bbox，从而忽略四角/对边的断裂短噪点。
     """
     img = img.convert("RGBA")
     alpha = np.asarray(img.getchannel("A"))
@@ -198,8 +271,8 @@ def trim_transparent(img: Image.Image, alpha_threshold: int = 0):
     # 短空隙桥接：约 0.15% 边长，最少 1px、最多 8px，避免主体 antialias 细缝拆段
     bridge = max(1, min(8, int(round(min(w, h) * 0.0015))))
 
-    col_run = _longest_true_run(content.any(axis=0), bridge_gap=bridge)
-    row_run = _longest_true_run(content.any(axis=1), bridge_gap=bridge)
+    col_run = _significant_run_span(content.any(axis=0), bridge_gap=bridge)
+    row_run = _significant_run_span(content.any(axis=1), bridge_gap=bridge)
     if col_run is None or row_run is None:
         raise ValueError("图片内容为空：整张图都是透明的")
 

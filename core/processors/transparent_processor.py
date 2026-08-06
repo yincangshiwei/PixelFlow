@@ -10,7 +10,13 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
 
 from core.base_processor import BaseProcessor, register_processor
-from core.image_processor import trim_transparent, place_subject_on_canvas
+from core.image_processor import (
+    trim_transparent,
+    place_subject_on_canvas,
+    hex_to_rgba,
+    rgba_to_hex,
+    rgba_to_css_hex,
+)
 from core.matting.model_registry import list_models, get_model_info
 from core.matting.model_manager import get_matting_manager
 from core.matting.inference import (
@@ -24,36 +30,68 @@ import config
 
 
 class _ColorBlock(QWidget):
-    """颜色选择：色块 + 色值标签"""
+    """
+    颜色选择：色块 + 色值标签。
+
+    存储约定统一为 #RRGGBB / #RRGGBBAA（与 PIL hex_to_rgba 一致）。
+    注意：Qt 的 QColor.name(HexArgb) 是 #AARRGGBB，StyleSheet 也按 ARGB 解析 8 位 hex，
+    二者与存储串不同；部分机器原生取色框对 Alpha 支持异常，故强制非原生对话框。
+    """
+
     def __init__(self, color="#FFFFFF", parent=None):
         super().__init__(parent)
-        self._color = color
+        self._color = rgba_to_hex(color)
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
         self._btn = QPushButton()
         self._btn.setFixedSize(36, 26)
         self._btn.setCursor(Qt.PointingHandCursor)
+        self._btn.setToolTip("点击选择画布颜色（支持透明）")
         self._btn.clicked.connect(self._pick)
         lay.addWidget(self._btn)
-        self._lbl = QLabel(color)
+        self._lbl = QLabel(self._color)
         self._lbl.setStyleSheet("color:#b0b8c8;font-size:12px;background:transparent;")
         lay.addWidget(self._lbl)
         self._refresh()
 
+    @staticmethod
+    def _to_qcolor(color_str: str) -> QColor:
+        r, g, b, a = hex_to_rgba(color_str)
+        return QColor(r, g, b, a)
+
     def _pick(self):
-        c = QColorDialog.getColor(QColor(self._color), self, "选择画布颜色",
-                                  QColorDialog.ShowAlphaChannel)
-        if c.isValid():
-            self._color = c.name(QColor.HexArgb) if c.alpha() < 255 else c.name()
-            self._refresh()
+        # DontUseNativeDialog：避免部分 Windows/驱动下原生取色框
+        # Alpha 滑条失效、选色后 alpha 被置 0（界面显示成 #00RRGGBB）等问题
+        dlg = QColorDialog(self._to_qcolor(self._color), self)
+        dlg.setWindowTitle("选择画布颜色")
+        dlg.setOption(QColorDialog.ShowAlphaChannel, True)
+        dlg.setOption(QColorDialog.DontUseNativeDialog, True)
+        if dlg.exec() != QColorDialog.Accepted:
+            return
+        c = dlg.currentColor()
+        if not c.isValid():
+            return
+        self._color = rgba_to_hex((c.red(), c.green(), c.blue(), c.alpha()))
+        self._refresh()
 
     def _refresh(self):
+        # StyleSheet 的 8 位 hex 按 #AARRGGBB，必须转换后再写入
+        css = rgba_to_css_hex(self._color)
         self._btn.setStyleSheet(
-            f"QPushButton{{background:{self._color};border:2px solid #5a5a6a;border-radius:6px;min-width:36px;min-height:24px;}}"
+            f"QPushButton{{background:{css};border:2px solid #5a5a6a;border-radius:6px;"
+            f"min-width:36px;min-height:24px;}}"
             f"QPushButton:hover{{border-color:#5b8af5;}}"
         )
         self._lbl.setText(self._color.upper())
+
+    def set_color(self, color: str):
+        """外部写入色值（预设加载等），自动规范化。"""
+        try:
+            self._color = rgba_to_hex(color)
+        except Exception:
+            self._color = "#FFFFFF"
+        self._refresh()
 
     def get_color(self) -> str:
         return self._color
@@ -136,7 +174,7 @@ class TransparentImageProcessor(BaseProcessor):
         self.spin_alpha.setValue(0)
         self.spin_alpha.setToolTip(
             "大于此值视为有效内容（0=仅裁完全透明像素）。\n"
-            "会按主体连续区域裁剪，自动忽略与主体不相连的边缘半透明噪点。"
+            "会保留图中所有显著内容（含多物品），并自动忽略四角断裂的短半透明噪点。"
         )
         t_lay.addWidget(self.spin_alpha)
         t_lay.addStretch()
@@ -169,6 +207,7 @@ class TransparentImageProcessor(BaseProcessor):
         self.spin_ch.setSuffix(" px")
         canvas_row.addWidget(self.spin_ch)
         canvas_row.addWidget(QLabel("背景:"))
+        # 默认透明底（#00000000）；不透明白底请选手动选 #FFFFFF
         self.color_btn = _ColorBlock("#00000000")
         canvas_row.addWidget(self.color_btn)
         canvas_row.addStretch()
@@ -484,8 +523,7 @@ class TransparentImageProcessor(BaseProcessor):
         else:
             self.combo_detail.setCurrentIndex(0)
         color = options.get("canvas_color", "#00000000")
-        self.color_btn._color = color
-        self.color_btn._refresh()
+        self.color_btn.set_color(color)
         fmt = options.get("output_format", "png")
         fmt_idx = ["png", "webp", "jpg"].index(fmt) if fmt in ["png", "webp", "jpg"] else 0
         self.combo_fmt.setCurrentIndex(fmt_idx)

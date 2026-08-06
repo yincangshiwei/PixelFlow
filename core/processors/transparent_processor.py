@@ -62,11 +62,19 @@ class _ColorBlock(QWidget):
 
     def _pick(self):
         # DontUseNativeDialog：避免部分 Windows/驱动下原生取色框
-        # Alpha 滑条失效、选色后 alpha 被置 0（界面显示成 #00RRGGBB）等问题
-        dlg = QColorDialog(self._to_qcolor(self._color), self)
+        # Alpha 滑条失效、选色后 alpha 被置 0 等问题
+        r, g, b, a = hex_to_rgba(self._color)
+        # 当前是全透明时，对话框初始 Alpha 提到不透明，否则用户只点色板
+        # 会得到 #RRGGBB00（透明色），看起来像“选白没用”
+        init = QColor(r, g, b, 255 if a <= 0 else a)
+        dlg = QColorDialog(init, self)
         dlg.setWindowTitle("选择画布颜色")
         dlg.setOption(QColorDialog.ShowAlphaChannel, True)
         dlg.setOption(QColorDialog.DontUseNativeDialog, True)
+        # 预设：不透明白 / 不透明黑 / 全透明（画布透底）
+        dlg.setCustomColor(0, QColor(255, 255, 255, 255).rgba())
+        dlg.setCustomColor(1, QColor(0, 0, 0, 255).rgba())
+        dlg.setCustomColor(2, QColor(0, 0, 0, 0).rgba())
         if dlg.exec() != QColorDialog.Accepted:
             return
         c = dlg.currentColor()
@@ -76,13 +84,23 @@ class _ColorBlock(QWidget):
         self._refresh()
 
     def _refresh(self):
-        # StyleSheet 的 8 位 hex 按 #AARRGGBB，必须转换后再写入
-        css = rgba_to_css_hex(self._color)
+        # StyleSheet 的 8 位 hex 按 #AARRGGBB；全透明时加棋盘提示更易辨认
+        r, g, b, a = hex_to_rgba(self._color)
+        if a <= 0:
+            # 透明：浅灰斜纹示意，避免看起来像纯黑坏掉
+            bg_css = (
+                "background-color: #3a3a4a;"
+                "background-image: repeating-linear-gradient("
+                "45deg, #2a2a3a 0, #2a2a3a 4px, #4a4a5a 4px, #4a4a5a 8px);"
+            )
+        else:
+            bg_css = f"background-color: {rgba_to_css_hex(self._color)};"
         self._btn.setStyleSheet(
-            f"QPushButton{{background:{css};border:2px solid #5a5a6a;border-radius:6px;"
+            f"QPushButton{{{bg_css}border:2px solid #5a5a6a;border-radius:6px;"
             f"min-width:36px;min-height:24px;}}"
             f"QPushButton:hover{{border-color:#5b8af5;}}"
         )
+        # 标签：不透明只显示 #RRGGBB；透明显示完整 #RRGGBBAA
         self._lbl.setText(self._color.upper())
 
     def set_color(self, color: str):
@@ -207,8 +225,8 @@ class TransparentImageProcessor(BaseProcessor):
         self.spin_ch.setSuffix(" px")
         canvas_row.addWidget(self.spin_ch)
         canvas_row.addWidget(QLabel("背景:"))
-        # 默认透明底（#00000000）；不透明白底请选手动选 #FFFFFF
-        self.color_btn = _ColorBlock("#00000000")
+        # 默认不透明白底；需要透底时在取色框把 Alpha 拉到 0 或点自定义「全透明」
+        self.color_btn = _ColorBlock("#FFFFFF")
         canvas_row.addWidget(self.color_btn)
         canvas_row.addStretch()
         layout_lay.addLayout(canvas_row)
@@ -472,7 +490,7 @@ class TransparentImageProcessor(BaseProcessor):
             "enable_layout": False,
             "canvas_w": 1500,
             "canvas_h": 1500,
-            "canvas_color": "#00000000",
+            "canvas_color": "#FFFFFF",
             "subject_percent": 80,
             "detail_restore": "normal",
             "output_format": "png",
@@ -522,7 +540,7 @@ class TransparentImageProcessor(BaseProcessor):
                 break
         else:
             self.combo_detail.setCurrentIndex(0)
-        color = options.get("canvas_color", "#00000000")
+        color = options.get("canvas_color", "#FFFFFF")
         self.color_btn.set_color(color)
         fmt = options.get("output_format", "png")
         fmt_idx = ["png", "webp", "jpg"].index(fmt) if fmt in ["png", "webp", "jpg"] else 0
@@ -570,7 +588,7 @@ class TransparentImageProcessor(BaseProcessor):
                 asset,
                 (int(options["canvas_w"]), int(options["canvas_h"])),
                 subject_percent=int(options.get("subject_percent", 80)),
-                canvas_color=options.get("canvas_color", "#00000000"),
+                canvas_color=options.get("canvas_color", "#FFFFFF"),
                 detail_restore=str(options.get("detail_restore", "normal") or "normal"),
             )
             details.update(layout_info)

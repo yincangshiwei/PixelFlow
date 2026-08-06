@@ -459,7 +459,7 @@ def place_subject_on_canvas(
     canvas_size: tuple[int, int],
     *,
     subject_percent: int = 80,
-    canvas_color: str = "#00000000",
+    canvas_color: str = "#FFFFFF",
     detail_restore: str = "normal",
 ) -> tuple[Image.Image, dict]:
     """

@@ -2,25 +2,35 @@
 PixelFlow 主窗口
 四大区域：① 图片列表  ② 功能菜单+参数  ③ 输出设置  ④ 处理日志
 """
+import base64
+import hashlib
+import html as html_lib
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import unquote, urljoin, urlparse
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QPushButton, QLineEdit, QComboBox, QCheckBox,
     QFileDialog, QListWidget, QListWidgetItem, QProgressBar,
     QSplitter, QTextEdit, QTextBrowser, QAbstractItemView, QMessageBox,
     QStackedWidget, QSizePolicy, QRadioButton, QButtonGroup,
     QInputDialog, QMenu, QScrollArea, QWidgetAction
 )
-from PySide6.QtCore import Qt, QSize, QThread, Signal
+from PySide6.QtCore import Qt, QSize, QThread, Signal, QUrl, QTimer
 from PySide6.QtGui import (
     QPixmap, QIcon, QDragEnterEvent, QDropEvent, QImage,
-    QPainter, QLinearGradient, QColor, QPaintEvent
+    QPainter, QLinearGradient, QColor, QPaintEvent, QKeySequence, QShortcut,
+    QCursor
 )
 
 from config import APP_TITLE, APP_NAME, APP_VERSION, RESOURCES_DIR, APP_COPYRIGHT, APP_COPYRIGHT_URL
@@ -46,13 +56,22 @@ from core.batch_session import (
 )
 from ui.settings_panel import SettingsPanel
 
-# 图片格式
+# 图片格式（进入处理列表）
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif', '.gif'}
-# 文档格式
+# 文档容器：导入时只抽取内嵌图片，文档本身不进入列表
 DOC_EXTS = {'.docx', '.pdf'}
-# 全部支持的格式（用于拖放判断）
-VALID_EXTS = IMAGE_EXTS | DOC_EXTS
+# HTML 容器：同上
+HTML_EXTS = {'.html', '.htm', '.xhtml'}
+# 所有「抽图容器」扩展名
+EXTRACT_EXTS = HTML_EXTS | DOC_EXTS
+# 可直接加入列表的格式（仅图片）
+VALID_EXTS = IMAGE_EXTS
+# 导入/拖放可接受的文件（图片 + 抽图容器）
+IMPORT_EXTS = IMAGE_EXTS | EXTRACT_EXTS
 THUMB_SIZE = QSize(48, 48)
+_IMAGE_PATH_EXTS = tuple(sorted(IMAGE_EXTS | {'.svg', '.ico', '.avif', '.jfif'}))
+# 从容器抽出时过滤过小的装饰图（字节）
+_MIN_EXTRACTED_IMAGE_BYTES = 64
 _RES_DIR = str(RESOURCES_DIR).replace("\\", "/")
 # 列表项数据角色：完整路径 / 相对导入根目录的路径（用于保留目录结构）
 ROLE_PATH = Qt.UserRole
@@ -81,6 +100,1055 @@ def _get_desktop_path() -> str:
     return str(Path.home() / "Desktop")
 
 
+def _scan_folder_images(folder: str | Path) -> list[str]:
+    """递归扫描文件夹中的图片文件，按路径排序。"""
+    root = Path(folder)
+    return [
+        str(f) for f in sorted(root.rglob("*"))
+        if f.is_file() and f.suffix.lower() in IMAGE_EXTS
+    ]
+
+
+def _scan_folder_extract_files(folder: str | Path) -> list[Path]:
+    """递归扫描文件夹中的抽图容器（HTML/DOCX/PDF）。"""
+    root = Path(folder)
+    return [
+        f for f in sorted(root.rglob("*"))
+        if f.is_file() and f.suffix.lower() in EXTRACT_EXTS
+    ]
+
+
+def _normalize_local_path(raw: str | Path) -> Path:
+    p = Path(raw)
+    try:
+        return p.resolve()
+    except OSError:
+        return Path(os.path.abspath(str(p)))
+
+
+def _collect_import_groups(local_paths: list[str | Path]) -> list[tuple[list[str], str | None]]:
+    """
+    将本地路径列表整理为可插入列表的图片分组。
+    每个分组为 (files, base_dir)：文件夹以自身为 base_dir，单文件 base_dir=None。
+    抽图容器（HTML/DOCX/PDF）不进入分组。
+    """
+    groups: list[tuple[list[str], str | None]] = []
+    for raw in local_paths:
+        if not raw:
+            continue
+        p = _normalize_local_path(raw)
+        if p.is_file() and p.suffix.lower() in EXTRACT_EXTS:
+            continue
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+            groups.append(([str(p)], None))
+        elif p.is_dir():
+            files = _scan_folder_images(p)
+            if files:
+                groups.append((files, str(p)))
+    return groups
+
+
+def _collect_extract_files(local_paths: list[str | Path]) -> list[Path]:
+    """
+    收集需要抽图的容器文件。
+    - 直接选中的 HTML/DOCX/PDF
+    - 文件夹内递归到的 HTML/DOCX/PDF
+    """
+    result: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(p: Path):
+        if not p.is_file() or p.suffix.lower() not in EXTRACT_EXTS:
+            return
+        key = str(p)
+        if key not in seen:
+            seen.add(key)
+            result.append(p)
+
+    for raw in local_paths:
+        if not raw:
+            continue
+        p = _normalize_local_path(raw)
+        if p.is_file():
+            _add(p)
+        elif p.is_dir():
+            for f in _scan_folder_extract_files(p):
+                _add(f)
+    return result
+
+
+def _urls_to_local_paths(urls) -> list[str]:
+    """从 QUrl 列表提取本地文件/文件夹路径。"""
+    paths: list[str] = []
+    for url in urls:
+        if isinstance(url, QUrl):
+            if not url.isLocalFile():
+                continue
+            local = url.toLocalFile()
+        else:
+            local = str(url)
+        if local:
+            paths.append(local)
+    return paths
+
+
+def _paste_temp_dir() -> Path | None:
+    """粘贴临时目录：%TEMP%/PixelFlow_paste"""
+    paste_dir = Path(tempfile.gettempdir()) / "PixelFlow_paste"
+    try:
+        paste_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return paste_dir
+
+
+def _save_clipboard_image(image) -> str | None:
+    """将剪贴板中的位图保存为临时 PNG，返回路径；失败返回 None。"""
+    if image is None:
+        return None
+    qimg = None
+    if isinstance(image, QImage):
+        qimg = image
+    elif isinstance(image, QPixmap):
+        qimg = image.toImage()
+    else:
+        try:
+            qimg = QImage(image)
+        except Exception:
+            return None
+    if qimg is None or qimg.isNull():
+        return None
+    paste_dir = _paste_temp_dir()
+    if paste_dir is None:
+        return None
+    out = paste_dir / f"paste_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+    if qimg.save(str(out), "PNG"):
+        return str(out.resolve())
+    return None
+
+
+# 图片魔数 → 扩展名
+_IMG_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+    (b"RIFF", ".webp"),  # 需再确认 WEBP
+    (b"BM", ".bmp"),
+)
+
+
+def _guess_image_ext(data: bytes, hint: str = "") -> str:
+    """根据魔数或 URL/MIME 提示猜测图片扩展名。"""
+    if data:
+        for magic, ext in _IMG_MAGIC:
+            if data.startswith(magic):
+                if ext == ".webp":
+                    if len(data) >= 12 and data[8:12] == b"WEBP":
+                        return ".webp"
+                else:
+                    return ext
+        # TIFF
+        if data[:4] in (b"II*\x00", b"MM\x00*"):
+            return ".tif"
+    hint = (hint or "").lower()
+    for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"):
+        if hint.endswith(ext) or ext.strip(".") in hint:
+            return ".jpg" if ext == ".jpeg" else (".tif" if ext == ".tiff" else ext)
+    return ".png"
+
+
+def _unique_paste_path(preferred_name: str = "", ext: str = ".png") -> Path | None:
+    paste_dir = _paste_temp_dir()
+    if paste_dir is None:
+        return None
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    if preferred_name:
+        stem = Path(preferred_name).stem
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stem).strip(" .") or "paste"
+        name = f"{stem}_{stamp}{ext}"
+    else:
+        name = f"paste_{stamp}{ext}"
+    return paste_dir / name
+
+
+def _write_image_bytes(data: bytes, preferred_name: str = "", hint: str = "") -> str | None:
+    """将图片字节写入临时文件，返回绝对路径。同内容复用已有文件。"""
+    if not data or len(data) < 24:
+        return None
+    ext = _guess_image_ext(data, hint)
+    paste_dir = _paste_temp_dir()
+    if paste_dir is None:
+        return None
+    # 内容寻址文件名：同图多次提取只落一份
+    digest = hashlib.sha1(data).hexdigest()[:16]
+    stem = ""
+    if preferred_name:
+        stem = Path(preferred_name).stem
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stem).strip(" .")
+        if stem:
+            stem = stem[:40] + "_"
+    out = paste_dir / f"{stem}{digest}{ext}"
+    try:
+        if out.is_file() and out.stat().st_size == len(data):
+            return str(out.resolve())
+        out.write_bytes(data)
+        return str(out.resolve())
+    except OSError:
+        # 回退时间戳文件名
+        out2 = _unique_paste_path(preferred_name, ext)
+        if out2 is None:
+            return None
+        try:
+            out2.write_bytes(data)
+            return str(out2.resolve())
+        except OSError:
+            return None
+
+
+class _HtmlImageRefParser(HTMLParser):
+    """通用 HTML 图片引用提取：img/srcset/source/meta/background 等。"""
+
+    _SRC_ATTRS = (
+        "src", "data-src", "data-original", "data-url", "data-lazy-src",
+        "data-actualsrc", "data-lazy", "data-image", "data-img",
+        "content",  # og:image 等
+    )
+    _CSS_URL_RE = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)", re.I)
+
+    def __init__(self):
+        # convert_charrefs=False：钉钉 data-clipboard-cangjie 内含 &quot; JSON，
+        # 若自动转义会提前闭合属性，导致解析出截断 URL / 幽灵标签。
+        super().__init__(convert_charrefs=False)
+        self.refs: list[str] = []
+
+    def _push(self, value: str | None):
+        if not value:
+            return
+        v = value.strip()
+        if not v:
+            return
+        # data URI 内含逗号，绝不能按 srcset 拆分
+        if v.lower().startswith("data:"):
+            self.refs.append(v)
+            return
+        # srcset: "a.jpg 1x, b.jpg 2x"
+        if "," in v and re.search(r"\s+\d+(\.\d+)?[wx]\s*(?:,|$)", v, flags=re.I):
+            for part in v.split(","):
+                token = part.strip().split()[0] if part.strip() else ""
+                if token:
+                    self.refs.append(token)
+            return
+        self.refs.append(v)
+
+    def _push_style(self, style: str | None):
+        if not style:
+            return
+        for m in self._CSS_URL_RE.finditer(style):
+            self._push(m.group(2))
+
+    def handle_starttag(self, tag, attrs):
+        t = tag.lower()
+        ad = {((k or "").lower()): v for k, v in attrs if k}
+        if t in ("img", "image", "source", "input", "embed", "object", "use"):
+            for key in self._SRC_ATTRS:
+                if key in ad:
+                    self._push(ad.get(key))
+            if "srcset" in ad:
+                self._push(ad.get("srcset"))
+            if "data-srcset" in ad:
+                self._push(ad.get("data-srcset"))
+            if t == "object":
+                self._push(ad.get("data"))
+            self._push_style(ad.get("style"))
+            return
+        if t == "meta":
+            prop = (ad.get("property") or ad.get("name") or "").lower()
+            if prop in ("og:image", "og:image:url", "twitter:image", "twitter:image:src"):
+                self._push(ad.get("content"))
+            return
+        # 任意标签的 style background-image
+        if "style" in ad:
+            style = ad.get("style") or ""
+            if "url(" in style.lower():
+                self._push_style(style)
+        # 常见背景属性
+        for key in ("background", "background-image", "data-background", "data-bg"):
+            if key in ad:
+                val = ad.get(key) or ""
+                if "url(" in val.lower():
+                    self._push_style(val)
+                else:
+                    self._push(val)
+
+
+def _strip_cf_html_header(raw: str) -> str:
+    """去掉 Windows CF_HTML 头部，只保留 HTML 正文。"""
+    if not raw:
+        return ""
+    # StartHTML / StartFragment 偏移（字节，对 utf-8 源通常等同）
+    m = re.search(r"StartHTML:(\d+)", raw)
+    if m:
+        try:
+            off = int(m.group(1))
+            # 偏移按原始字节计；这里 raw 已是 str，用字符近似（ASCII 头时一致）
+            if 0 <= off < len(raw):
+                return raw[off:]
+        except ValueError:
+            pass
+    # SourceURL 头也要保留解析用，但正文从 <html 开始
+    idx = raw.lower().find("<html")
+    if idx >= 0:
+        return raw[idx:]
+    idx = raw.find("<!--StartFragment")
+    if idx >= 0:
+        return raw[idx:]
+    return raw
+
+
+def _cf_html_source_url(raw: str) -> str:
+    """从 CF_HTML 头读取 SourceURL（作为相对路径/Referer 基准）。"""
+    if not raw:
+        return ""
+    m = re.search(r"SourceURL:([^\r\n]+)", raw)
+    if not m:
+        return ""
+    return (m.group(1) or "").strip()
+
+
+def _looks_like_image_url(url: str) -> bool:
+    """判断 URL/路径是否像图片资源（过滤页面链接）。"""
+    if not url:
+        return False
+    u = url.strip()
+    low = u.lower()
+    if low.startswith("data:image/"):
+        return True
+    if low.startswith("javascript:") or low.startswith("mailto:") or low == "#":
+        return False
+    # 去 query/hash 看扩展名
+    path = urlparse(u).path if "://" in u or u.startswith("//") else u.split("?", 1)[0].split("#", 1)[0]
+    path_l = unquote(path).lower()
+    if any(path_l.endswith(ext) for ext in _IMAGE_PATH_EXTS):
+        return True
+    # 常见图床/对象存储特征
+    markers = (
+        "/img/", "/image/", "/images/", "/static/", "/upload", "/media/",
+        "ossaccesskeyid", "x-oss-", "format=jpg", "format=png", "format=webp",
+        "imageView", "imageMogr", "x-image",
+    )
+    return any(m in low for m in markers)
+
+
+def _normalize_ref_text(ref: str) -> str:
+    """清理单个引用：去引号、反转义实体，不破坏 URL 语义。"""
+    ref = (ref or "").strip().strip('"').strip("'")
+    if not ref:
+        return ""
+    # 仅对实体做反转义（&amp; &quot;），避免整页 unescape 破坏属性边界
+    if "&" in ref:
+        ref = html_lib.unescape(ref)
+    ref = ref.strip().strip('"').strip("'")
+    # 钉钉/HTML 截断残留：末尾孤立 & 或半截参数
+    ref = ref.rstrip("\\").rstrip(".,);]")
+    while ref.endswith("&") or ref.endswith("?"):
+        ref = ref[:-1]
+    return ref.strip()
+
+
+def _image_ref_dedupe_key(ref: str) -> str:
+    """
+    同一资源的去重键。
+    - http(s)：scheme + host + path（忽略签名 query，避免截断/完整 URL 算成两张）
+    - data URI：按解码后内容哈希（同图不同空白仍合并）
+    - 其它：规范化小写字符串
+    """
+    ref = _normalize_ref_text(ref)
+    if not ref:
+        return ""
+    low = ref.lower()
+    if low.startswith("data:image/"):
+        m = re.match(r"data:image/([a-zA-Z0-9.+-]+);base64,(.+)$", ref, flags=re.I | re.S)
+        if m:
+            try:
+                raw = base64.b64decode(re.sub(r"\s+", "", m.group(2)), validate=False)
+                return "data:" + hashlib.sha1(raw).hexdigest()
+            except Exception:
+                return "data:" + hashlib.sha1(ref.encode("utf-8", errors="ignore")).hexdigest()
+        return "data:" + hashlib.sha1(ref.encode("utf-8", errors="ignore")).hexdigest()
+    if low.startswith("//"):
+        ref = "https:" + ref
+        low = ref.lower()
+    if low.startswith(("http://", "https://")):
+        p = urlparse(ref)
+        path = unquote(p.path or "").rstrip("/")
+        return f"{(p.scheme or 'https').lower()}://{(p.netloc or '').lower()}{path.lower()}"
+    if low.startswith("file:"):
+        u = QUrl(ref)
+        if u.isLocalFile():
+            try:
+                return "file:" + str(Path(u.toLocalFile()).resolve()).lower()
+            except OSError:
+                return "file:" + u.toLocalFile().lower()
+    # 相对/本地路径：去 query/hash
+    path_only = unquote(ref.split("?", 1)[0].split("#", 1)[0]).replace("\\", "/")
+    return "path:" + path_only.lower()
+
+
+def _sanitize_html_for_image_extract(html_text: str) -> str:
+    """
+    抽取前清理会干扰解析的内容：
+    - 钉钉 data-clipboard-cangjie 等巨型 JSON 属性（与真实 <img> 重复，且含 &quot;）
+    - script/style 块
+    """
+    if not html_text:
+        return ""
+    body = html_text
+    # 去掉 script / style
+    body = re.sub(r"<script\b[^>]*>[\s\S]*?</script>", " ", body, flags=re.I)
+    body = re.sub(r"<style\b[^>]*>[\s\S]*?</style>", " ", body, flags=re.I)
+    # 去掉易重复/易破坏解析的 JSON 剪贴板属性（钉钉 cangjie 等）
+    body = re.sub(
+        r"""\s+data-clipboard-cangjie\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""",
+        "",
+        body,
+        flags=re.I,
+    )
+    body = re.sub(
+        r"""\s+data-clipboard-[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*')""",
+        "",
+        body,
+        flags=re.I,
+    )
+    return body
+
+
+def _extract_image_refs_from_html(html_text: str) -> list[str]:
+    """
+    通用：从任意 HTML 提取图片引用（自动去重）。
+    支持 http(s)/data URI/相对路径/file://、img/srcset/CSS url()、钉钉等非常规嵌入。
+
+    注意：
+    1) 不要对整段 HTML 先做 html.unescape（会破坏属性边界）
+    2) 解析器 convert_charrefs=False，实体在单条 ref 上再 unescape
+    3) 去掉钉钉 cangjie 等与 <img> 重复的嵌入 JSON，避免同一图抽两次
+    """
+    if not html_text:
+        return []
+    body = _strip_cf_html_header(html_text)
+    body = _sanitize_html_for_image_extract(body)
+
+    # key -> 选用的 ref（同 key 保留更完整/更长的那条）
+    chosen: dict[str, str] = {}
+    order: list[str] = []
+
+    def _add(ref: str):
+        ref = _normalize_ref_text(ref)
+        if not ref:
+            return
+        low = ref.lower()
+        if low.startswith("data:") and not low.startswith("data:image/"):
+            return
+        if low.startswith("data:image/") or low.startswith(("http://", "https://", "file:", "//")):
+            if low.startswith(("http://", "https://", "//")) and not _looks_like_image_url(ref):
+                return
+        elif low.startswith("javascript:") or low.startswith("mailto:") or low.startswith("#"):
+            return
+        else:
+            path_only = ref.split("?", 1)[0].split("#", 1)[0].lower()
+            if path_only.endswith((".css", ".js", ".mjs", ".map", ".html", ".htm", ".xhtml", ".svgz")):
+                if not path_only.endswith(".svg"):
+                    return
+            if not (
+                any(path_only.endswith(ext) for ext in _IMAGE_PATH_EXTS)
+                or "/" in ref
+                or "\\" in ref
+            ):
+                return
+
+        key = _image_ref_dedupe_key(ref)
+        if not key:
+            return
+        prev = chosen.get(key)
+        if prev is None:
+            chosen[key] = ref
+            order.append(key)
+            return
+        # 同资源：优先更长（query 更完整）的 URL；data URI 已按内容哈希合并
+        if len(ref) > len(prev):
+            chosen[key] = ref
+
+    # 1) 优先用正则抓真实标签上的图片属性（对钉钉等最稳，且已去掉 cangjie）
+    for m in re.finditer(
+        r"""<\s*img\b[^>]*?\b(?:src|data-src|data-original|data-url|data-lazy-src)\s*=\s*["']([^"']+)["']""",
+        body,
+        flags=re.I | re.S,
+    ):
+        _add(m.group(1))
+    for m in re.finditer(
+        r"""<\s*(?:source|image|embed|object|input)\b[^>]*?\b(?:src|data|data-src)\s*=\s*["']([^"']+)["']""",
+        body,
+        flags=re.I | re.S,
+    ):
+        _add(m.group(1))
+    for m in re.finditer(
+        r"""<\s*meta\b[^>]*?\b(?:property|name)\s*=\s*["'](?:og:image(?::url)?|twitter:image(?::src)?)["'][^>]*?\bcontent\s*=\s*["']([^"']+)["']""",
+        body,
+        flags=re.I | re.S,
+    ):
+        _add(m.group(1))
+    for m in re.finditer(
+        r"""<\s*meta\b[^>]*?\bcontent\s*=\s*["']([^"']+)["'][^>]*?\b(?:property|name)\s*=\s*["'](?:og:image(?::url)?|twitter:image(?::src)?)["']""",
+        body,
+        flags=re.I | re.S,
+    ):
+        _add(m.group(1))
+    for m in re.finditer(r"""url\(\s*['"]?([^'")\s]+)['"]?\s*\)""", body, flags=re.I):
+        _add(m.group(1))
+    for m in re.finditer(r"(data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+)", body):
+        _add(re.sub(r"\s+", "", m.group(1)))
+    for m in re.finditer(
+        r"""\bsrcset\s*=\s*["']([^"']+)["']""",
+        body,
+        flags=re.I,
+    ):
+        raw_ss = m.group(1)
+        if raw_ss.lower().startswith("data:"):
+            _add(raw_ss)
+        else:
+            for part in raw_ss.split(","):
+                token = part.strip().split()[0] if part.strip() else ""
+                if token:
+                    _add(token)
+
+    # 2) 结构化解析补充（懒加载属性、非常规标签）
+    parser = _HtmlImageRefParser()
+    try:
+        parser.feed(body)
+        parser.close()
+    except Exception:
+        parser.refs = []
+    for s in parser.refs:
+        _add(s)
+
+    # 3) 仍为空时再扫裸 URL（最后手段）
+    if not order:
+        for m in re.finditer(r"""https?://[^\s"'<>\\]+""", body):
+            u = m.group(0).rstrip("\\").rstrip(".,);]")
+            if _looks_like_image_url(_normalize_ref_text(u)):
+                _add(u)
+        for m in re.finditer(r"""//[^\s"'<>\\]+""", body):
+            u = m.group(0).rstrip("\\").rstrip(".,);]")
+            nu = _normalize_ref_text(u)
+            if nu.startswith("//") and _looks_like_image_url("https:" + nu):
+                _add(u)
+
+    return [chosen[k] for k in order]
+
+
+def _decode_data_image_uri(uri: str) -> str | None:
+    """data:image/...;base64,... → 临时文件路径。"""
+    m = re.match(r"data:image/([a-zA-Z0-9.+-]+);base64,(.+)$", uri, flags=re.I | re.S)
+    if not m:
+        return None
+    mime = m.group(1).lower()
+    try:
+        raw = base64.b64decode(m.group(2), validate=False)
+    except Exception:
+        return None
+    hint = f".{mime.split('+')[0]}"
+    return _write_image_bytes(raw, preferred_name="html_data", hint=hint)
+
+
+def _copy_local_image(path: Path) -> str | None:
+    """复制本地图片到粘贴临时目录（避免占用源文件；已是 paste 目录则直接用）。"""
+    if not path.is_file():
+        return None
+    if path.suffix.lower() not in IMAGE_EXTS and path.suffix.lower() not in {'.svg', '.ico', '.avif', '.jfif'}:
+        # 无扩展名时仍尝试按内容识别
+        try:
+            head = path.read_bytes()[:64]
+        except OSError:
+            return None
+        if not any(head.startswith(m[0]) for m in _IMG_MAGIC) and head[:4] not in (b"II*\x00", b"MM\x00*"):
+            return None
+    paste_dir = _paste_temp_dir()
+    if paste_dir is None:
+        return None
+    try:
+        resolved = path.resolve()
+        if paste_dir in resolved.parents or resolved.parent == paste_dir:
+            return str(resolved)
+    except OSError:
+        pass
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    return _write_image_bytes(data, preferred_name=path.name, hint=path.suffix)
+
+
+def _download_image_url(url: str, timeout: float = 25.0, referer: str = "") -> str | None:
+    """下载远程图片到粘贴临时目录（通用 HTML / 钉钉 CDN 等）。"""
+    if not url.lower().startswith(("http://", "https://")):
+        return None
+    parsed = urlparse(url)
+    host = (parsed.netloc or "").lower()
+    # 文件名提示
+    path_name = Path(unquote(parsed.path)).name
+    preferred = path_name if path_name and "." in path_name else "html_net"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    # Referer：优先调用方（页面 SourceURL / HTML 所在站）；否则按主机推断
+    if referer:
+        headers["Referer"] = referer
+    elif "dingtalk.com" in host or "aliyuncs.com" in host or "alidocs" in host:
+        headers["Referer"] = "https://alidocs.dingtalk.com/"
+    elif host:
+        headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}/"
+
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
+        return None
+    if not data:
+        return None
+    # 拒绝明显 HTML 错误页
+    if ctype.startswith("text/html") or data.lstrip()[:15].lower().startswith((b"<!doctype", b"<html")):
+        return None
+    return _write_image_bytes(data, preferred_name=preferred, hint=ctype or preferred)
+
+
+def _resolve_html_ref(
+    ref: str,
+    *,
+    html_base: Path | None = None,
+    page_url: str = "",
+) -> tuple[str, str]:
+    """
+    将引用规范为可 materialize 的形态。
+    返回 (kind, value)：kind in data|http|file|skip
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return "skip", ""
+    low = ref.lower()
+    if low.startswith("data:image/"):
+        return "data", ref
+    if low.startswith("//"):
+        scheme = "https:"
+        if page_url.lower().startswith("http://"):
+            scheme = "http:"
+        return "http", scheme + ref
+    if low.startswith(("http://", "https://")):
+        return "http", ref
+    if low.startswith("file:"):
+        url = QUrl(ref)
+        if url.isLocalFile():
+            return "file", url.toLocalFile()
+        return "skip", ""
+    # Windows 绝对路径
+    if re.match(r"^[a-zA-Z]:[\\/]", ref) or ref.startswith("\\\\"):
+        return "file", ref
+    # 相对路径：优先相对 HTML 文件目录，其次相对 page_url
+    rel_path = unquote(ref.split("?", 1)[0].split("#", 1)[0])
+    if html_base is not None:
+        try:
+            base_dir = html_base if html_base.is_dir() else html_base.parent
+            cand = (base_dir / rel_path).resolve()
+            if cand.is_file():
+                return "file", str(cand)
+        except OSError:
+            pass
+    if page_url:
+        abs_url = urljoin(page_url, ref)
+        al = abs_url.lower()
+        if al.startswith(("http://", "https://")):
+            return "http", abs_url
+        if al.startswith("file:"):
+            u = QUrl(abs_url)
+            if u.isLocalFile():
+                return "file", u.toLocalFile()
+    return "skip", ""
+
+
+def _materialize_image_refs(
+    refs: list[str],
+    *,
+    html_base: Path | None = None,
+    page_url: str = "",
+) -> list[str]:
+    """将 HTML 图片引用落盘：data URI / http(s) / 本地相对或绝对路径（路径+内容去重）。"""
+    paths: list[str] = []
+    seen_out: set[str] = set()
+    seen_ref_keys: set[str] = set()
+    seen_content: set[str] = set()
+    referer = page_url if page_url.lower().startswith(("http://", "https://")) else ""
+
+    for ref in refs:
+        ref_key = _image_ref_dedupe_key(ref)
+        if ref_key and ref_key in seen_ref_keys:
+            continue
+        if ref_key:
+            seen_ref_keys.add(ref_key)
+
+        kind, value = _resolve_html_ref(ref, html_base=html_base, page_url=page_url)
+        p = None
+        if kind == "data":
+            p = _decode_data_image_uri(value)
+        elif kind == "http":
+            # 已通过提取过滤；钉钉等无扩展名签名 URL 仍允许
+            p = _download_image_url(value, referer=referer)
+        elif kind == "file":
+            p = _copy_local_image(Path(value))
+        if not p or p in seen_out:
+            continue
+        # 内容哈希再去重（截断 URL 与完整 URL 下到同一文件时合并）
+        try:
+            digest = hashlib.sha1(Path(p).read_bytes()).hexdigest()
+            if digest in seen_content:
+                continue
+            seen_content.add(digest)
+        except OSError:
+            pass
+        seen_out.add(p)
+        paths.append(p)
+    return paths
+
+
+def _read_html_file_text(path: Path) -> str:
+    """读取本地 HTML 文件文本（尝试常见编码）。"""
+    data = path.read_bytes()
+    for enc in ("utf-8-sig", "utf-8", "gb18030", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _extract_images_from_docx(path: Path) -> list[str]:
+    """
+    从 DOCX 提取内嵌图片到临时目录。
+    DOCX 为 ZIP，图片通常在 word/media/。
+    """
+    import zipfile
+
+    paths: list[str] = []
+    seen_hash: set[str] = set()
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            names = [
+                n for n in zf.namelist()
+                if n.lower().startswith("word/media/") and not n.endswith("/")
+            ]
+            names.sort()
+            for name in names:
+                try:
+                    data = zf.read(name)
+                except Exception:
+                    continue
+                if not data or len(data) < _MIN_EXTRACTED_IMAGE_BYTES:
+                    continue
+                digest = hashlib.sha1(data).hexdigest()
+                if digest in seen_hash:
+                    continue
+                # 仅保留可识别的图片字节
+                ext = _guess_image_ext(data, Path(name).suffix)
+                if not any(data.startswith(m[0]) for m in _IMG_MAGIC) and data[:4] not in (
+                    b"II*\x00", b"MM\x00*",
+                ):
+                    # EMF/WMF 等矢量占位跳过（Pillow/列表预览通常不可用）
+                    low = name.lower()
+                    if low.endswith((".emf", ".wmf", ".emz", ".wmz")):
+                        continue
+                    # 无魔数也尝试写入（少数 jpeg 变体）
+                preferred = f"{path.stem}_{Path(name).name}"
+                out = _write_image_bytes(data, preferred_name=preferred, hint=ext)
+                if out:
+                    seen_hash.add(digest)
+                    paths.append(out)
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return []
+    return paths
+
+
+def _extract_images_from_pdf(path: Path) -> list[str]:
+    """
+    从 PDF 提取内嵌图片（使用已有依赖 pypdf）。
+    仅提取嵌入位图，不做整页渲染。
+    """
+    try:
+        from pypdf import PdfReader
+        from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject
+    except ImportError:
+        return []
+
+    paths: list[str] = []
+    seen_hash: set[str] = set()
+    try:
+        reader = PdfReader(str(path), strict=False)
+    except Exception:
+        return []
+
+    def _walk_xobjects(xobj, page_idx: int, counter: list[int]):
+        if xobj is None:
+            return
+        try:
+            if isinstance(xobj, IndirectObject):
+                xobj = xobj.get_object()
+        except Exception:
+            return
+        if not isinstance(xobj, DictionaryObject):
+            return
+        subtype = xobj.get("/Subtype")
+        if subtype == "/Image":
+            counter[0] += 1
+            try:
+                data = xobj.get_data()
+            except Exception:
+                return
+            if not data or len(data) < _MIN_EXTRACTED_IMAGE_BYTES:
+                return
+            digest = hashlib.sha1(data).hexdigest()
+            if digest in seen_hash:
+                return
+            # 过滤过小的图标（宽或高 < 8）
+            try:
+                w = int(xobj.get("/Width") or 0)
+                h = int(xobj.get("/Height") or 0)
+                if w and h and (w < 8 or h < 8):
+                    return
+            except Exception:
+                pass
+            filt = xobj.get("/Filter")
+            hint = ".bin"
+            # 根据 Filter 猜测扩展名
+            filters = []
+            if isinstance(filt, ArrayObject):
+                filters = [str(f) for f in filt]
+            elif filt is not None:
+                filters = [str(filt)]
+            fl = " ".join(filters).lower()
+            if "dct" in fl or "jpeg" in fl:
+                hint = ".jpg"
+            elif "jpx" in fl:
+                hint = ".jp2"
+            elif "flate" in fl or "lzw" in fl or not filters:
+                # 尝试按魔数；Flate 原始像素常需解码，pypdf get_data 已解流
+                hint = _guess_image_ext(data, ".png")
+            elif "ccitt" in fl:
+                hint = ".tiff"
+            # 仅保留常见可预览格式
+            if not (
+                data.startswith(b"\x89PNG")
+                or data.startswith(b"\xff\xd8\xff")
+                or data.startswith(b"GIF8")
+                or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+                or data.startswith(b"BM")
+                or data[:4] in (b"II*\x00", b"MM\x00*")
+            ):
+                # 原始像素流：用 Pillow 按 ColorSpace/Bits 尝试重建
+                try:
+                    from PIL import Image
+                    import io
+
+                    width = int(xobj.get("/Width") or 0)
+                    height = int(xobj.get("/Height") or 0)
+                    if width < 8 or height < 8:
+                        return
+                    bpc = int(xobj.get("/BitsPerComponent") or 8)
+                    cs = xobj.get("/ColorSpace")
+                    cs_name = str(cs) if cs is not None else "/DeviceRGB"
+                    if isinstance(cs, ArrayObject) and len(cs) > 0:
+                        cs_name = str(cs[0])
+                    mode = None
+                    if "RGB" in cs_name:
+                        mode = "RGB"
+                    elif "Gray" in cs_name or "Grey" in cs_name:
+                        mode = "L"
+                    elif "CMYK" in cs_name:
+                        mode = "CMYK"
+                    if mode is None or bpc != 8:
+                        return
+                    expected = width * height * (1 if mode == "L" else (4 if mode == "CMYK" else 3))
+                    if len(data) < expected:
+                        return
+                    img = Image.frombytes(mode, (width, height), data[:expected])
+                    if mode == "CMYK":
+                        img = img.convert("RGB")
+                    buf = io.BytesIO()
+                    img.save(buf, format="PNG")
+                    data = buf.getvalue()
+                    hint = ".png"
+                except Exception:
+                    return
+            preferred = f"{path.stem}_p{page_idx + 1}_{counter[0]}"
+            out = _write_image_bytes(data, preferred_name=preferred, hint=hint)
+            if out:
+                seen_hash.add(digest)
+                paths.append(out)
+            return
+
+        # Form XObject：继续向下找图片
+        if subtype == "/Form":
+            try:
+                resources = xobj.get("/Resources")
+                if isinstance(resources, IndirectObject):
+                    resources = resources.get_object()
+                if isinstance(resources, DictionaryObject):
+                    inner = resources.get("/XObject")
+                    if isinstance(inner, IndirectObject):
+                        inner = inner.get_object()
+                    if isinstance(inner, DictionaryObject):
+                        for _k, v in inner.items():
+                            _walk_xobjects(v, page_idx, counter)
+            except Exception:
+                return
+
+    for page_idx, page in enumerate(reader.pages):
+        counter = [0]
+        try:
+            resources = page.get("/Resources")
+            if isinstance(resources, IndirectObject):
+                resources = resources.get_object()
+            if not isinstance(resources, DictionaryObject):
+                continue
+            xobjects = resources.get("/XObject")
+            if isinstance(xobjects, IndirectObject):
+                xobjects = xobjects.get_object()
+            if not isinstance(xobjects, DictionaryObject):
+                continue
+            for _name, obj in xobjects.items():
+                _walk_xobjects(obj, page_idx, counter)
+        except Exception:
+            continue
+
+    return paths
+
+
+def _extract_images_from_container(path: Path) -> list[str]:
+    """按扩展名从容器文件提取图片路径列表。"""
+    ext = path.suffix.lower()
+    if ext in HTML_EXTS:
+        try:
+            text = _read_html_file_text(path)
+        except OSError:
+            return []
+        refs = _extract_image_refs_from_html(text)
+        if not refs:
+            return []
+        return _materialize_image_refs(refs, html_base=path.parent, page_url=path.as_uri())
+    if ext == ".docx":
+        return _extract_images_from_docx(path)
+    if ext == ".pdf":
+        return _extract_images_from_pdf(path)
+    return []
+
+
+def _read_windows_html_clipboard() -> str:
+    """
+    读取 Windows CF_HTML（钉钉等可能只放 HTML Format，Qt 有时取不到完整内容）。
+    失败返回空字符串。
+    """
+    if sys.platform != "win32":
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.CloseClipboard.argtypes = []
+        user32.CloseClipboard.restype = wintypes.BOOL
+        user32.EnumClipboardFormats.argtypes = [wintypes.UINT]
+        user32.EnumClipboardFormats.restype = wintypes.UINT
+        user32.GetClipboardFormatNameW.argtypes = [wintypes.UINT, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetClipboardFormatNameW.restype = ctypes.c_int
+        user32.GetClipboardData.argtypes = [wintypes.UINT]
+        user32.GetClipboardData.restype = wintypes.HANDLE
+        kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalSize.restype = ctypes.c_size_t
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
+
+        if not user32.OpenClipboard(None):
+            return ""
+        try:
+            fmt = 0
+            html_fmt = 0
+            while True:
+                fmt = user32.EnumClipboardFormats(fmt)
+                if fmt == 0:
+                    break
+                buf = ctypes.create_unicode_buffer(512)
+                n = user32.GetClipboardFormatNameW(fmt, buf, 512)
+                if n and buf.value == "HTML Format":
+                    html_fmt = fmt
+                    break
+            if not html_fmt:
+                return ""
+            handle = user32.GetClipboardData(html_fmt)
+            if not handle:
+                return ""
+            size = int(kernel32.GlobalSize(handle) or 0)
+            if size <= 0 or size > 20 * 1024 * 1024:
+                return ""
+            ptr = kernel32.GlobalLock(handle)
+            if not ptr:
+                return ""
+            try:
+                data = ctypes.string_at(ptr, size)
+            finally:
+                kernel32.GlobalUnlock(handle)
+        finally:
+            user32.CloseClipboard()
+
+        # CF_HTML 通常为 UTF-8，末尾可能带 \0
+        text = data.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+        return text
+    except Exception:
+        return ""
+
+
+def _clipboard_html_text(mime) -> str:
+    """优先 Qt text/html，否则 Windows CF_HTML 回退。"""
+    html = ""
+    if mime is not None and mime.hasHtml():
+        html = mime.html() or ""
+    if not html and mime is not None:
+        # 部分环境以自定义格式暴露
+        for fmt in ("text/html", "HTML Format", "application/x-qt-windows-mime;value=\"HTML Format\""):
+            if mime.hasFormat(fmt):
+                try:
+                    ba = mime.data(fmt)
+                    raw = bytes(ba)
+                    if raw:
+                        html = raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+                        break
+                except Exception:
+                    pass
+    if not html or ("<img" not in html.lower() and "data:image/" not in html.lower()):
+        win_html = _read_windows_html_clipboard()
+        if win_html and (len(win_html) > len(html or "")):
+            html = win_html
+    return html or ""
+
+
 class _ThumbnailLoader(QThread):
     """后台加载缩略图"""
     loaded = Signal(str, QIcon)  # path, icon
@@ -101,6 +1169,64 @@ class _ThumbnailLoader(QThread):
                 pass
 
 
+class _ContainerImageExtractWorker(QThread):
+    """
+    后台从容器提取图片并落盘。
+    - container_paths: 本地 HTML/DOCX/PDF 路径列表
+    - html_jobs: 剪贴板 HTML 任务 list of (refs, html_base_str|None, page_url)
+    """
+    finished_ok = Signal(list)       # 本地路径列表
+    finished_fail = Signal(str)      # 错误说明
+
+    def __init__(
+        self,
+        container_paths: list[str] | None = None,
+        html_jobs: list[tuple[list[str], str | None, str]] | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._containers = list(container_paths or [])
+        self._html_jobs = list(html_jobs or [])
+
+    def run(self):
+        try:
+            all_paths: list[str] = []
+            seen_path: set[str] = set()
+            seen_content: set[str] = set()
+
+            def _add_path(p: str):
+                if not p or p in seen_path:
+                    return
+                try:
+                    digest = hashlib.sha1(Path(p).read_bytes()).hexdigest()
+                    if digest in seen_content:
+                        return
+                    seen_content.add(digest)
+                except OSError:
+                    pass
+                seen_path.add(p)
+                all_paths.append(p)
+
+            for cp in self._containers:
+                try:
+                    for p in _extract_images_from_container(Path(cp)):
+                        _add_path(p)
+                except Exception:
+                    continue
+
+            for refs, base_s, page_url in self._html_jobs:
+                base = Path(base_s) if base_s else None
+                for p in _materialize_image_refs(refs, html_base=base, page_url=page_url or ""):
+                    _add_path(p)
+
+            if all_paths:
+                self.finished_ok.emit(all_paths)
+            else:
+                self.finished_fail.emit("未能提取到图片（文档无内嵌图、链接失效或格式不支持）")
+        except Exception as e:
+            self.finished_fail.emit(f"提取图片失败：{e}")
+
+
 class GradientBackground(QWidget):
     """绘制深色渐变背景，为毛玻璃效果提供底层氛围"""
     def paintEvent(self, event: QPaintEvent):
@@ -116,38 +1242,36 @@ class GradientBackground(QWidget):
 
 
 class DropListWidget(QListWidget):
-    """支持拖放、缩略图显示的文件列表"""
+    """支持拖放 / 粘贴、缩略图显示的文件列表"""
     def __init__(self, parent=None):
         super().__init__(parent)
+        # DropOnly：接受外部拖入，禁止列表内拖拽重排；NoDragDrop 会关闭 acceptDrops
+        self.setDragDropMode(QAbstractItemView.DropOnly)
         self.setAcceptDrops(True)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.setDragDropMode(QAbstractItemView.NoDragDrop)
         self.setIconSize(THUMB_SIZE)
         self.setSpacing(2)
+        self.setToolTip(
+            "支持拖放或 Ctrl+V 粘贴：图片 / 文件夹；"
+            "HTML / DOCX / PDF 自动提取其中图片"
+        )
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def dragMoveEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def dropEvent(self, event: QDropEvent):
-        urls = event.mimeData().urls()
-        for url in urls:
-            p = Path(url.toLocalFile())
-            paths = []
-            base_dir = None
-            if p.is_file() and p.suffix.lower() in VALID_EXTS:
-                paths.append(str(p))
-            elif p.is_dir():
-                base_dir = str(p)
-                for f in sorted(p.rglob("*")):
-                    if f.is_file() and f.suffix.lower() in VALID_EXTS:
-                        paths.append(str(f))
-            if paths:
-                self.window()._insert_files(paths, base_dir=base_dir)
+        win = self.window()
+        if hasattr(win, "_import_from_urls"):
+            win._import_from_urls(event.mimeData().urls())
         event.acceptProposedAction()
 
     def _is_image(self, path: str) -> bool:
@@ -158,9 +1282,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
+        # 主窗口也接受拖放，便于拖到左栏按钮/预览等区域
+        self.setAcceptDrops(True)
 
         # 按屏幕分辨率自适应：初始 85% 屏幕尺寸，最小不低于 1000×650
-        from PySide6.QtWidgets import QApplication
         screen = QApplication.primaryScreen().availableGeometry()
         init_w = max(1000, int(screen.width() * 0.75))
         init_h = max(650, int(screen.height() * 0.75))
@@ -176,6 +1301,7 @@ class MainWindow(QMainWindow):
 
         self.worker = None
         self._thumb_loader = None
+        self._extract_worker: _ContainerImageExtractWorker | None = None
         # 本批次处理计时（点击「开始处理」起算）
         self._process_t0_mono: float | None = None
         self._process_t0_wall: datetime | None = None
@@ -586,6 +1712,10 @@ class MainWindow(QMainWindow):
         self.btn_add_folder.clicked.connect(self._add_folder)
         self.btn_clear.clicked.connect(self._clear_files)
         self.btn_remove.clicked.connect(self._remove_selected)
+        # 全局粘贴快捷键（焦点在输入框等控件时仍可用，文本控件自身会优先处理）
+        self._shortcut_paste = QShortcut(QKeySequence.Paste, self)
+        self._shortcut_paste.setContext(Qt.WindowShortcut)
+        self._shortcut_paste.activated.connect(self._on_paste_shortcut)
         self.btn_browse.clicked.connect(self._browse_output)
         self.btn_start.clicked.connect(self._start_process)
         self.btn_continue.clicked.connect(self._continue_process)
@@ -1193,24 +2323,259 @@ class MainWindow(QMainWindow):
 
     # ─── 文件操作 ───
     def _add_files(self):
-        desktop_path = os.path.join(os.path.expanduser('~'), 'Desktop')
+        desktop_path = _get_desktop_path()
         files, _ = QFileDialog.getOpenFileNames(
             self, "选择文件", desktop_path,
-            "支持的文件 (*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.tif *.gif *.docx *.pdf);;"
+            "支持的文件 (*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.tif *.gif *.docx *.pdf *.html *.htm);;"
             "图片文件 (*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.tif *.gif);;"
-            "文档文件 (*.docx *.pdf)"
+            "从文档抽图 (*.docx *.pdf *.html *.htm *.xhtml)"
         )
         if files:
-            self._insert_files(files)
+            # 图片直接入库；HTML/DOCX/PDF 自动抽图
+            self._import_local_paths(files)
 
     def _add_folder(self):
-        desktop_path = os.path.join(os.path.expanduser('~'), 'Desktop')
+        desktop_path = _get_desktop_path()
         folder = QFileDialog.getExistingDirectory(self, "选择文件夹", desktop_path)
         if folder:
-            files = [str(f) for f in sorted(Path(folder).rglob("*"))
-                     if f.is_file() and f.suffix.lower() in VALID_EXTS]
-            # 传入 base_dir 以便显示相对路径
-            self._insert_files(files, base_dir=folder)
+            # 文件夹：图片 + 容器抽图 统一走导入
+            self._import_local_paths([folder])
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        self._import_from_urls(event.mimeData().urls())
+        event.acceptProposedAction()
+
+    def _import_from_urls(self, urls) -> int:
+        """从 QUrl 列表导入本地文件/文件夹，返回直接加入列表的图片数。"""
+        return self._import_local_paths(_urls_to_local_paths(urls))
+
+    def _import_local_paths(self, local_paths: list[str | Path]) -> int:
+        """
+        导入本地路径：
+        - 图片直接加入列表
+        - HTML/DOCX/PDF 异步抽取内嵌图片后加入列表（文档本身不入库）
+        返回直接加入列表的图片数（不含异步抽图）。
+        """
+        total = 0
+        for files, base_dir in _collect_import_groups(local_paths):
+            total += len(files)
+            self._insert_files(files, base_dir=base_dir)
+
+        extract_files = _collect_extract_files(local_paths)
+        if extract_files:
+            labels = []
+            for p in extract_files:
+                ext = p.suffix.lower()
+                if ext in HTML_EXTS:
+                    labels.append("HTML")
+                elif ext == ".docx":
+                    labels.append("DOCX")
+                elif ext == ".pdf":
+                    labels.append("PDF")
+            kind = " / ".join(sorted(set(labels))) or "文档"
+            self._start_container_extract(
+                container_paths=[str(p) for p in extract_files],
+                busy_tip=f"正在从 {kind} 提取图片（{len(extract_files)} 个文件）…",
+            )
+        return total
+
+    @staticmethod
+    def _focus_wants_native_paste(focus) -> bool:
+        """焦点控件是否应使用原生文本粘贴（而非导入文件列表）。"""
+        if focus is None:
+            return False
+        # 可编辑下拉内部焦点通常是 QLineEdit
+        if focus.inherits("QLineEdit"):
+            return not focus.isReadOnly()
+        if focus.inherits("QAbstractSpinBox"):
+            return True
+        if focus.inherits("QTextEdit") or focus.inherits("QPlainTextEdit"):
+            return not focus.isReadOnly()
+        if focus.inherits("QComboBox"):
+            return bool(focus.isEditable())
+        return False
+
+    def _on_paste_shortcut(self):
+        """窗口级粘贴：可编辑文本控件转发原生 paste，否则导入文件列表。"""
+        focus = QApplication.focusWidget()
+        # QShortcut 可能先于控件截获 Ctrl+V，对可编辑控件手动转发
+        if self._focus_wants_native_paste(focus):
+            if focus.inherits("QAbstractSpinBox"):
+                le = focus.lineEdit()
+                if le is not None:
+                    le.paste()
+                    return
+            if hasattr(focus, "paste"):
+                focus.paste()
+            return
+        self._paste_from_clipboard()
+
+    def _paste_from_clipboard(self):
+        """
+        从剪贴板导入：
+        1) 文件/文件夹/HTML/DOCX/PDF 路径
+        2) 位图数据 → 临时 PNG
+        3) 剪贴板 HTML 中的图片（URL / base64）
+        4) 纯文本本地路径
+        """
+        clipboard = QApplication.clipboard()
+        mime = clipboard.mimeData()
+        if mime is None:
+            return
+
+        # 1) 本地路径（含文件夹、抽图容器）
+        if mime.hasUrls():
+            paths = _urls_to_local_paths(mime.urls())
+            if paths:
+                extract_files = _collect_extract_files(paths)
+                n = self._import_local_paths(paths)
+                if n > 0 or extract_files:
+                    return
+
+        # 2) 剪贴板图片（截图、浏览器复制等）
+        image = None
+        if mime.hasImage():
+            image = mime.imageData()
+        if image is None:
+            pix = clipboard.pixmap()
+            if pix is not None and not pix.isNull():
+                image = pix
+
+        if image is not None:
+            saved = _save_clipboard_image(image)
+            if saved:
+                self._insert_files([saved])
+                return
+
+        # 3) 通用 HTML 图片（浏览器/钉钉/Office 等 CF_HTML 或 text/html）
+        html = _clipboard_html_text(mime)
+        if html:
+            refs = _extract_image_refs_from_html(html)
+            if refs:
+                page_url = _cf_html_source_url(html)
+                self._start_container_extract(
+                    html_jobs=[(refs, None, page_url)],
+                    busy_tip=f"正在从 HTML 提取图片（{len(refs)}）…",
+                )
+                return
+
+        # 4) 纯文本路径
+        if mime.hasText():
+            text = (mime.text() or "").strip()
+            if text:
+                candidates: list[str] = []
+                for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                    line = line.strip().strip('"').strip("'")
+                    if not line:
+                        continue
+                    if line.lower().startswith("file:"):
+                        url = QUrl(line)
+                        if url.isLocalFile():
+                            candidates.append(url.toLocalFile())
+                        continue
+                    p = Path(line)
+                    if p.exists():
+                        candidates.append(str(p))
+                if candidates:
+                    self._import_local_paths(candidates)
+
+    def _start_container_extract(
+        self,
+        *,
+        container_paths: list[str] | None = None,
+        html_jobs: list[tuple[list[str], str | None | Path, str]] | None = None,
+        busy_tip: str = "正在提取图片…",
+    ):
+        """后台从 HTML/DOCX/PDF 或剪贴板 HTML 抽图并加入列表。"""
+        if self._extract_worker is not None and self._extract_worker.isRunning():
+            self.lbl_file_count.setText("正在提取图片，请稍候再试…")
+            QTimer.singleShot(2500, self._update_file_count)
+            return
+        now = time.monotonic()
+        last = getattr(self, "_extract_last_ts", 0.0)
+        if now - last < 0.35:
+            return
+        self._extract_last_ts = now
+
+        containers = [str(p) for p in (container_paths or []) if p]
+        norm_jobs: list[tuple[list[str], str | None, str]] = []
+        global_keys: set[str] = set()
+        for refs, base, page_url in (html_jobs or []):
+            if not refs:
+                continue
+            uniq_refs: list[str] = []
+            for r in refs:
+                k = _image_ref_dedupe_key(r)
+                if not k or k in global_keys:
+                    continue
+                global_keys.add(k)
+                uniq_refs.append(_normalize_ref_text(r) or r)
+            if not uniq_refs:
+                continue
+            base_s = str(base) if base is not None else None
+            norm_jobs.append((uniq_refs, base_s, page_url or ""))
+
+        if not containers and not norm_jobs:
+            return
+
+        self._set_extract_busy(True, busy_tip)
+        worker = _ContainerImageExtractWorker(
+            container_paths=containers,
+            html_jobs=norm_jobs,
+            parent=self,
+        )
+        self._extract_worker = worker
+        worker.finished_ok.connect(self._on_extract_ok)
+        worker.finished_fail.connect(self._on_extract_fail)
+        worker.finished.connect(self._on_extract_finished)
+        worker.start()
+
+    def _set_extract_busy(self, busy: bool, tip: str = ""):
+        """抽图期间的轻量状态提示。"""
+        try:
+            if busy:
+                QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+                if tip:
+                    self.lbl_file_count.setToolTip(tip)
+                    self.lbl_file_count.setText(tip)
+            else:
+                while QApplication.overrideCursor() is not None:
+                    QApplication.restoreOverrideCursor()
+                self.lbl_file_count.setToolTip("")
+                self._update_file_count()
+        except Exception:
+            pass
+
+    def _on_extract_ok(self, paths: list):
+        if paths:
+            self._insert_files(list(paths))
+
+    def _on_extract_fail(self, message: str):
+        try:
+            self.lbl_file_count.setText(message or "抽图失败")
+            QTimer.singleShot(3500, self._update_file_count)
+        except Exception:
+            pass
+        QMessageBox.information(self, "提取图片", message or "未能提取到图片")
+
+    def _on_extract_finished(self):
+        self._set_extract_busy(False)
+        w = self._extract_worker
+        self._extract_worker = None
+        if w is not None:
+            w.deleteLater()
 
     def _insert_files(self, files, base_dir=None):
         existing = {self.file_list.item(i).data(ROLE_PATH) for i in range(self.file_list.count())}
@@ -1234,9 +2599,6 @@ class MainWindow(QMainWindow):
                         display_name = f"{Path(f).parent.name}/{Path(f).name}"
                         
                     base_text = display_name
-                    if Path(f).suffix.lower() in DOC_EXTS:
-                        ext = Path(f).suffix.lower()
-                        base_text = f"{'📄' if ext == '.pdf' else '📝'}  {display_name}"
                     item = QListWidgetItem(base_text)
                     item.setData(ROLE_PATH, f)
                     item.setData(ROLE_REL_PATH, rel_path)
@@ -1354,11 +2716,7 @@ class MainWindow(QMainWindow):
             return
         if hasattr(proc, "on_selected_image"):
             try:
-                # 文档不传给图片处理器回读
-                if path and Path(path).suffix.lower() in DOC_EXTS:
-                    proc.on_selected_image(None)
-                else:
-                    proc.on_selected_image(path)
+                proc.on_selected_image(path)
             except Exception:
                 pass
 
@@ -1370,16 +2728,6 @@ class MainWindow(QMainWindow):
             self._notify_processor_selection(None)
             return
         path = current.data(ROLE_PATH)
-        # 文档文件不做图片预览
-        if Path(path).suffix.lower() in DOC_EXTS:
-            self.preview_label.clear()
-            ext = Path(path).suffix.upper().lstrip(".")
-            icon_char = "📄" if ext == "PDF" else "📝"
-            self.preview_label.setText(f"{icon_char}\n{ext} 文档")
-            size_kb = Path(path).stat().st_size // 1024 if Path(path).exists() else 0
-            self.lbl_preview_info.setText(f"{Path(path).name}  ({size_kb} KB)")
-            self._notify_processor_selection(None)
-            return
         pixmap = QPixmap(path)
         if pixmap.isNull():
             self.preview_label.setText("无法加载预览")

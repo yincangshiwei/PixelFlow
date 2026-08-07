@@ -1,11 +1,16 @@
 """
 PixelFlow 处理器基类
 所有图像处理功能都应继承此基类，实现插件化架构。
+
+P6：处理器只负责 process / process_batch 纯处理逻辑；
+参数面板、参数收集/应用等 UI 职责已迁至 ui/routes/process/features/*
+（FeatureRoute）与 services/features/*（FeatureService）。
+功能的唯一权威注册入口是 services.features.catalog（FeatureDescriptor），
+不再有装饰器注册表。
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from PIL import Image
-from PySide6.QtWidgets import QWidget
 
 
 @dataclass
@@ -24,8 +29,10 @@ class ProcessResult:
 
 class BaseProcessor(ABC):
     """
-    处理器基类。
-    每个图像处理功能模块都应继承此类，注册后自动出现在功能菜单中。
+    处理器基类（纯处理，无 UI）。
+
+    每个图像处理功能模块都应继承此类；功能注册、菜单顺序、预设与
+    编排统一由 services.features.catalog 的 FeatureDescriptor 描述。
     """
 
     @property
@@ -72,58 +79,11 @@ class BaseProcessor(ABC):
         raise NotImplementedError("Batch processor must implement process_batch()")
 
     @abstractmethod
-    def create_panel(self, parent: QWidget = None) -> QWidget:
-        """创建该处理器的参数设置面板"""
-        ...
-
-    @abstractmethod
     def process(self, img: Image.Image, options: dict) -> tuple[Image.Image, dict]:
         """处理单张图片"""
-        ...
-
-    @abstractmethod
-    def gather_options(self) -> dict:
-        """从 UI 面板收集当前参数，返回字典"""
-        ...
-
-    @abstractmethod
-    def apply_options(self, options: dict):
-        """将参数字典应用到 UI 面板（用于加载预设）"""
         ...
 
     @abstractmethod
     def default_options(self) -> dict:
         """返回该处理器的出厂默认参数"""
         ...
-
-    @abstractmethod
-    def get_output_format(self) -> str:
-        """返回输出格式: png / jpg / webp"""
-        ...
-
-    def on_selected_image(self, path: str | None):
-        """
-        左侧列表当前选中图片变化时由主窗口回调（可选覆盖）。
-        用于单图回读：如元数据编辑读取原图属性填入面板。
-        path 为 None 表示取消选中或非图片项。
-        """
-        return
-
-    def supports_selected_load(self) -> bool:
-        """是否支持从选中图片加载参数到面板（默认否）"""
-        return False
-
-
-# ── 处理器注册表 ──
-_registry: list[type[BaseProcessor]] = []
-
-
-def register_processor(cls: type[BaseProcessor]):
-    """装饰器：注册一个处理器"""
-    _registry.append(cls)
-    return cls
-
-
-def get_all_processors() -> list[type[BaseProcessor]]:
-    """获取所有已注册的处理器类"""
-    return list(_registry)

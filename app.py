@@ -58,7 +58,7 @@ def main():
     _setup_qt_plugin_path()
     from PySide6.QtWidgets import QApplication
     from PySide6.QtGui import QIcon
-    from ui.main_window import MainWindow
+    from ui.shell.main_window import MainWindow
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)

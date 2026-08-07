@@ -18,9 +18,43 @@
 **入口：** `app.py`  
 - 开发：直接运行 `app.py`  
 - 打包：处理 Qt 插件路径、未捕获异常写入 `logs/app/`  
-- 主窗口：`ui/main_window.py`  
-- 配置中心：`ui/settings_panel.py`  
-- 全局常量 / 样式：`config.py`
+- 主窗口壳：`ui/shell/main_window.py`（只装配路由与连线）  
+- 配置中心：`ui/routes/settings/`（SettingsRoute / DevEnvRoute / MattingModelRoute）  
+- 全局常量 / 样式：`config.py`、`ui/shell/styles.py`
+
+### 分层与依赖规则（Route → Service → core 单向依赖）
+
+- `ui/`：壳（`ui/shell/`）+ 页面路由（`ui/routes/`）+ 通用控件（`ui/widgets/`）+ Qt 平台适配（`ui/adapters/`）；Route 只与 Service 交互，不直接读写 core
+- `services/`：不依赖 Route / QWidget。`services/features/`（功能 Service + catalog 权威注册）、`services/common/`（编排 / 预设 / 输出路径 / 导入）、`services/contracts/`（跨层契约）
+- `core/`：纯处理逻辑，不 import ui
+
+**硬性规则**（由 `tests/test_dependency_rules.py` 静态检查守护）：
+
+| 规则 | 说明 |
+|------|------|
+| Route → Service → core 单向 | 禁止反向依赖；core 不 import `ui` 包 |
+| services 不 import QtWidgets | `services/common/batch_orchestrator.py` 为唯一白名单（主线程 QObject 编排，允许 QtCore） |
+| 处理器不 import PySide6 | 面板/参数收集在 FeatureRoute / FeatureService |
+| Qt 剪贴板只在 `ui/adapters/clipboard_adapter.py` | 导入纯逻辑在 `services/common/importing/` |
+| 壳不保存跨页面业务状态 | `ui/shell/` 只装配与连线；业务状态归 services |
+
+### 跨层契约（`services/contracts/`）
+
+| 契约 | 用途 |
+|------|------|
+| `ImportEntry` / `ImportCollection` | 导入条目与集合快照（列表项仅存条目 id） |
+| `FeatureDescriptor` | 功能统一描述符（id 即 preset_id / 输入形态 / 工厂 / 能力声明） |
+| `RunRequest` / `OutputPolicy` | 批处理请求与输出策略 |
+| `JobEvent` | 批处理事件（**必带 `job_id`**，状态机：queued → running → finished/cancelled/failed） |
+| `BatchSnapshot` | 断点续跑快照 |
+| `AppContext` | 只读依赖容器（`ui/shell/app_context.py`，不依赖 Qt） |
+
+### Qt 线程与生命周期约定
+
+- **Worker 归属**：`BatchOrchestrator`（主线程 QObject）持有 Worker 直至 `finished`，禁止提前 delete；完成弹窗在 `QThread.finished` 之后
+- **事件隔离**：所有 `JobEvent` 携带 `job_id`，编排器丢弃迟到事件，避免上一轮任务串扰
+- **后台回调守卫**：UI 侧异步回调统一经 `_AsyncBridge` + `shiboken6.isValid` 守卫，防止控件已销毁时回调崩溃
+- **关闭策略**：closeEvent 按「禁止新任务 → 请求取消 → 有界等待（15s）→ 超时则 ignore」执行
 
 ---
 
@@ -30,17 +64,17 @@
 PixelFlow/
 ├── app.py                      # 入口
 ├── config.py                   # 路径、样式、常量
-├── core/
-│   ├── base_processor.py       # 图像处理器基类 + 注册表
-│   ├── base_file_processor.py  # 文件类处理器基类
+├── core/                       # 处理核心（纯逻辑，不 import ui）
+│   ├── base_processor.py       # 图像处理器基类（纯处理，无 UI）
+│   ├── base_file_processor.py  # 文件类处理器基类（预留）
 │   ├── worker.py               # 图像批处理 QThread
 │   ├── file_worker.py          # 文件批处理 QThread
 │   ├── batch_session.py        # 续跑 / 重试会话
 │   ├── image_processor.py      # 通用图像算法（裁边、画布等）
 │   ├── metadata_utils.py       # EXIF / tEXt / 格式识别
-│   ├── preset_manager.py       # 预设 JSON
+│   ├── preset_manager.py       # 预设 JSON 读写
 │   ├── log_manager.py          # 后台日志落盘
-│   ├── processors/             # 功能插件
+│   ├── processors/             # 功能处理器（插件）
 │   ├── matting/                # AI 抠图
 │   │   ├── inference.py        # 主进程推理封装
 │   │   ├── pipeline.py         # 三阶段流水线
@@ -51,7 +85,15 @@ PixelFlow/
 │   └── runtime/
 │       ├── env_manager.py      # uv / Python / Git / 模型 venv / PATH 同步
 │       └── gpu_catalog.py      # 主流 GPU ↔ PyTorch CUDA 标签清单
-├── ui/
+├── services/                   # 服务层（不依赖 Route / QWidget）
+│   ├── contracts/              # 跨层契约（ImportEntry / FeatureDescriptor / RunRequest / JobEvent …）
+│   ├── features/               # 功能 Service + catalog（功能注册唯一权威入口）
+│   └── common/                 # 编排（BatchOrchestrator）/ 预设 / 输出路径 / 导入
+├── ui/                         # 表现层（Route → Service → core）
+│   ├── shell/                  # 主窗口壳 / AppContext / 全局样式 / 导入协调
+│   ├── routes/                 # 页面路由（file_list / process / settings / log / changelog）
+│   ├── widgets/                # 通用控件
+│   └── adapters/               # Qt 平台适配（剪贴板等）
 ├── models/matting/<id>/        # 模型权重（本地数据）
 ├── runtime/                    # AI 运行时数据（gitignore）
 │   ├── uv/                     # 便携 uv.exe（可一键安装或手动放置）
@@ -74,21 +116,19 @@ PixelFlow/
 
 ---
 
-## 3. 插件化处理器架构
+## 3. 插件化功能架构（Route → Service → core）
 
-### 3.1 图像处理器（`BaseProcessor`）
+### 3.1 图像处理器（`BaseProcessor`，纯处理）
 
-每个功能一个类，放在 `core/processors/`，用 `@register_processor` 注册。
+每个功能一个类，放在 `core/processors/`。处理器**只做处理逻辑**，不创建面板、不读控件。
 
 **必须实现：**
 
 | 接口 | 作用 |
 |------|------|
-| `name` / `description` / `icon` / `preset_id` | 展示与预设目录名 |
-| `create_panel()` | 参数面板 `QWidget` |
-| `gather_options()` / `apply_options()` / `default_options()` | 参数字典 ↔ UI |
+| `name` / `description` / `icon` / `preset_id` | 展示与预设目录名（`preset_id` 同时作为功能 id） |
+| `default_options()` | 出厂默认参数 |
 | `process(img, options) -> (Image, details)` | 单张处理 |
-| `get_output_format()` | 输出扩展名相关 |
 
 **可选：**
 
@@ -97,19 +137,31 @@ PixelFlow/
 | `is_batch_processor = True` | 走 `process_batch`（合并导出类） |
 | `process_many` / `matting_many` | micro-batch / 流水线 |
 | `preferred_matting_batch_size` | 建议 GPU batch |
-| `on_selected_image(path)` | 列表选中时回读（如元数据） |
-| `on_panel_activated()` | 切回图像 Tab 时刷新提示 |
+| `set_base_image_size(w, h)` | 运行期上下文（如叠加的宫格坐标定位） |
 
-### 3.2 批处理数据流
+### 3.2 功能注册与参数流（FeatureDescriptor / Service / Route）
+
+功能的唯一权威注册入口是 `services/features/catalog.py`：每个功能由 `FeatureDescriptor`（id / 名称 / 输入形态 / 工厂 / 能力声明）描述，菜单顺序、预设、编排均读取同一注册表，不再有多份功能清单。
+
+| 组成 | 位置 | 职责 |
+|------|------|------|
+| FeatureRoute | `ui/routes/process/features/` | 参数面板 QWidget；`collect_raw_state()` 收集原始控件状态、`apply_state(state)` 应用预设态 |
+| FeatureService | `services/features/` | `validate_and_normalize()` 规范化参数；`normalize_preset()` 预设态转换；`build_run_options()` 构建运行参数（`_output_format` / `keep_matting`）；`load_selected()` 选中图回读（如元数据） |
+| FeatureDescriptor | `services/contracts/` | 能力声明：`input_kind`（IMAGE / FILE / BATCH_MERGED）、`supports_resume`、`supports_selected_load` |
+
+参数流：`Route.collect_raw_state() → Service.validate_and_normalize() → options → Service.build_run_options() → RunRequest`。
+
+### 3.3 批处理数据流
 
 ```
-MainWindow
-  → 收集文件列表 + gather_options() 快照（含 _output_format）
+ActionBarRoute（开始处理）
+  → ProcessTabRoute.build_run_options()（Route 收集 + Service 规范化）
+  → BatchOrchestrator（主线程 QObject，持 Worker 至 finished；事件带 job_id）
   → ProcessWorker(QThread)
        ├─ is_batch_processor → process_batch(...)
        ├─ AI 抠图多图 → matting pipeline（见 §5）
        └─ 默认 → 逐张 process() → 保存
-  → image_done / debug 信号 → 后台日志 + 列表状态
+  → JobEvent 信号 → 后台日志 + 列表状态 + 进度条
   → QThread.finished → 结算弹窗（须等 AI 子进程关闭）
 ```
 
@@ -118,24 +170,26 @@ MainWindow
 - Worker **不得**访问 QComboBox 等 UI 控件；输出格式在启动前写入 `options["_output_format"]`。
 - 取消只置 `_cancelled`；常驻抠图进程在 Worker 线程 `finally` 中 `shutdown_matting_workers()`。
 - 完成弹窗在 `QThread.finished` 之后，避免线程未退出即销毁导致崩溃。
+- 事件统一携带 `job_id`，编排器丢弃迟到事件，避免上一轮任务串扰。
 
-### 3.3 当前处理器一览
+### 3.4 当前功能一览
 
-| 模块 | 文件 | 类型 |
-|------|------|------|
-| 透明图处理 | `transparent_processor.py` | 逐张 + AI 流水线 |
-| 基础处理 | `basic_processor.py` | 逐张（格式/压缩/DPI/重命名） |
-| 元数据编辑 | `metadata_processor.py` | 多为 `process_batch` 按路径写，保留 EXIF |
-| 图片叠加 | `overlay_processor.py` | 逐张 |
-| 图片排版导出 | `img2doc_processor.py` | `is_batch_processor`（PPT/PDF/Word） |
+| 模块 | 处理器 | Service / Route | 类型 |
+|------|--------|-----------------|------|
+| 透明图处理 | `transparent_processor.py` | `transparent_service` / `transparent_route` | 逐张 + AI 流水线 |
+| 基础处理 | `basic_processor.py` | `basic_service` / `basic_route` | 逐张（格式/压缩/DPI/重命名） |
+| 元数据编辑 | `metadata_processor.py` | `metadata_service` / `metadata_route` | `process_batch` 按路径写，保留 EXIF |
+| 图片叠加 | `overlay_processor.py` | `overlay_service` / `overlay_route` | 逐张 |
+| 图片排版导出 | `img2doc_processor.py` | `img2doc_service` / `img2doc_route` | `is_batch_processor`（PPT/PDF/Word） |
 
-### 3.4 新增功能步骤（简版）
+### 3.5 新增功能步骤（简版）
 
-1. 在 `core/processors/` 新建类，继承 `BaseProcessor` 并 `@register_processor`。  
-2. 实现面板（遵循 UI 规范：毛玻璃、`COMBOBOX_STYLE`、宽屏水平优先布局）。  
-3. 实现 `process` / 必要时 `process_batch`。  
-4. 文件对话框默认目录用桌面：`Path.home() / "Desktop"`。  
-5. 功能变更同步 `resources/CHANGELOG.md`。
+1. 在 `core/processors/` 新建处理器类，继承 `BaseProcessor`（纯处理，不含控件）。  
+2. 在 `services/features/` 新建 FeatureService（参数规范化 / 预设态转换 / `build_run_options`），并暴露 `descriptor`。  
+3. 在 `ui/routes/process/features/` 新建 FeatureRoute 面板（遵循 UI 规范：毛玻璃、`COMBOBOX_STYLE`、宽屏水平优先布局），实现 `collect_raw_state()` / `apply_state()`。  
+4. 在 `services/features/catalog.py` 的 `_SERVICE_TYPES` 与 `EXPECTED_FEATURE_ORDER` 注册（菜单顺序以 catalog 为准），并在 `ProcessTabRoute` 注入 Route 工厂。  
+5. 实现 `process` / 必要时 `process_batch`；文件对话框默认目录用桌面：`Path.home() / "Desktop"`。  
+6. 打包时在 `PixelFlow.spec` 的 `hiddenimports` 补充新处理器模块；功能变更同步 `resources/CHANGELOG.md`。
 
 ---
 
@@ -144,7 +198,7 @@ MainWindow
 ### 4.1 处理范围
 
 - **全部文件** / **仅选中**：全局，对所有功能生效。  
-- 主窗口 `_collect_process_files()` / `_collect_process_entries()` 取列表。  
+- 处理条目取自 `ImportCollection` 快照（`services/common/importing/`），列表项仅存条目 id。  
 - 仅选中且未选时禁止开始。
 
 ### 4.2 输出路径
@@ -154,7 +208,7 @@ MainWindow
 | 桌面 / 自定义 | 可选 `PixelFlow_output/` 子目录 + **保留目录结构** |
 | 原图覆盖 / 副本 | 不启用自动子文件夹与保留结构 |
 
-文件夹导入时列表项带相对路径（`ROLE_REL_PATH`），开始时组成 `rel_path_map`，由 `resolve_file_out_dir()` 解析输出子目录。
+文件夹导入时条目带相对路径（`ImportEntry.relative_path`），由 `OutputPathService.resolve_file_out_dir()` 解析输出子目录。
 
 ### 4.3 批处理续跑 / 重试（`BatchSession`）
 

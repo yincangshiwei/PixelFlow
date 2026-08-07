@@ -1,10 +1,13 @@
 """
 PixelFlow 文件处理器基类
 用于处理非图片文件（如文档格式转换），与 BaseProcessor（图片处理）并存。
+
+P6：文件处理器同样只负责处理逻辑；参数面板与参数收集/应用等 UI 职责
+由 FeatureRoute / FeatureService 承担，功能注册统一走
+services.features.catalog 的 FeatureDescriptor（InputKind.FILE）。
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from PySide6.QtWidgets import QWidget
 
 
 @dataclass
@@ -19,7 +22,7 @@ class FileProcessResult:
 
 class BaseFileProcessor(ABC):
     """
-    文件处理器基类。
+    文件处理器基类（纯处理，无 UI）。
     适用于输入/输出不是 PIL Image 的功能（如文档格式转换）。
     """
 
@@ -52,21 +55,6 @@ class BaseFileProcessor(ABC):
         ...
 
     @abstractmethod
-    def create_panel(self, parent: QWidget = None) -> QWidget:
-        """创建参数设置面板"""
-        ...
-
-    @abstractmethod
-    def gather_options(self) -> dict:
-        """从 UI 面板收集当前参数"""
-        ...
-
-    @abstractmethod
-    def apply_options(self, options: dict):
-        """将参数字典应用到 UI 面板（加载预设用）"""
-        ...
-
-    @abstractmethod
     def default_options(self) -> dict:
         """返回出厂默认参数"""
         ...
@@ -83,18 +71,3 @@ class BaseFileProcessor(ABC):
         :return:            FileProcessResult
         """
         ...
-
-
-# ── 文件处理器注册表 ──
-_file_registry: list[type[BaseFileProcessor]] = []
-
-
-def register_file_processor(cls: type[BaseFileProcessor]):
-    """装饰器：注册一个文件处理器"""
-    _file_registry.append(cls)
-    return cls
-
-
-def get_all_file_processors() -> list[type[BaseFileProcessor]]:
-    """获取所有已注册的文件处理器类"""
-    return list(_file_registry)

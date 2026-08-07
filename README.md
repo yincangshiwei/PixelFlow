@@ -148,44 +148,38 @@ presets/
 
 ## 后端架构
 
-### 插件化处理器框架
+项目采用 **Route → Service → core** 的单向依赖分层（详见 [TECHNICAL.md](TECHNICAL.md)）：
 
-```
-core/
-├── base_processor.py          # 基类 BaseProcessor + 注册表
-├── image_processor.py         # 底层通用图像处理函数（裁剪、缩放等）
-├── preset_manager.py          # 预设管理器（按功能管理 JSON 预设文件）
-├── worker.py                  # 通用后台批量处理线程（基于 QThread）
-└── processors/                # 处理器插件目录（每个功能一个文件）
-    └── transparent_processor.py
-```
+- **`ui/`（表现层）** — 壳层 `ui/shell/main_window.py` 只负责装配与连线；页面逻辑在 `ui/routes/`（文件列表 / 处理 / 配置 / 日志 / 版本日志），每个功能的参数面板是一个 FeatureRoute（`ui/routes/process/features/`）。Route 不直接读写 core，只与 Service 交互
+- **`services/`（服务层）** — 不依赖任何 QWidget。`services/features/` 是五功能的 FeatureService 与 catalog（功能注册的唯一权威入口，菜单顺序、预设、编排都读它）；`services/common/` 提供批处理编排（`BatchOrchestrator`）、预设、输出路径、导入等公共服务；`services/contracts/` 定义跨层契约（`ImportEntry` / `FeatureDescriptor` / `RunRequest` / `JobEvent` 等）
+- **`core/`（处理核心）** — 纯处理逻辑，不 import ui。处理器只做 `process` / `process_batch`，不含任何控件代码
 
 **核心设计：**
 
-- **`BaseProcessor`** — 抽象基类，定义处理器接口：
+- **`BaseProcessor`** — 处理器基类（纯处理，无 UI）：
   - `name` / `description` / `icon` / `preset_id` — 名称、说明、图标、预设目录名
-  - `create_panel()` — 创建参数设置面板（返回 QWidget）
-  - `gather_options()` — 从面板收集参数（返回 dict）
-  - `apply_options(options)` — 将参数字典应用到面板（用于加载预设）
-  - `default_options()` — 返回出厂默认参数
+  - `default_options()` — 出厂默认参数
   - `process(img, options)` — 处理单张图片（返回处理后 Image + 详情 dict）
-  - `get_output_format()` — 返回输出格式
+  - `is_batch_processor` / `process_batch(...)` — 批量合并处理（元数据编辑、图片排版导出）
 
-- **`@register_processor`** — 装饰器，自动将处理器类注册到全局注册表
+- **`FeatureDescriptor`** — 功能统一描述符（id / 名称 / 输入形态 / 处理器与 Route、Service 工厂 / 续跑与选中回读能力），由 `services/features/catalog.py` 统一构建，是菜单、预设、编排的唯一注册来源
 
-- **`PresetManager`** — 按功能模块管理预设 JSON 文件，支持增删改查和默认预设
+- **`FeatureService`** — 每个功能的参数规范化（`validate_and_normalize`）、预设态转换（`normalize_preset`）、运行参数构建（`build_run_options`）与选中图回读（`load_selected`）
 
-- **`ProcessWorker`** — 通用后台线程，接收任意 `BaseProcessor` 实例和参数，逐张处理并发射进度/完成信号
+- **`PresetService`** — 按功能管理预设 JSON 文件，支持增删改查和默认预设
+
+- **`BatchOrchestrator` + Worker** — 主线程编排对象持有后台 Worker（`ProcessWorker` / 批量合并路由），事件统一带 `job_id` 隔离，支持取消、续跑与重试失败
 
 - **`image_processor.py`** — 底层函数库（`trim_transparent`、`resize_image`、`hex_to_rgba` 等），可被多个处理器复用
 
 ### 数据流
 
 ```
-用户操作 → MainWindow 收集文件列表 + 处理器选项
-         → ProcessWorker(QThread) 后台遍历文件
-         → BaseProcessor.process() 处理每张图
-         → 信号通知 UI 更新进度/日志（自动切换到日志 Tab）
+用户操作 → FeatureRoute 收集原始控件状态
+         → FeatureService 规范化为 options（含 _output_format / keep_matting）
+         → BatchOrchestrator 启动 Worker(QThread) 后台遍历文件
+         → BaseProcessor.process() / process_batch() 处理
+         → JobEvent 信号通知 UI 更新进度/日志（自动切换到日志 Tab）
 ```
 
 ---
@@ -407,14 +401,15 @@ PixelFlow/
 │   ├── img2doc/
 │   ├── image_overlay/
 │   └── metadata_edit/
-├── core/                               # 后端核心
-│   ├── base_processor.py               # 处理器基类 + 注册表（支持批量合并接口）
-│   ├── base_file_processor.py          # 文件处理器基类 + 注册表
+├── core/                               # 处理核心（纯逻辑，不 import ui）
+│   ├── base_processor.py               # 图片处理器基类（纯处理，无 UI）
+│   ├── base_file_processor.py          # 文件处理器基类（预留）
 │   ├── image_processor.py              # 底层图像处理函数（含二分法最优压缩算法）
 │   ├── metadata_utils.py               # 图片元数据读写（EXIF / PNG tEXt / 标记）
-│   ├── preset_manager.py               # 预设管理器
+│   ├── preset_manager.py               # 预设文件读写（JSON）
 │   ├── worker.py                       # 后台批量处理线程（支持单图和批量合并路由）
 │   ├── file_worker.py                  # 文件批量处理线程
+│   ├── batch_session.py                # 批处理会话（进度保存 / 断点续跑）
 │   ├── runtime/                        # uv / 系统 Python / 每模型隔离 venv
 │   │   └── env_manager.py
 │   ├── matting/                        # AI 抠图（注册 / 权重 / 硬件 / 子进程推理）
@@ -424,15 +419,47 @@ PixelFlow/
 │   │   ├── inference.py
 │   │   └── workers/                    # 在模型 venv 中运行的脚本
 │   │       └── ben2_worker.py
-│   └── processors/
+│   └── processors/                     # 五功能处理器（插件，纯处理）
 │       ├── transparent_processor.py    # 透明图处理器（含 AI 抠图步骤）
 │       ├── basic_processor.py          # 基础处理器
 │       ├── img2doc_processor.py        # 图片排版导出处理器
 │       ├── overlay_processor.py        # 图片叠加处理器
 │       └── metadata_processor.py       # 元数据编辑处理器
-└── ui/
-    ├── main_window.py                  # 主窗口（支持自适应滚动、双处理器体系、目录树展示）
-    └── settings_panel.py               # 配置中心（抠图模型等）
+├── services/                           # 服务层（不依赖 Route / QWidget）
+│   ├── contracts/                      # 跨层契约（ImportEntry / FeatureDescriptor / RunRequest / JobEvent …）
+│   ├── features/                       # 功能级 Service + catalog（功能注册唯一权威入口）
+│   │   ├── catalog.py                  # 统一构建 FeatureRegistry（菜单顺序 / 预设 / 编排读取）
+│   │   ├── registry.py                 # FeatureRegistry
+│   │   ├── basic_service.py            # 基础处理 Service
+│   │   ├── transparent_service.py      # 透明图处理 Service
+│   │   ├── img2doc_service.py          # 图片排版导出 Service
+│   │   ├── overlay_service.py          # 图片叠加 Service
+│   │   └── metadata_service.py         # 元数据编辑 Service
+│   └── common/                         # 编排与公共服务
+│       ├── batch_orchestrator.py       # 批处理编排（主线程 QObject，持 Worker 至 finished）
+│       ├── worker_factory.py           # Worker 工厂
+│       ├── output_path_service.py      # 输出路径解析
+│       ├── preset_service.py           # 预设服务（PresetManager 之上的薄封装）
+│       ├── importing/                  # 导入纯逻辑（剪贴板解析 / 容器抽图 / 集合管理）
+│       └── file_list/                  # 文件列表领域逻辑
+└── ui/                                 # 表现层（Route → Service → core 单向依赖）
+    ├── shell/                          # 壳层
+    │   ├── main_window.py              # 主窗口（只装配与连线）
+    │   ├── app_context.py              # 只读依赖容器
+    │   ├── styles.py                   # 全局 QSS
+    │   └── import_coordinator.py       # 导入协调
+    ├── routes/                         # 页面级路由
+    │   ├── file_list/                  # 文件列表页（导入 / 列表 / 缩略图）
+    │   ├── process/                    # 处理页
+    │   │   ├── process_tab_route.py    # 处理 Tab（功能切换 / 面板栈 / 预设连线）
+    │   │   ├── output_settings_route.py# 输出设置
+    │   │   ├── action_bar_route.py     # 底部操作栏（进度 / 开始 / 取消）
+    │   │   └── features/               # 五功能参数面板（FeatureRoute）
+    │   ├── settings/                   # 配置中心（开发环境 / 抠图模型）
+    │   ├── log/                        # 后台日志页
+    │   └── changelog/                  # 版本日志页
+    ├── widgets/                        # 通用控件（标签芯片编辑器等）
+    └── adapters/                       # Qt 平台适配（剪贴板等）
 ```
 
 ## 环境要求
@@ -648,38 +675,22 @@ python build.py --clean
 
 ## 扩展新功能
 
-继承 `BaseProcessor` 并使用 `@register_processor` 装饰器，即可自动注册到功能菜单并支持预设系统：
+新功能由四部分组成（Route → Service → core 单向依赖）：
+
+1. **处理器**（`core/processors/my_processor.py`）— 继承 `BaseProcessor`，只做纯处理，不含任何控件：
 
 ```python
 from PIL import Image
-from PySide6.QtWidgets import QWidget
-from core.base_processor import BaseProcessor, register_processor
+from core.base_processor import BaseProcessor
 
-@register_processor
 class MyProcessor(BaseProcessor):
     name = "我的功能"
     description = "功能简要说明"
     icon = "🎨"
-    preset_id = "my_feature"  # 预设目录名（英文唯一标识）
-
-    def create_panel(self, parent=None) -> QWidget:
-        """创建参数设置面板"""
-        ...
-
-    def gather_options(self) -> dict:
-        """从面板收集当前参数"""
-        ...
-
-    def apply_options(self, options: dict):
-        """将参数字典应用到面板（加载预设用）"""
-        ...
+    preset_id = "my_feature"  # 预设目录名（英文唯一标识，同时作为功能 id）
 
     def default_options(self) -> dict:
         """返回出厂默认参数"""
-        ...
-
-    def get_output_format(self) -> str:
-        """返回输出格式: png / jpg / webp"""
         ...
 
     def process(self, img: Image.Image, options: dict) -> tuple[Image.Image, dict]:
@@ -687,13 +698,13 @@ class MyProcessor(BaseProcessor):
         ...
 ```
 
-然后在 `main_window.py` 中添加一行导入触发注册：
+2. **FeatureService**（`services/features/my_service.py`）— 参数规范化 / 预设态转换 / 运行参数构建，并暴露 `FEATURE_ID` 与 `descriptor`（不依赖 QWidget）
 
-```python
-import core.processors.my_processor  # noqa: F401
-```
+3. **FeatureRoute**（`ui/routes/process/features/my_route.py`）— 参数面板 QWidget，实现 `collect_raw_state()` / `apply_state(state)`
 
-重启应用后，新功能即出现在功能下拉菜单中，预设系统自动可用。
+4. **注册到 catalog**（`services/features/catalog.py`）— 在 `_SERVICE_TYPES` 与 `EXPECTED_FEATURE_ORDER` 中加入新功能（菜单顺序以 catalog 为准），并在 `ProcessTabRoute` 的 route 工厂映射中注入 Route
+
+完成后重启应用，新功能即出现在功能下拉菜单中，预设系统自动可用。打包时记得在 `PixelFlow.spec` 的 `hiddenimports` 中补充新处理器模块。
 
 ## License
 

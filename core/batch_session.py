@@ -129,6 +129,21 @@ class BatchSession:
                 job.status = STATUS_CANCELLED
                 job.error = "用户取消"
 
+    def remove_paths(self, paths: Iterable[str]) -> int:
+        """从会话移除指定路径（列表删除条目后同步；不再参与续跑）。
+
+        与既有 main_window._on_files_removed 的逐条移除语义一致。
+        返回实际移除条数。
+        """
+        dropped = set(paths)
+        if not dropped:
+            return 0
+        before = len(self.files)
+        self.files = [f for f in self.files if f.path not in dropped]
+        for p in dropped:
+            self._index.pop(p, None)
+        return before - len(self.files)
+
     def reset_for_retry(self, paths: Iterable[str]):
         for p in paths:
             job = self._index.get(p)

@@ -31,6 +31,22 @@ def _build_stem(original_stem: str, options: dict, index: int) -> str:
         return seq
 
 
+def unique_out_path(file_out_dir: Path, stem: str, ext: str, file_overwrite: bool) -> Path:
+    """按是否覆盖生成最终输出路径。
+
+    file_overwrite 开启时直接使用 stem+ext；否则存在同名则追加 _1/_2…
+    （纯函数，供 ProcessWorker 与基线测试共用。）
+    """
+    out_path = file_out_dir / (stem + ext)
+    if file_overwrite:
+        return out_path
+    counter = 1
+    while out_path.exists():
+        out_path = file_out_dir / f"{stem}_{counter}{ext}"
+        counter += 1
+    return out_path
+
+
 def resolve_file_out_dir(base_out_dir: Path, fpath: str, rel_path_map: dict | None) -> Path:
     """
     根据相对路径映射，在输出根目录下解析单文件的目标子目录。
@@ -472,14 +488,7 @@ class ProcessWorker(QThread):
 
         file_overwrite 开启时直接使用 stem+ext；否则存在同名则追加 _1/_2…
         """
-        out_path = file_out_dir / (stem + ext)
-        if self.file_overwrite:
-            return out_path
-        counter = 1
-        while out_path.exists():
-            out_path = file_out_dir / f"{stem}_{counter}{ext}"
-            counter += 1
-        return out_path
+        return unique_out_path(file_out_dir, stem, ext, self.file_overwrite)
 
     def _save_processed_image(
         self,

@@ -90,7 +90,6 @@ a = Analysis(
         'core.processors.metadata_processor',
         'core.runtime.env_manager',
         'core.matting.inference',
-        'ui.settings_panel',
         'openpyxl',
         'openpyxl.cell',
         'openpyxl.utils',
@@ -101,11 +100,19 @@ a = Analysis(
         'email.mime',
         'email.mime.text',
         'email.mime.multipart',
-        # 主窗口 HTML 抽图 / 粘贴：import html、html.parser
+        # services（importing / file_list / features / preset_service，
+        # P3 新增 batch_orchestrator / worker_factory / output_path_service /
+        # batch_log_format；P5 新增 runtime_facade / matting_config_service）
+        # 与 ui.widgets / ui.routes（file_list / process / log / changelog /
+        # settings）及 ui.shell 均由 app.py → ui.shell.main_window 静态引用，
+        # modulefinder 可自动收集，无需 hiddenimports
+        # 各 FeatureService 在 create_processor 时延迟导入 processor，
+        # 打包时请确认五功能 processor 均在分析图中
+        # HTML 抽图 / 粘贴（services.common.importing）：import html、html.parser
         'html',
         'html.parser',
         'html.entities',
-        # 主窗口 PDF 抽图（函数内延迟 import，需显式收集）
+        # PDF 抽图（services.common.importing.pdf_extractor 函数内延迟 import，需显式收集）
         'pypdf',
         'pypdf.generic',
         # 排版导出等函数内延迟 import（与 openpyxl 同理）

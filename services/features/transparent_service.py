@@ -16,6 +16,11 @@ FEATURE_DESCRIPTION = "AI 抠图 → 去除透明边缘 → 按画布占比等�
 
 _VALID_FORMATS = frozenset({"png", "webp", "jpg", "jpeg"})
 _VALID_DETAIL = frozenset({"normal", "subtle", "off"})
+_VALID_POSITIONS = frozenset({
+    "top_left", "top_center", "top_right",
+    "middle_left", "center", "middle_right",
+    "bottom_left", "bottom_center", "bottom_right",
+})
 
 __all__ = [
     "FEATURE_ID", "FEATURE_NAME", "FEATURE_ICON", "FEATURE_DESCRIPTION",
@@ -124,6 +129,31 @@ class TransparentService:
             subject_percent = 80
         subject_percent = max(1, min(100, subject_percent))
 
+        reserve_left = _int("reserve_left_percent", base["reserve_left_percent"], 0, 99)
+        reserve_right = _int("reserve_right_percent", base["reserve_right_percent"], 0, 99)
+        reserve_top = _int("reserve_top_percent", base["reserve_top_percent"], 0, 99)
+        reserve_bottom = _int("reserve_bottom_percent", base["reserve_bottom_percent"], 0, 99)
+        if reserve_left + reserve_right >= 100:
+            if strict:
+                errors.append("左侧预留与右侧预留之和必须小于 100%")
+            else:
+                reserve_left = base["reserve_left_percent"]
+                reserve_right = base["reserve_right_percent"]
+        if reserve_top + reserve_bottom >= 100:
+            if strict:
+                errors.append("顶部预留与底部预留之和必须小于 100%")
+            else:
+                reserve_top = base["reserve_top_percent"]
+                reserve_bottom = base["reserve_bottom_percent"]
+
+        subject_position = str(
+            raw_state.get("subject_position", base["subject_position"]) or "center"
+        )
+        if subject_position not in _VALID_POSITIONS:
+            if strict:
+                errors.append("主体位置无效")
+            subject_position = "center"
+
         detail = str(raw_state.get("detail_restore", base["detail_restore"]) or "normal")
         if detail not in _VALID_DETAIL:
             detail = "normal"
@@ -154,7 +184,12 @@ class TransparentService:
             "canvas_w": canvas_w,
             "canvas_h": canvas_h,
             "canvas_color": canvas_color,
+            "reserve_left_percent": reserve_left,
+            "reserve_right_percent": reserve_right,
+            "reserve_top_percent": reserve_top,
+            "reserve_bottom_percent": reserve_bottom,
             "subject_percent": subject_percent,
+            "subject_position": subject_position,
             "detail_restore": detail,
             "output_format": fmt,
         })

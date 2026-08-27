@@ -37,7 +37,7 @@ def default_metadata_options() -> dict:
         }
     return {
         "clear_all": False,
-        "enable_convert": False,
+        "enable_convert": True,
         "target_format": "jpg",
         "fields": fields,
     }

@@ -34,7 +34,12 @@ def default_transparent_options() -> dict:
         "canvas_w": 1500,
         "canvas_h": 1500,
         "canvas_color": "#FFFFFF",
+        "reserve_left_percent": 0,
+        "reserve_right_percent": 0,
+        "reserve_top_percent": 0,
+        "reserve_bottom_percent": 0,
         "subject_percent": 80,
+        "subject_position": "center",
         "detail_restore": "normal",
         "output_format": "png",
     }
@@ -95,6 +100,11 @@ class TransparentImageProcessor(BaseProcessor):
                 subject_percent=int(options.get("subject_percent", 80)),
                 canvas_color=options.get("canvas_color", "#FFFFFF"),
                 detail_restore=str(options.get("detail_restore", "normal") or "normal"),
+                reserve_left_percent=int(options.get("reserve_left_percent", 0)),
+                reserve_right_percent=int(options.get("reserve_right_percent", 0)),
+                reserve_top_percent=int(options.get("reserve_top_percent", 0)),
+                reserve_bottom_percent=int(options.get("reserve_bottom_percent", 0)),
+                subject_position=str(options.get("subject_position", "center") or "center"),
             )
             details.update(layout_info)
 

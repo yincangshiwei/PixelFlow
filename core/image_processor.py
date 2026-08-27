@@ -480,15 +480,13 @@ def place_subject_on_canvas(
     subject_percent: int = 80,
     canvas_color: str = "#FFFFFF",
     detail_restore: str = "normal",
+    reserve_left_percent: int = 0,
+    reserve_right_percent: int = 0,
+    reserve_top_percent: int = 0,
+    reserve_bottom_percent: int = 0,
+    subject_position: str = "center",
 ) -> tuple[Image.Image, dict]:
-    """
-    将全分辨率主体（asset）按智能对象思路一次栅格化到画布。
-
-    - asset：质量基准，本函数不会写回调用方引用
-    - 始终按主体占比缩放（可缩小也可放大），保证批量标准化呈现一致
-    - 几何用浮点 scale 算到精确显示尺寸后只采样一次
-    - 画布/显示小于源时必然丢细节；源本身偏小时放大无法创造真实细节
-    """
+    """将主体等比放入扣除四边预留后的可用区，并按九宫格位置对齐。"""
     asset_rgba = asset.convert("RGBA")
     src_w, src_h = asset_rgba.size
     if src_w < 1 or src_h < 1:
@@ -497,21 +495,35 @@ def place_subject_on_canvas(
     cw = max(1, int(canvas_size[0]))
     ch = max(1, int(canvas_size[1]))
     percent = max(1, min(100, int(subject_percent)))
-    safe_w = max(1.0, cw * percent / 100.0)
-    safe_h = max(1.0, ch * percent / 100.0)
+    left_pct = max(0, min(99, int(reserve_left_percent)))
+    right_pct = max(0, min(99, int(reserve_right_percent)))
+    top_pct = max(0, min(99, int(reserve_top_percent)))
+    bottom_pct = max(0, min(99, int(reserve_bottom_percent)))
+    if left_pct + right_pct >= 100 or top_pct + bottom_pct >= 100:
+        raise ValueError("左右预留之和、上下预留之和必须分别小于 100%")
 
-    # 始终贴合安全框（标准化构图优先）
+    available_left = min(cw - 1, int(round(cw * left_pct / 100.0)))
+    available_top = min(ch - 1, int(round(ch * top_pct / 100.0)))
+    available_right = max(available_left + 1, cw - int(round(cw * right_pct / 100.0)))
+    available_bottom = max(available_top + 1, ch - int(round(ch * bottom_pct / 100.0)))
+    available_w = available_right - available_left
+    available_h = available_bottom - available_top
+    safe_w = max(1.0, available_w * percent / 100.0)
+    safe_h = max(1.0, available_h * percent / 100.0)
+
     scale = min(safe_w / src_w, safe_h / src_h)
 
     dst_w = max(1, int(round(src_w * scale)))
     dst_h = max(1, int(round(src_h * scale)))
-    # round 可能越出安全框/画布 1px：用同一 scale 再收紧，保持宽高比
-    if dst_w > cw or dst_h > ch or dst_w > safe_w or dst_h > safe_h:
-        scale = min(cw / src_w, ch / src_h, safe_w / src_w, safe_h / src_h)
-        dst_w = max(1, int(round(src_w * scale)))
-        dst_h = max(1, int(round(src_h * scale)))
-        dst_w = min(dst_w, cw)
-        dst_h = min(dst_h, ch)
+    if dst_w > available_w or dst_h > available_h or dst_w > safe_w or dst_h > safe_h:
+        scale = min(
+            available_w / src_w,
+            available_h / src_h,
+            safe_w / src_w,
+            safe_h / src_h,
+        )
+        dst_w = min(available_w, max(1, int(round(src_w * scale))))
+        dst_h = min(available_h, max(1, int(round(src_h * scale))))
 
     # 与实际输出尺寸对齐的有效 scale（供锐化/日志）
     eff_scale = min(dst_w / src_w, dst_h / src_h)
@@ -529,15 +541,42 @@ def place_subject_on_canvas(
             detail_restore=detail_restore,
         )
 
+    valid_positions = {
+        "top_left", "top_center", "top_right",
+        "middle_left", "center", "middle_right",
+        "bottom_left", "bottom_center", "bottom_right",
+    }
+    position = subject_position if subject_position in valid_positions else "center"
+    free_x = available_w - subject.size[0]
+    free_y = available_h - subject.size[1]
+    if position.endswith("_left"):
+        px = available_left
+    elif position.endswith("_right"):
+        px = available_left + free_x
+    else:
+        px = available_left + free_x // 2
+    if position.startswith("top_"):
+        py = available_top
+    elif position.startswith("bottom_"):
+        py = available_top + free_y
+    else:
+        py = available_top + free_y // 2
+
     canvas = Image.new("RGBA", (cw, ch), hex_to_rgba(canvas_color))
-    px = (cw - subject.size[0]) // 2
-    py = (ch - subject.size[1]) // 2
     canvas.alpha_composite(subject, dest=(px, py))
 
     info = {
         "asset_size": (src_w, src_h),
         "layout_display_size": subject.size,
         "subject_percent": percent,
+        "subject_position": position,
+        "reserve_percent": {
+            "left": left_pct, "right": right_pct,
+            "top": top_pct, "bottom": bottom_pct,
+        },
+        "available_box": (
+            available_left, available_top, available_right, available_bottom
+        ),
         "canvas_size": (cw, ch),
         "paste_pos": (px, py),
         "layout_scale": round(eff_scale, 6),

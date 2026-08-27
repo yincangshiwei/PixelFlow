@@ -110,9 +110,9 @@ class MetadataFeatureRoute(QWidget):
         mid_row = QHBoxLayout()
         mid_row.setSpacing(8)
 
-        self._grp_convert = QGroupBox("格式转换（可选）")
+        self._grp_convert = QGroupBox("格式转换（默认 JPG）")
         self._grp_convert.setCheckable(True)
-        self._grp_convert.setChecked(False)
+        self._grp_convert.setChecked(True)
         self._grp_convert.setToolTip(
             "勾选后强制转换为目标格式。按真实文件头识别格式，"
             "扩展名造假（如 .jpg 实为 MPO）也会正确转换；"
@@ -491,7 +491,7 @@ class MetadataFeatureRoute(QWidget):
         if not self._fields:
             return
 
-        enable_convert = bool(options.get("enable_convert", False))
+        enable_convert = bool(options.get("enable_convert", True))
         if self._grp_convert is not None:
             self._grp_convert.blockSignals(True)
             self._grp_convert.setChecked(enable_convert)

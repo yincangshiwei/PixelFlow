@@ -12,6 +12,7 @@ from core.processors.metadata_processor import MetadataProcessor
 from core.processors.overlay_processor import OverlayProcessor
 from core.processors.img2doc_processor import Img2DocProcessor
 from core.processors.transparent_processor import TransparentImageProcessor
+from core.image_processor import place_subject_on_canvas
 
 
 class TestMetadataService(unittest.TestCase):
@@ -21,6 +22,8 @@ class TestMetadataService(unittest.TestCase):
     def test_default_matches_processor(self):
         self.assertEqual(self.svc.default_state(), MetadataProcessor().default_options())
         self.assertEqual(self.svc.default_state(), default_metadata_options())
+        self.assertTrue(self.svc.default_state()["enable_convert"])
+        self.assertEqual(self.svc.default_state()["target_format"], "jpg")
 
     def test_normalize_fields(self):
         data = self.svc.normalize_preset({
@@ -142,6 +145,25 @@ class TestTransparentService(unittest.TestCase):
         }, strict=False)
         self.assertFalse(r.value["keep_matting"])
 
+    def test_reserve_and_position_normalize(self):
+        r = self.svc.validate_and_normalize({
+            "reserve_left_percent": 10,
+            "reserve_right_percent": 20,
+            "reserve_top_percent": 5,
+            "reserve_bottom_percent": 25,
+            "subject_position": "bottom_left",
+        })
+        self.assertTrue(r.ok)
+        self.assertEqual(r.value["reserve_bottom_percent"], 25)
+        self.assertEqual(r.value["subject_position"], "bottom_left")
+
+    def test_invalid_reserve_sum(self):
+        r = self.svc.validate_and_normalize({
+            "reserve_left_percent": 60,
+            "reserve_right_percent": 40,
+        })
+        self.assertFalse(r.ok)
+
     def test_build_run_options(self):
         opts = self.svc.build_run_options({
             "enable_matting": True,
@@ -170,6 +192,37 @@ class TestTransparentService(unittest.TestCase):
         })
         self.assertEqual(out.size, (10, 10))
         self.assertIn("trim_bbox", details)
+
+    def test_layout_reserve_and_bottom_left_position(self):
+        from PIL import Image
+        asset = Image.new("RGBA", (100, 100), (255, 0, 0, 255))
+        out, details = place_subject_on_canvas(
+            asset,
+            (1000, 1000),
+            subject_percent=100,
+            reserve_top_percent=10,
+            reserve_bottom_percent=20,
+            subject_position="bottom_left",
+            detail_restore="off",
+        )
+        self.assertEqual(out.size, (1000, 1000))
+        self.assertEqual(details["available_box"], (0, 100, 1000, 800))
+        self.assertEqual(details["layout_display_size"], (700, 700))
+        self.assertEqual(details["paste_pos"], (0, 100))
+
+    def test_layout_subject_size_is_relative_to_available_area(self):
+        from PIL import Image
+        asset = Image.new("RGBA", (100, 100), (255, 0, 0, 255))
+        _, details = place_subject_on_canvas(
+            asset,
+            (1000, 1000),
+            subject_percent=50,
+            reserve_bottom_percent=20,
+            subject_position="bottom_center",
+            detail_restore="off",
+        )
+        self.assertEqual(details["layout_display_size"], (400, 400))
+        self.assertEqual(details["paste_pos"], (300, 400))
 
 
 if __name__ == "__main__":

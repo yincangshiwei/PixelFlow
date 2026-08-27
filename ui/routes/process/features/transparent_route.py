@@ -7,14 +7,90 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
     QLabel, QSpinBox, QComboBox, QPushButton, QColorDialog, QCheckBox, QMessageBox,
 )
-from PySide6.QtCore import Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtCore import Qt, QUrl, Signal, QRectF
+from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPen, QBrush, QFont
 
 from core.image_processor import hex_to_rgba, rgba_to_hex, rgba_to_css_hex
 from core.matting.model_registry import list_models, get_model_info
 from core.matting.model_manager import get_matting_manager
 from core.processors.transparent_processor import default_transparent_options
 import config
+
+
+class _SubjectPositionGrid(QWidget):
+    """与图片叠加一致的 3×3 位置选择器，保存稳定的位置枚举值。"""
+
+    positionChanged = Signal(str)
+    CELLS = [
+        ("↖", "top_left"), ("↑", "top_center"), ("↗", "top_right"),
+        ("←", "middle_left"), ("⊙", "center"), ("→", "middle_right"),
+        ("↙", "bottom_left"), ("↓", "bottom_center"), ("↘", "bottom_right"),
+    ]
+
+    def __init__(self, value="center", parent=None):
+        super().__init__(parent)
+        self._hovered_cell = -1
+        self._selected_cell = 4
+        self.setFixedSize(90, 90)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("选择主体在扣除四边预留后的可用区内的位置")
+        self.setCurrentData(value)
+
+    def currentData(self) -> str:
+        return self.CELLS[self._selected_cell][1]
+
+    def setCurrentData(self, value: str) -> None:
+        idx = next((i for i, (_, data) in enumerate(self.CELLS) if data == value), 4)
+        if idx != self._selected_cell:
+            self._selected_cell = idx
+            self.update()
+
+    def _cell_at(self, pos) -> int:
+        col = int(pos.x() / (self.width() / 3.0))
+        row = int(pos.y() / (self.height() / 3.0))
+        return row * 3 + col if 0 <= col < 3 and 0 <= row < 3 else -1
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        cell_w, cell_h = self.width() / 3.0, self.height() / 3.0
+        painter.fillRect(self.rect(), QColor(22, 22, 40, 180))
+        for i, (symbol, _) in enumerate(self.CELLS):
+            row, col = divmod(i, 3)
+            rect = QRectF(col * cell_w + 1, row * cell_h + 1, cell_w - 2, cell_h - 2)
+            if i == self._hovered_cell:
+                painter.setBrush(QBrush(QColor(91, 138, 245, 110)))
+                painter.setPen(QPen(QColor(91, 138, 245, 210), 1.5))
+            elif i == self._selected_cell:
+                painter.setBrush(QBrush(QColor(91, 138, 245, 150)))
+                painter.setPen(QPen(QColor(124, 108, 245, 230), 2))
+            else:
+                painter.setBrush(QBrush(QColor(38, 38, 62, 120)))
+                painter.setPen(QPen(QColor(100, 110, 170, 60), 1))
+            painter.drawRoundedRect(rect, 4, 4)
+            painter.setPen(QColor(225, 230, 248) if i == self._selected_cell else QColor(200, 205, 230))
+            painter.setFont(QFont("Segoe UI Symbol", 11))
+            painter.drawText(rect, Qt.AlignCenter, symbol)
+        painter.end()
+
+    def mouseMoveEvent(self, event):
+        idx = self._cell_at(event.position().toPoint())
+        if idx != self._hovered_cell:
+            self._hovered_cell = idx
+            self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            idx = self._cell_at(event.position().toPoint())
+            if idx >= 0 and idx != self._selected_cell:
+                self._selected_cell = idx
+                self.update()
+                self.positionChanged.emit(self.currentData())
+
+    def leaveEvent(self, event):
+        self._hovered_cell = -1
+        self.update()
 
 
 class _ColorBlock(QWidget):
@@ -179,12 +255,6 @@ class TransparentFeatureRoute(QWidget):
         self._grp_layout = QGroupBox("画布与主体布局")
         self._grp_layout.setCheckable(True)
         self._grp_layout.setChecked(False)
-        self._grp_layout.setToolTip(
-            "类似智能对象：裁剪后的全分辨率主体作为源，画布只存布局参数，\n"
-            "导出时从源预乘 Alpha 后一次栅格化到画布，避免中间重复缩放。\n"
-            "主体占比 = 完整放入画布对应比例的安全框（始终保持宽高比）。\n"
-            "注意：画布/显示尺寸小于源时，放大查看仍会丢细节（与 PS 相同）。"
-        )
         layout_lay = QVBoxLayout(self._grp_layout)
         layout_lay.setSpacing(6)
 
@@ -202,23 +272,41 @@ class TransparentFeatureRoute(QWidget):
         self.spin_ch.setSuffix(" px")
         canvas_row.addWidget(self.spin_ch)
         canvas_row.addWidget(QLabel("背景:"))
-        # 默认不透明白底；需要透底时在取色框把 Alpha 拉到 0 或点自定义「全透明」
         self.color_btn = _ColorBlock("#FFFFFF")
         canvas_row.addWidget(self.color_btn)
         canvas_row.addStretch()
         layout_lay.addLayout(canvas_row)
 
+        reserve_row = QHBoxLayout()
+        self._reserve_spins = {}
+        for key, label in (
+            ("left", "左预留:"), ("right", "右预留:"),
+            ("top", "上预留:"), ("bottom", "下预留:"),
+        ):
+            reserve_row.addWidget(QLabel(label))
+            spin = QSpinBox()
+            spin.setRange(0, 99)
+            spin.setValue(0)
+            spin.setSuffix(" %")
+            spin.setToolTip("按整张画布对应方向尺寸的百分比预留")
+            self._reserve_spins[key] = spin
+            reserve_row.addWidget(spin)
+        reserve_row.addStretch()
+        layout_lay.addLayout(reserve_row)
+
         subject_row = QHBoxLayout()
-        subject_row.addWidget(QLabel("主体占比:"))
+        subject_row.addWidget(QLabel("主体大小:"))
         self.spin_subject_percent = QSpinBox()
         self.spin_subject_percent.setRange(1, 100)
         self.spin_subject_percent.setValue(80)
         self.spin_subject_percent.setSuffix(" %")
         self.spin_subject_percent.setToolTip(
-            "例如 1500×1000 画布设置 80%，主体会等比完整放入 1200×800 的安全框。\n"
-            "无论源图偏大或偏小，都按此占比统一呈现（标准化构图）。"
+            "主体等比完整放入可用区对应比例的安全框；可用区已扣除四边预留。"
         )
         subject_row.addWidget(self.spin_subject_percent)
+        subject_row.addWidget(QLabel("主体位置:"))
+        self.position_grid = _SubjectPositionGrid("center")
+        subject_row.addWidget(self.position_grid, 0, Qt.AlignVCenter)
         subject_row.addWidget(QLabel("细节:"))
         self.combo_detail = QComboBox()
         self.combo_detail.setStyleSheet(config.COMBOBOX_STYLE)
@@ -227,16 +315,15 @@ class TransparentFeatureRoute(QWidget):
         self.combo_detail.addItem("关闭", "off")
         self.combo_detail.setCurrentIndex(0)
         self.combo_detail.setToolTip(
-            "缩小时对颜色通道做轻度锐化以补偿重采样发软；不影响透明边缘。\n"
-            "不能恢复已小于源分辨率而丢失的像素细节。"
+            "缩小时对颜色通道做轻度锐化以补偿重采样发软；不影响透明边缘。"
         )
         subject_row.addWidget(self.combo_detail)
         subject_row.addStretch()
         layout_lay.addLayout(subject_row)
 
         self.lbl_layout_hint = QLabel(
-            "所有图按同一主体占比标准化呈现；源像素只在导出时采样一次。"
-            "画布比源小时会丢细节，源本身偏小时放大也无法凭空变清。"
+            "先从画布扣除四边预留，再按主体大小缩放，并在剩余可用区内对齐。"
+            "左右预留之和、上下预留之和必须分别小于 100%。"
         )
         self.lbl_layout_hint.setWordWrap(True)
         self.lbl_layout_hint.setStyleSheet("color:#8a90b0;font-size:11px;")
@@ -451,7 +538,12 @@ class TransparentFeatureRoute(QWidget):
             "canvas_w": self.spin_cw.value(),
             "canvas_h": self.spin_ch.value(),
             "canvas_color": self.color_btn.get_color(),
+            "reserve_left_percent": self._reserve_spins["left"].value(),
+            "reserve_right_percent": self._reserve_spins["right"].value(),
+            "reserve_top_percent": self._reserve_spins["top"].value(),
+            "reserve_bottom_percent": self._reserve_spins["bottom"].value(),
             "subject_percent": self.spin_subject_percent.value(),
+            "subject_position": self.position_grid.currentData() or "center",
             "detail_restore": self.combo_detail.currentData() or "normal",
             "output_format": self.combo_fmt.currentText(),
         }
@@ -493,7 +585,12 @@ class TransparentFeatureRoute(QWidget):
         self._grp_layout.setChecked(bool(layout_enabled))
         self.spin_cw.setValue(canvas_w)
         self.spin_ch.setValue(canvas_h)
+        for key in ("left", "right", "top", "bottom"):
+            value = int(options.get(f"reserve_{key}_percent", 0) or 0)
+            self._reserve_spins[key].setValue(max(0, min(99, value)))
         self.spin_subject_percent.setValue(max(1, min(100, int(subject_percent or 80))))
+        position = options.get("subject_position", "center")
+        self.position_grid.setCurrentData(position)
         detail = options.get("detail_restore", "normal")
         for i in range(self.combo_detail.count()):
             if self.combo_detail.itemData(i) == detail:

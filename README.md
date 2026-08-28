@@ -10,7 +10,7 @@
 
 ### 主界面
 
-![主页面.png](resources/screenshots/%E4%B8%BB%E9%A1%B5%E9%9D%A2.png)
+![主界面.png](resources/screenshots/主界面.png)
 
 ### 图像处理 — 透明图处理
 

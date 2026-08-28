@@ -32,12 +32,16 @@ class OverlayElement:
 
 
 class TextElement(OverlayElement):
-    """文本元素"""
+    """文本元素。缺少布局字段的旧预设仍按自由坐标绘制。"""
     def __init__(
         self, x=50, y=50, source="fixed", content="",
         font_size=24, font_family="Microsoft YaHei", bold=False,
         color="#FFFFFF", excel_file="", match_column=0, data_column=0,
-        excel_row_start=2, name="",
+        excel_row_start=2, name="", layout_mode="free", anchor="center",
+        margin=0, offset_x=0, offset_y=0, box_width=80,
+        box_width_unit="percent", box_height=0,
+        auto_wrap=True, h_align="center", v_align="center",
+        keep_inside=True, auto_shrink=True, min_font_size=8,
     ):
         super().__init__("text", x, y, name)
         self.source = source
@@ -50,15 +54,134 @@ class TextElement(OverlayElement):
         self.match_column = match_column
         self.data_column = data_column
         self.excel_row_start = excel_row_start
+        self.layout_mode = layout_mode
+        self.anchor = anchor
+        self.margin = margin
+        self.offset_x = offset_x
+        self.offset_y = offset_y
+        self.box_width = box_width
+        self.box_width_unit = box_width_unit
+        self.box_height = box_height
+        self.auto_wrap = auto_wrap
+        self.h_align = h_align
+        self.v_align = v_align
+        self.keep_inside = keep_inside
+        self.auto_shrink = auto_shrink
+        self.min_font_size = min_font_size
 
 
 class ImageElement(OverlayElement):
     """图片元素"""
-    def __init__(self, x=100, y=100, image_path="", width=200, height=200, name=""):
+    def __init__(
+        self, x=100, y=100, image_path="", width=200, height=200, name="",
+        layout_mode="free", anchor="center", margin=0, offset_x=0, offset_y=0,
+        keep_inside=True, shrink_to_fit=True, keep_aspect=True,
+    ):
         super().__init__("image", x, y, name)
         self.image_path = image_path
         self.width = width
         self.height = height
+        self.layout_mode = layout_mode
+        self.anchor = anchor
+        self.margin = margin
+        self.offset_x = offset_x
+        self.offset_y = offset_y
+        self.keep_inside = keep_inside
+        self.shrink_to_fit = shrink_to_fit
+        self.keep_aspect = keep_aspect
+
+
+_ANCHOR_RATIOS = {
+    "top_left": (0.0, 0.0), "top_center": (0.5, 0.0), "top_right": (1.0, 0.0),
+    "center_left": (0.0, 0.5), "center": (0.5, 0.5), "center_right": (1.0, 0.5),
+    "bottom_left": (0.0, 1.0), "bottom_center": (0.5, 1.0), "bottom_right": (1.0, 1.0),
+}
+
+
+def _anchored_position(canvas_size, element_size, anchor, margin=0):
+    """在扣除统一边距的画布安全区中按九宫格定位元素。"""
+    cw, ch = canvas_size
+    ew, eh = element_size
+    margin = max(0, int(margin))
+    left, top = min(margin, cw), min(margin, ch)
+    available_w = max(0, cw - 2 * margin)
+    available_h = max(0, ch - 2 * margin)
+    rx, ry = _ANCHOR_RATIOS.get(anchor, _ANCHOR_RATIOS["center"])
+    return (
+        int(round(left + (available_w - ew) * rx)),
+        int(round(top + (available_h - eh) * ry)),
+    )
+
+
+def _clamp_position(x, y, element_size, canvas_size, margin=0):
+    """尽量把元素完整移入画布；元素大于安全区时贴安全区左上。"""
+    ew, eh = element_size
+    cw, ch = canvas_size
+    margin = max(0, int(margin))
+    min_x, min_y = min(margin, cw), min(margin, ch)
+    max_x = max(min_x, cw - margin - ew)
+    max_y = max(min_y, ch - margin - eh)
+    return min(max(int(x), min_x), max_x), min(max(int(y), min_y), max_y)
+
+
+def _split_wrap_tokens(text):
+    """英文连续串优先作为单词，中文和其他字符按单字符参与换行。"""
+    tokens, word = [], ""
+    for char in text:
+        if char == "\n":
+            if word:
+                tokens.append(word)
+                word = ""
+            tokens.append("\n")
+        elif char.isascii() and (char.isalnum() or char in "_-'./"):
+            word += char
+        else:
+            if word:
+                tokens.append(word)
+                word = ""
+            tokens.append(char)
+    if word:
+        tokens.append(word)
+    return tokens
+
+
+def _wrap_text(draw, text, font, max_width):
+    """按真实字体宽度换行，保留手动换行，超长英文单词退化为逐字符。"""
+    if max_width <= 0:
+        return text.split("\n")
+    lines, current = [], ""
+    for token in _split_wrap_tokens(text):
+        if token == "\n":
+            lines.append(current.rstrip())
+            current = ""
+            continue
+        candidate = current + token
+        if not current or draw.textlength(candidate, font=font) <= max_width:
+            current = candidate
+            continue
+        lines.append(current.rstrip())
+        current = token.lstrip() if token.isspace() else token
+        if draw.textlength(current, font=font) > max_width:
+            fragment = ""
+            for char in current:
+                candidate = fragment + char
+                if fragment and draw.textlength(candidate, font=font) > max_width:
+                    lines.append(fragment)
+                    fragment = char
+                else:
+                    fragment = candidate
+            current = fragment
+    lines.append(current.rstrip())
+    return lines or [""]
+
+
+def _measure_text_block(draw, lines, font, spacing=4, align="left"):
+    """返回 Pillow 实际绘制包围框，包含字体基线、上下留白与行距。"""
+    rendered = "\n".join(lines)
+    bbox = draw.multiline_textbbox(
+        (0, 0), rendered or " ", font=font, spacing=spacing, align=align,
+    )
+    return rendered, bbox, max(0, bbox[2] - bbox[0]), max(1, bbox[3] - bbox[1])
 
 
 class OverlayProcessor(BaseProcessor):
@@ -289,28 +412,82 @@ class OverlayProcessor(BaseProcessor):
                         })
                         continue
                     
-                    # 直接使用像素坐标
                     x = elem_data['x']
                     y = elem_data['y']
-                    
-                    # 获取字体
                     font_family = elem_data.get('font_family', 'Microsoft YaHei')
-                    font_size = elem_data.get('font_size', 24)
+                    requested_font_size = elem_data.get('font_size', 24)
+                    font_size = requested_font_size
                     bold = elem_data.get('bold', False)
-                    font = self._get_font(font_family, font_size, bold)
-                    
-                    # 获取颜色
                     color = hex_to_rgba(elem_data.get('color', '#FFFFFF'))
-                    
-                    # 绘制文本
-                    draw.text((x, y), text_content, fill=color, font=font)
-                    
+                    layout_mode = elem_data.get('layout_mode', 'free')
+
+                    if layout_mode == 'anchor':
+                        margin = elem_data.get('margin', 0)
+                        width_value = elem_data.get('box_width', 80)
+                        if elem_data.get('box_width_unit', 'percent') == 'percent':
+                            box_width = max(1, int(img_width * width_value / 100))
+                        else:
+                            box_width = max(1, int(width_value))
+                        box_width = min(box_width, max(1, img_width - 2 * margin))
+                        available_height = max(1, img_height - 2 * margin)
+                        requested_height = max(0, int(elem_data.get('box_height', 0)))
+                        height_limit = min(requested_height, available_height) if requested_height else available_height
+                        min_font_size = min(font_size, elem_data.get('min_font_size', 8))
+                        overflow = False
+
+                        h_align = elem_data.get('h_align', 'center')
+                        while True:
+                            font = self._get_font(font_family, font_size, bold)
+                            lines = (_wrap_text(draw, text_content, font, box_width)
+                                     if elem_data.get('auto_wrap', True)
+                                     else text_content.split('\n'))
+                            rendered_text, text_bbox, text_width, text_height = _measure_text_block(
+                                draw, lines, font, align=h_align,
+                            )
+                            fits = text_width <= box_width and text_height <= height_limit
+                            if fits or not elem_data.get('auto_shrink', True) or font_size <= min_font_size:
+                                overflow = not fits
+                                break
+                            font_size -= 1
+
+                        box_height = height_limit if requested_height else min(text_height, available_height)
+                        box_size = (box_width, max(1, box_height))
+                        x, y = _anchored_position(
+                            (img_width, img_height), box_size,
+                            elem_data.get('anchor', 'center'), margin,
+                        )
+                        x += int(elem_data.get('offset_x', 0))
+                        y += int(elem_data.get('offset_y', 0))
+                        if elem_data.get('keep_inside', True):
+                            x, y = _clamp_position(
+                                x, y, box_size, (img_width, img_height), margin,
+                            )
+                        vertical_room = box_height - text_height
+                        v_ratio = {'top': 0.0, 'center': 0.5, 'bottom': 1.0}.get(
+                            elem_data.get('v_align', 'center'), 0.5
+                        )
+                        text_top = y + max(0, int(vertical_room * v_ratio))
+                        h_ratio = {'left': 0.0, 'center': 0.5, 'right': 1.0}.get(h_align, 0.5)
+                        text_left = x + max(0, int((box_width - text_width) * h_ratio))
+                        draw.multiline_text(
+                            (text_left - text_bbox[0], text_top - text_bbox[1]),
+                            rendered_text, fill=color, font=font, spacing=4, align=h_align,
+                        )
+                    else:
+                        font = self._get_font(font_family, font_size, bold)
+                        draw.text((x, y), text_content, fill=color, font=font)
+                        overflow = False
+                        box_size = None
+
                     details["overlays"].append({
                         "type": "text",
                         "index": idx,
                         "content": text_content[:30],
                         "font": f"{font_family} {font_size}px",
+                        "requested_font_size": requested_font_size,
                         "position": (x, y),
+                        "box_size": box_size,
+                        "overflow": overflow,
                         "color": elem_data.get('color', '#FFFFFF')
                     })
                 
@@ -320,17 +497,45 @@ class OverlayProcessor(BaseProcessor):
                     if not overlay_path or not os.path.exists(overlay_path):
                         continue
                     
-                    # 直接使用像素坐标和尺寸
                     x = elem_data['x']
                     y = elem_data['y']
                     overlay_w = elem_data['width']
                     overlay_h = elem_data['height']
-                    
-                    # 加载叠加图片
+
                     overlay_img = Image.open(overlay_path).convert("RGBA")
+                    if elem_data.get('layout_mode', 'free') == 'anchor':
+                        margin = elem_data.get('margin', 0)
+                        available_w = max(1, img_width - 2 * margin)
+                        available_h = max(1, img_height - 2 * margin)
+                        if elem_data.get('keep_aspect', True):
+                            source_ratio = overlay_img.width / max(1, overlay_img.height)
+                            if overlay_w <= 0 and overlay_h > 0:
+                                overlay_w = max(1, int(round(overlay_h * source_ratio)))
+                            elif overlay_h <= 0 and overlay_w > 0:
+                                overlay_h = max(1, int(round(overlay_w / source_ratio)))
+                            elif overlay_w > 0 and overlay_h > 0:
+                                scale = min(overlay_w / overlay_img.width, overlay_h / overlay_img.height)
+                                overlay_w = max(1, int(round(overlay_img.width * scale)))
+                                overlay_h = max(1, int(round(overlay_img.height * scale)))
+                        if elem_data.get('shrink_to_fit', True) and (
+                            overlay_w > available_w or overlay_h > available_h
+                        ):
+                            scale = min(available_w / overlay_w, available_h / overlay_h)
+                            overlay_w = max(1, int(round(overlay_w * scale)))
+                            overlay_h = max(1, int(round(overlay_h * scale)))
+                        x, y = _anchored_position(
+                            (img_width, img_height), (overlay_w, overlay_h),
+                            elem_data.get('anchor', 'center'), margin,
+                        )
+                        x += int(elem_data.get('offset_x', 0))
+                        y += int(elem_data.get('offset_y', 0))
+                        if elem_data.get('keep_inside', True):
+                            x, y = _clamp_position(
+                                x, y, (overlay_w, overlay_h),
+                                (img_width, img_height), margin,
+                            )
+
                     overlay_img = overlay_img.resize((overlay_w, overlay_h), Image.LANCZOS)
-                    
-                    # 粘贴到目标位置
                     img.paste(overlay_img, (x, y), overlay_img)
                     
                     # 关闭叠加图片释放内存

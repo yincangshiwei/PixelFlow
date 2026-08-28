@@ -1,5 +1,7 @@
 """P4：各 FeatureService 校验 / 默认值 / Processor 纯化（无 QWidget）。"""
+import tempfile
 import unittest
+from pathlib import Path
 
 from services.features.metadata_service import MetadataService, default_metadata_options
 from services.features.overlay_service import OverlayService, default_overlay_options
@@ -86,6 +88,99 @@ class TestOverlayService(unittest.TestCase):
         out, details = OverlayProcessor().process(img, {"elements": [], "custom_fonts": {}})
         self.assertEqual(out.size, (8, 8))
         self.assertIn("summary", details)
+
+    def test_legacy_overlay_defaults_to_free_layout(self):
+        result = self.svc.validate_and_normalize({"elements": [{
+            "type": "text", "source": "fixed", "content": "legacy",
+            "x": 17, "y": 29,
+        }]})
+        element = result.value["elements"][0]
+        self.assertEqual(element["layout_mode"], "free")
+        self.assertEqual((element["x"], element["y"]), (17, 29))
+
+    def test_smart_layout_normalization(self):
+        result = self.svc.validate_and_normalize({"elements": [{
+            "type": "text", "layout_mode": "bad", "anchor": "bad",
+            "box_width_unit": "percent", "box_width": 500,
+            "offset_x": "-12", "offset_y": "bad",
+            "auto_wrap": "false", "h_align": "bad", "v_align": "bottom",
+            "font_size": 20, "min_font_size": 100,
+        }, {
+            "type": "image", "layout_mode": "anchor", "anchor": "bottom_right",
+            "keep_aspect": "false", "shrink_to_fit": "true",
+        }]})
+        text, image = result.value["elements"]
+        self.assertEqual(text["layout_mode"], "free")
+        self.assertEqual(text["anchor"], "center")
+        self.assertEqual(text["box_width"], 100)
+        self.assertEqual(text["offset_x"], -12)
+        self.assertEqual(text["offset_y"], 0)
+        self.assertFalse(text["auto_wrap"])
+        self.assertEqual(text["h_align"], "center")
+        self.assertEqual(text["min_font_size"], 20)
+        self.assertEqual(image["anchor"], "bottom_right")
+        self.assertFalse(image["keep_aspect"])
+        self.assertTrue(image["shrink_to_fit"])
+
+    def test_text_anchor_wrap_center_and_stay_inside(self):
+        from PIL import Image
+        img = Image.new("RGBA", (240, 120), (0, 0, 0, 0))
+        options = self.svc.build_run_options({"elements": [{
+            "type": "text", "source": "fixed",
+            "content": "中文自动换行 English automatic wrapping",
+            "font_family": "Microsoft YaHei", "font_size": 28,
+            "color": "#FFFFFF", "x": 999, "y": 999,
+            "layout_mode": "anchor", "anchor": "bottom_center", "margin": 8,
+            "box_width": 50, "box_width_unit": "percent", "box_height": 50,
+            "auto_wrap": True, "h_align": "center", "v_align": "bottom",
+            "keep_inside": True, "auto_shrink": True, "min_font_size": 8,
+        }]})
+        out, details = OverlayProcessor().process(img, options)
+        overlay = details["overlays"][0]
+        x, y = overlay["position"]
+        width, height = overlay["box_size"]
+        self.assertEqual(x, (240 - width) // 2)
+        self.assertGreaterEqual(y, 8)
+        self.assertLessEqual(y + height, 112)
+        self.assertLessEqual(overlay["requested_font_size"], 28)
+        alpha_bbox = out.getchannel("A").getbbox()
+        self.assertIsNotNone(alpha_bbox)
+        self.assertGreaterEqual(alpha_bbox[0], 8)
+        self.assertGreaterEqual(alpha_bbox[1], 8)
+        self.assertLessEqual(alpha_bbox[2], 232)
+        self.assertLessEqual(alpha_bbox[3], 112)
+
+    def test_text_anchor_applies_offset(self):
+        from PIL import Image
+        img = Image.new("RGBA", (200, 100), (0, 0, 0, 0))
+        options = self.svc.build_run_options({"elements": [{
+            "type": "text", "source": "fixed", "content": "微调",
+            "font_size": 20, "color": "#FFFFFF", "layout_mode": "anchor",
+            "anchor": "center", "box_width": 80, "box_width_unit": "px",
+            "offset_x": -15, "offset_y": -10, "keep_inside": True,
+        }]})
+        _, details = OverlayProcessor().process(img, options)
+        x, y = details["overlays"][0]["position"]
+        self.assertEqual(x, 45)
+        self.assertLess(y, 50)
+
+    def test_image_anchor_and_oversize_fit(self):
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as tmp:
+            overlay_path = Path(tmp) / "overlay.png"
+            Image.new("RGBA", (400, 200), (255, 0, 0, 255)).save(overlay_path)
+            img = Image.new("RGBA", (100, 80), (0, 0, 0, 0))
+            options = self.svc.build_run_options({"elements": [{
+                "type": "image", "image_path": str(overlay_path),
+                "x": 999, "y": 999, "width": 400, "height": 200,
+                "layout_mode": "anchor", "anchor": "bottom_right", "margin": 10,
+                "offset_x": -6, "offset_y": -8,
+                "keep_inside": True, "shrink_to_fit": True, "keep_aspect": True,
+            }]})
+            _, details = OverlayProcessor().process(img, options)
+            overlay = details["overlays"][0]
+            self.assertEqual(overlay["size"], (80, 40))
+            self.assertEqual(overlay["position"], (10, 22))
 
 
 class TestImg2DocService(unittest.TestCase):

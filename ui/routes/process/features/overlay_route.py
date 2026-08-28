@@ -39,16 +39,19 @@ class ElementListItem(QListWidgetItem):
 
 
 class GridPositionWidget(QWidget):
-    """3x3 宫格坐标定位器 — 点击格点自动填充 X/Y 坐标值"""
+    """3x3 宫格定位器：自由模式写入坐标，锚定模式保存动态布局规则。"""
 
     CELLS = [
-        ("↖", 0.0, 0.0), ("↑", 0.5, 0.0), ("↗", 1.0, 0.0),
-        ("←", 0.0, 0.5), ("⊙", 0.5, 0.5), ("→", 1.0, 0.5),
-        ("↙", 0.0, 1.0), ("↓", 0.5, 1.0), ("↘", 1.0, 1.0),
+        ("↖", 0.0, 0.0, "top_left"), ("↑", 0.5, 0.0, "top_center"),
+        ("↗", 1.0, 0.0, "top_right"), ("←", 0.0, 0.5, "center_left"),
+        ("⊙", 0.5, 0.5, "center"), ("→", 1.0, 0.5, "center_right"),
+        ("↙", 0.0, 1.0, "bottom_left"), ("↓", 0.5, 1.0, "bottom_center"),
+        ("↘", 1.0, 1.0, "bottom_right"),
     ]
 
     def __init__(self, x_spin, y_spin, size_provider, element_type="text",
-                 overlay_w_spin=None, overlay_h_spin=None, parent=None):
+                 overlay_w_spin=None, overlay_h_spin=None, anchor="center",
+                 anchor_changed=None, anchor_mode=None, parent=None):
         super().__init__(parent)
         self._x_spin = x_spin
         self._y_spin = y_spin
@@ -56,7 +59,12 @@ class GridPositionWidget(QWidget):
         self._element_type = element_type
         self._overlay_w_spin = overlay_w_spin
         self._overlay_h_spin = overlay_h_spin
+        self._anchor_changed = anchor_changed
+        self._anchor_mode = anchor_mode
         self._hovered_cell = -1
+        self._selected_cell = next(
+            (i for i, cell in enumerate(self.CELLS) if cell[3] == anchor), 4
+        )
         self.setFixedSize(90, 90)
         self.setMouseTracking(True)
         self.setCursor(Qt.PointingHandCursor)
@@ -84,7 +92,13 @@ class GridPositionWidget(QWidget):
     def _apply_position(self, cell_idx):
         if cell_idx < 0:
             return
-        _, x_ratio, y_ratio = self.CELLS[cell_idx]
+        _, x_ratio, y_ratio, anchor = self.CELLS[cell_idx]
+        self._selected_cell = cell_idx
+        if self._anchor_changed:
+            self._anchor_changed(anchor)
+        if self._anchor_mode and self._anchor_mode():
+            self.update()
+            return
         bw, bh = self._get_base_size()
         if self._element_type == "image" and self._overlay_w_spin and self._overlay_h_spin:
             ow = self._overlay_w_spin.value()
@@ -96,6 +110,7 @@ class GridPositionWidget(QWidget):
             y = int(bh * y_ratio)
         self._x_spin.setValue(max(0, x))
         self._y_spin.setValue(max(0, y))
+        self.update()
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -103,10 +118,13 @@ class GridPositionWidget(QWidget):
         w, h = self.width(), self.height()
         cw, ch = w / 3.0, h / 3.0
         p.fillRect(self.rect(), QColor(22, 22, 40, 180))
-        for i, (sym, _, _) in enumerate(self.CELLS):
+        for i, (sym, _, _, _) in enumerate(self.CELLS):
             r, c = divmod(i, 3)
             rect = QRectF(c * cw + 1, r * ch + 1, cw - 2, ch - 2)
-            if i == self._hovered_cell:
+            if i == self._selected_cell:
+                p.setBrush(QBrush(QColor(91, 138, 245, 130)))
+                p.setPen(QPen(QColor(124, 108, 245, 230), 2))
+            elif i == self._hovered_cell:
                 p.setBrush(QBrush(QColor(91, 138, 245, 80)))
                 p.setPen(QPen(QColor(91, 138, 245, 180), 1.5))
             else:
@@ -268,7 +286,7 @@ class OverlayFeatureRoute(QWidget):
         # 根据已有元素数量计算默认位置，避免重叠
         text_count = sum(1 for e in self._elements if e.element_type == 'text')
         default_y = 50 + (text_count * 50)  # 依次向下排列，避免重叠
-        element = TextElement(x=50, y=default_y)
+        element = TextElement(x=50, y=default_y, layout_mode="anchor", anchor="center")
         self._elements.append(element)
         item = ElementListItem(element, len(self._elements) - 1)
         self._list_widget.addItem(item)
@@ -279,7 +297,7 @@ class OverlayFeatureRoute(QWidget):
         # 根据已有元素数量计算默认位置，避免重叠
         img_count = sum(1 for e in self._elements if e.element_type == 'image')
         default_y = 100 + (img_count * 250)  # 依次向下排列
-        element = ImageElement(x=100, y=default_y)
+        element = ImageElement(x=100, y=default_y, layout_mode="anchor", anchor="center")
         self._elements.append(element)
         item = ElementListItem(element, len(self._elements) - 1)
         self._list_widget.addItem(item)
@@ -387,10 +405,17 @@ class OverlayFeatureRoute(QWidget):
             '_widget_excel', '_widget_filename_hint', '_text_content',
             '_excel_file_input', '_excel_match_column', '_excel_data_column',
             '_excel_row_start',
-            '_font_family', '_font_size', '_chk_bold', 
+            '_font_family', '_font_size', '_chk_bold',
             '_text_color_btn', '_text_color_lbl', '_text_x', '_text_y',
-            '_image_file_input', '_image_x', '_image_y', 
-            '_image_width', '_image_height'
+            '_text_layout_mode', '_text_margin', '_text_offset_x', '_text_offset_y',
+            '_text_box_width', '_text_box_width_unit', '_text_box_height', '_text_auto_wrap',
+            '_text_h_align', '_text_v_align', '_text_keep_inside',
+            '_text_auto_shrink', '_text_min_font_size',
+            '_image_file_input', '_image_x', '_image_y',
+            '_image_width', '_image_height', '_image_layout_mode',
+            '_image_margin', '_image_offset_x', '_image_offset_y',
+            '_image_keep_inside', '_image_shrink_to_fit',
+            '_image_keep_aspect'
         ]
         for attr in attrs_to_clear:
             if hasattr(self, attr):
@@ -509,6 +534,9 @@ class OverlayFeatureRoute(QWidget):
         # 常用字体列表（中文字体优先）
         fonts = ['Microsoft YaHei', 'SimHei', 'SimSun', 'KaiTi', 'FangSong', 'Arial', 'Times New Roman']
         self._font_family.addItems(fonts)
+        for font_name in self._custom_fonts:
+            if self._font_family.findText(font_name) < 0:
+                self._font_family.addItem(font_name)
         idx = self._font_family.findText(element.font_family)
         if idx >= 0:
             self._font_family.setCurrentIndex(idx)
@@ -554,35 +582,143 @@ class OverlayFeatureRoute(QWidget):
         page_layout.addLayout(color_layout)
         self._refresh_text_color_btn(element.color)
 
-        # 位置设置
-        pos_layout = QHBoxLayout()
+        # 文本框布局
+        layout_row = QHBoxLayout()
+        layout_row.addWidget(QLabel("定位方式:"))
+        self._text_layout_mode = QComboBox()
+        self._text_layout_mode.addItem("自由坐标", "free")
+        self._text_layout_mode.addItem("九宫格锚定", "anchor")
+        self._text_layout_mode.setCurrentIndex(
+            max(0, self._text_layout_mode.findData(element.layout_mode))
+        )
+        self._text_layout_mode.setStyleSheet(config.COMBOBOX_STYLE)
+        layout_row.addWidget(self._text_layout_mode)
+        layout_row.addWidget(QLabel("边距(px):"))
+        self._text_margin = QSpinBox()
+        self._text_margin.setRange(0, 99999)
+        self._text_margin.setValue(element.margin)
+        layout_row.addWidget(self._text_margin)
+        self._text_keep_inside = QCheckBox("限制在画布内")
+        self._text_keep_inside.setChecked(element.keep_inside)
+        layout_row.addWidget(self._text_keep_inside)
+        layout_row.addStretch()
+        page_layout.addLayout(layout_row)
 
-        # 先创建坐标 SpinBox（供后续宫格引用）
+        box_row = QHBoxLayout()
+        box_row.addWidget(QLabel("文本框宽度:"))
+        self._text_box_width = QSpinBox()
+        self._text_box_width.setRange(1, 99999)
+        self._text_box_width.setValue(element.box_width)
+        box_row.addWidget(self._text_box_width)
+        self._text_box_width_unit = QComboBox()
+        self._text_box_width_unit.addItem("画布百分比", "percent")
+        self._text_box_width_unit.addItem("像素", "px")
+        self._text_box_width_unit.setCurrentIndex(
+            max(0, self._text_box_width_unit.findData(element.box_width_unit))
+        )
+        self._text_box_width_unit.setStyleSheet(config.COMBOBOX_STYLE)
+        box_row.addWidget(self._text_box_width_unit)
+        box_row.addWidget(QLabel("高度(px):"))
+        self._text_box_height = QSpinBox()
+        self._text_box_height.setRange(0, 99999)
+        self._text_box_height.setValue(element.box_height)
+        self._text_box_height.setSpecialValueText("自动")
+        box_row.addWidget(self._text_box_height)
+        self._text_auto_wrap = QCheckBox("自动换行")
+        self._text_auto_wrap.setChecked(element.auto_wrap)
+        box_row.addWidget(self._text_auto_wrap)
+        box_row.addStretch()
+        page_layout.addLayout(box_row)
+
+        align_row = QHBoxLayout()
+        align_row.addWidget(QLabel("水平对齐:"))
+        self._text_h_align = QComboBox()
+        for label, value in (("左对齐", "left"), ("居中", "center"), ("右对齐", "right")):
+            self._text_h_align.addItem(label, value)
+        self._text_h_align.setCurrentIndex(max(0, self._text_h_align.findData(element.h_align)))
+        self._text_h_align.setStyleSheet(config.COMBOBOX_STYLE)
+        align_row.addWidget(self._text_h_align)
+        align_row.addWidget(QLabel("垂直对齐:"))
+        self._text_v_align = QComboBox()
+        for label, value in (("顶部", "top"), ("居中", "center"), ("底部", "bottom")):
+            self._text_v_align.addItem(label, value)
+        self._text_v_align.setCurrentIndex(max(0, self._text_v_align.findData(element.v_align)))
+        self._text_v_align.setStyleSheet(config.COMBOBOX_STYLE)
+        align_row.addWidget(self._text_v_align)
+        self._text_auto_shrink = QCheckBox("溢出时缩小字号")
+        self._text_auto_shrink.setChecked(element.auto_shrink)
+        align_row.addWidget(self._text_auto_shrink)
+        align_row.addWidget(QLabel("最小字号:"))
+        self._text_min_font_size = QSpinBox()
+        self._text_min_font_size.setRange(8, 200)
+        self._text_min_font_size.setValue(element.min_font_size)
+        align_row.addWidget(self._text_min_font_size)
+        align_row.addStretch()
+        page_layout.addLayout(align_row)
+
+        pos_layout = QHBoxLayout()
         self._text_x = QSpinBox()
         self._text_x.setRange(0, 99999)
         self._text_x.setValue(element.x)
-        self._text_x.setToolTip("相对于图片左上角的X坐标（像素值）")
-
         self._text_y = QSpinBox()
         self._text_y.setRange(0, 99999)
         self._text_y.setValue(element.y)
-        self._text_y.setToolTip("相对于图片左上角的Y坐标（像素值）")
-
-        pos_layout.addWidget(QLabel("X坐标(px):"))
+        self._text_x_label = QLabel("X坐标(px):")
+        self._text_y_label = QLabel("Y坐标(px):")
+        self._text_offset_x = QSpinBox()
+        self._text_offset_x.setRange(-99999, 99999)
+        self._text_offset_x.setValue(element.offset_x)
+        self._text_offset_x.setSuffix(" px")
+        self._text_offset_x.setToolTip("正值向右，负值向左")
+        self._text_offset_y = QSpinBox()
+        self._text_offset_y.setRange(-99999, 99999)
+        self._text_offset_y.setValue(element.offset_y)
+        self._text_offset_y.setSuffix(" px")
+        self._text_offset_y.setToolTip("正值向下，负值向上")
+        self._text_offset_x_label = QLabel("水平偏移:")
+        self._text_offset_y_label = QLabel("垂直偏移:")
+        pos_layout.addWidget(self._text_x_label)
         pos_layout.addWidget(self._text_x)
-        pos_layout.addWidget(QLabel("Y坐标(px):"))
+        pos_layout.addWidget(self._text_y_label)
         pos_layout.addWidget(self._text_y)
+        pos_layout.addWidget(self._text_offset_x_label)
+        pos_layout.addWidget(self._text_offset_x)
+        pos_layout.addWidget(self._text_offset_y_label)
+        pos_layout.addWidget(self._text_offset_y)
         pos_layout.addSpacing(8)
-        # 宫格坐标定位器
         grid = GridPositionWidget(
             x_spin=self._text_x,
             y_spin=self._text_y,
             size_provider=self._base_size,
             element_type='text',
+            anchor=element.anchor,
+            anchor_changed=lambda value: setattr(element, 'anchor', value),
+            anchor_mode=lambda: self._text_layout_mode.currentData() == 'anchor',
         )
         pos_layout.addWidget(grid)
         pos_layout.addStretch()
         page_layout.addLayout(pos_layout)
+
+        def _update_text_layout_controls():
+            anchored = self._text_layout_mode.currentData() == 'anchor'
+            for control in (
+                self._text_x_label, self._text_x, self._text_y_label, self._text_y,
+            ):
+                control.setVisible(not anchored)
+            for control in (
+                self._text_offset_x_label, self._text_offset_x,
+                self._text_offset_y_label, self._text_offset_y,
+            ):
+                control.setVisible(anchored)
+            for control in (
+                self._text_margin, self._text_box_width, self._text_box_width_unit,
+                self._text_box_height, self._text_auto_wrap, self._text_h_align,
+                self._text_v_align, self._text_keep_inside, self._text_auto_shrink,
+                self._text_min_font_size,
+            ):
+                control.setEnabled(anchored)
+        self._text_layout_mode.currentIndexChanged.connect(_update_text_layout_controls)
+        _update_text_layout_controls()
 
         # 保存引用用于收集参数
         self._current_element = element
@@ -630,12 +766,50 @@ class OverlayFeatureRoute(QWidget):
         self._image_height.setValue(element.height)
         self._image_height.setToolTip("叠加图片的高度（像素值）")
 
-        # 位置设置（宫格在行尾）
+        layout_row = QHBoxLayout()
+        layout_row.addWidget(QLabel("定位方式:"))
+        self._image_layout_mode = QComboBox()
+        self._image_layout_mode.addItem("自由坐标", "free")
+        self._image_layout_mode.addItem("九宫格锚定", "anchor")
+        self._image_layout_mode.setCurrentIndex(
+            max(0, self._image_layout_mode.findData(element.layout_mode))
+        )
+        self._image_layout_mode.setStyleSheet(config.COMBOBOX_STYLE)
+        layout_row.addWidget(self._image_layout_mode)
+        layout_row.addWidget(QLabel("边距(px):"))
+        self._image_margin = QSpinBox()
+        self._image_margin.setRange(0, 99999)
+        self._image_margin.setValue(element.margin)
+        layout_row.addWidget(self._image_margin)
+        self._image_keep_inside = QCheckBox("限制在画布内")
+        self._image_keep_inside.setChecked(element.keep_inside)
+        layout_row.addWidget(self._image_keep_inside)
+        layout_row.addStretch()
+        page_layout.addLayout(layout_row)
+
         pos_layout = QHBoxLayout()
-        pos_layout.addWidget(QLabel("X坐标(px):"))
+        self._image_x_label = QLabel("X坐标(px):")
+        self._image_y_label = QLabel("Y坐标(px):")
+        self._image_offset_x = QSpinBox()
+        self._image_offset_x.setRange(-99999, 99999)
+        self._image_offset_x.setValue(element.offset_x)
+        self._image_offset_x.setSuffix(" px")
+        self._image_offset_x.setToolTip("正值向右，负值向左")
+        self._image_offset_y = QSpinBox()
+        self._image_offset_y.setRange(-99999, 99999)
+        self._image_offset_y.setValue(element.offset_y)
+        self._image_offset_y.setSuffix(" px")
+        self._image_offset_y.setToolTip("正值向下，负值向上")
+        self._image_offset_x_label = QLabel("水平偏移:")
+        self._image_offset_y_label = QLabel("垂直偏移:")
+        pos_layout.addWidget(self._image_x_label)
         pos_layout.addWidget(self._image_x)
-        pos_layout.addWidget(QLabel("Y坐标(px):"))
+        pos_layout.addWidget(self._image_y_label)
         pos_layout.addWidget(self._image_y)
+        pos_layout.addWidget(self._image_offset_x_label)
+        pos_layout.addWidget(self._image_offset_x)
+        pos_layout.addWidget(self._image_offset_y_label)
+        pos_layout.addWidget(self._image_offset_y)
         pos_layout.addSpacing(8)
         grid = GridPositionWidget(
             x_spin=self._image_x,
@@ -644,19 +818,46 @@ class OverlayFeatureRoute(QWidget):
             element_type='image',
             overlay_w_spin=self._image_width,
             overlay_h_spin=self._image_height,
+            anchor=element.anchor,
+            anchor_changed=lambda value: setattr(element, 'anchor', value),
+            anchor_mode=lambda: self._image_layout_mode.currentData() == 'anchor',
         )
         pos_layout.addWidget(grid)
         pos_layout.addStretch()
         page_layout.addLayout(pos_layout)
 
-        # 大小设置
         size_layout = QHBoxLayout()
         size_layout.addWidget(QLabel("宽度(px):"))
         size_layout.addWidget(self._image_width)
         size_layout.addWidget(QLabel("高度(px):"))
         size_layout.addWidget(self._image_height)
+        self._image_keep_aspect = QCheckBox("保持比例")
+        self._image_keep_aspect.setChecked(element.keep_aspect)
+        size_layout.addWidget(self._image_keep_aspect)
+        self._image_shrink_to_fit = QCheckBox("超出画布自动缩小")
+        self._image_shrink_to_fit.setChecked(element.shrink_to_fit)
+        size_layout.addWidget(self._image_shrink_to_fit)
         size_layout.addStretch()
         page_layout.addLayout(size_layout)
+
+        def _update_image_layout_controls():
+            anchored = self._image_layout_mode.currentData() == 'anchor'
+            for control in (
+                self._image_x_label, self._image_x, self._image_y_label, self._image_y,
+            ):
+                control.setVisible(not anchored)
+            for control in (
+                self._image_offset_x_label, self._image_offset_x,
+                self._image_offset_y_label, self._image_offset_y,
+            ):
+                control.setVisible(anchored)
+            for control in (
+                self._image_margin, self._image_keep_inside,
+                self._image_keep_aspect, self._image_shrink_to_fit,
+            ):
+                control.setEnabled(anchored)
+        self._image_layout_mode.currentIndexChanged.connect(_update_image_layout_controls)
+        _update_image_layout_controls()
 
         self._current_element = element
         
@@ -728,6 +929,20 @@ class OverlayFeatureRoute(QWidget):
                 element.x = self._text_x.value()
             if hasattr(self, '_text_y'):
                 element.y = self._text_y.value()
+            if hasattr(self, '_text_layout_mode'):
+                element.layout_mode = self._text_layout_mode.currentData()
+                element.margin = self._text_margin.value()
+                element.offset_x = self._text_offset_x.value()
+                element.offset_y = self._text_offset_y.value()
+                element.box_width = self._text_box_width.value()
+                element.box_width_unit = self._text_box_width_unit.currentData()
+                element.box_height = self._text_box_height.value()
+                element.auto_wrap = self._text_auto_wrap.isChecked()
+                element.h_align = self._text_h_align.currentData()
+                element.v_align = self._text_v_align.currentData()
+                element.keep_inside = self._text_keep_inside.isChecked()
+                element.auto_shrink = self._text_auto_shrink.isChecked()
+                element.min_font_size = self._text_min_font_size.value()
         else:
             if hasattr(self, '_image_file_input'):
                 element.image_path = self._image_file_input.text()
@@ -739,6 +954,14 @@ class OverlayFeatureRoute(QWidget):
                 element.width = self._image_width.value()
             if hasattr(self, '_image_height'):
                 element.height = self._image_height.value()
+            if hasattr(self, '_image_layout_mode'):
+                element.layout_mode = self._image_layout_mode.currentData()
+                element.margin = self._image_margin.value()
+                element.offset_x = self._image_offset_x.value()
+                element.offset_y = self._image_offset_y.value()
+                element.keep_inside = self._image_keep_inside.isChecked()
+                element.shrink_to_fit = self._image_shrink_to_fit.isChecked()
+                element.keep_aspect = self._image_keep_aspect.isChecked()
 
     def collect_raw_state(self) -> dict[str, Any]:
         """收集所有参数"""
@@ -764,6 +987,20 @@ class OverlayFeatureRoute(QWidget):
                     'match_column': elem.match_column,
                     'data_column': elem.data_column,
                     'excel_row_start': elem.excel_row_start,
+                    'layout_mode': elem.layout_mode,
+                    'anchor': elem.anchor,
+                    'margin': elem.margin,
+                    'offset_x': elem.offset_x,
+                    'offset_y': elem.offset_y,
+                    'box_width': elem.box_width,
+                    'box_width_unit': elem.box_width_unit,
+                    'box_height': elem.box_height,
+                    'auto_wrap': elem.auto_wrap,
+                    'h_align': elem.h_align,
+                    'v_align': elem.v_align,
+                    'keep_inside': elem.keep_inside,
+                    'auto_shrink': elem.auto_shrink,
+                    'min_font_size': elem.min_font_size,
                 })
             else:
                 elements_data.append({
@@ -774,6 +1011,14 @@ class OverlayFeatureRoute(QWidget):
                     'y': elem.y,
                     'width': elem.width,
                     'height': elem.height,
+                    'layout_mode': elem.layout_mode,
+                    'anchor': elem.anchor,
+                    'margin': elem.margin,
+                    'offset_x': elem.offset_x,
+                    'offset_y': elem.offset_y,
+                    'keep_inside': elem.keep_inside,
+                    'shrink_to_fit': elem.shrink_to_fit,
+                    'keep_aspect': elem.keep_aspect,
                 })
         
         # 收集自定义字体信息
@@ -821,6 +1066,20 @@ class OverlayFeatureRoute(QWidget):
                     match_column=data.get('match_column', 1),
                     data_column=data.get('data_column', 2),
                     excel_row_start=data.get('excel_row_start', 2),
+                    layout_mode=data.get('layout_mode', 'free'),
+                    anchor=data.get('anchor', 'center'),
+                    margin=data.get('margin', 0),
+                    offset_x=data.get('offset_x', 0),
+                    offset_y=data.get('offset_y', 0),
+                    box_width=data.get('box_width', 80),
+                    box_width_unit=data.get('box_width_unit', 'percent'),
+                    box_height=data.get('box_height', 0),
+                    auto_wrap=data.get('auto_wrap', True),
+                    h_align=data.get('h_align', 'center'),
+                    v_align=data.get('v_align', 'center'),
+                    keep_inside=data.get('keep_inside', True),
+                    auto_shrink=data.get('auto_shrink', True),
+                    min_font_size=data.get('min_font_size', 8),
                 )
             else:
                 element = ImageElement(
@@ -830,6 +1089,14 @@ class OverlayFeatureRoute(QWidget):
                     name=data.get('name', ''),
                     width=data.get('width', 200),
                     height=data.get('height', 200),
+                    layout_mode=data.get('layout_mode', 'free'),
+                    anchor=data.get('anchor', 'center'),
+                    margin=data.get('margin', 0),
+                    offset_x=data.get('offset_x', 0),
+                    offset_y=data.get('offset_y', 0),
+                    keep_inside=data.get('keep_inside', True),
+                    shrink_to_fit=data.get('shrink_to_fit', True),
+                    keep_aspect=data.get('keep_aspect', True),
                 )
             
             self._elements.append(element)
@@ -841,15 +1108,8 @@ class OverlayFeatureRoute(QWidget):
         idx = ['png', 'webp', 'jpg'].index(fmt) if fmt in ['png', 'webp', 'jpg'] else 0
         self.combo_fmt.setCurrentIndex(idx)
         
-        # 恢复自定义字体
-        custom_fonts = options.get('custom_fonts', {})
-        if custom_fonts:
-            self._custom_fonts = custom_fonts
-            # 将自定义字体添加到字体下拉框中
-            existing_fonts = [self._font_family.itemText(i) for i in range(self._font_family.count())]
-            for font_name in custom_fonts.keys():
-                if font_name not in existing_fonts:
-                    self._font_family.addItem(font_name)
+        # 字体下拉框在选中文本元素时才创建，此处仅恢复映射。
+        self._custom_fonts = dict(options.get('custom_fonts', {}) or {})
 
     def _load_font(self):
         """加载外部字体文件"""

@@ -15,6 +15,46 @@ FEATURE_DESCRIPTION = "在图片上叠加文本和图片元素，支持Excel数�
 
 _VALID_FORMATS = frozenset({"png", "webp", "jpg", "jpeg"})
 _VALID_SOURCES = frozenset({"fixed", "excel", "filename"})
+_VALID_LAYOUT_MODES = frozenset({"free", "anchor"})
+_VALID_ANCHORS = frozenset({
+    "top_left", "top_center", "top_right", "center_left", "center",
+    "center_right", "bottom_left", "bottom_center", "bottom_right",
+})
+_VALID_WIDTH_UNITS = frozenset({"px", "percent"})
+_VALID_H_ALIGN = frozenset({"left", "center", "right"})
+_VALID_V_ALIGN = frozenset({"top", "center", "bottom"})
+
+
+def _enum(value, allowed, default):
+    value = str(value or default).lower()
+    return value if value in allowed else default
+
+
+def _integer(value, default, minimum=None, maximum=None):
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        result = default
+    if minimum is not None:
+        result = max(minimum, result)
+    if maximum is not None:
+        result = min(maximum, result)
+    return result
+
+
+def _boolean(value, default=True):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+    return default
+
 
 __all__ = [
     "FEATURE_ID", "FEATURE_NAME", "FEATURE_ICON", "FEATURE_DESCRIPTION",
@@ -99,28 +139,39 @@ class OverlayService:
                 continue
             item = dict(el)
             item["type"] = et
+            item["layout_mode"] = _enum(
+                item.get("layout_mode"), _VALID_LAYOUT_MODES, "free"
+            )
+            item["anchor"] = _enum(item.get("anchor"), _VALID_ANCHORS, "center")
+            item["margin"] = _integer(item.get("margin", 0), 0, 0, 99999)
+            item["offset_x"] = _integer(item.get("offset_x", 0), 0, -99999, 99999)
+            item["offset_y"] = _integer(item.get("offset_y", 0), 0, -99999, 99999)
+            item["keep_inside"] = _boolean(item.get("keep_inside", True))
             if et == "text":
-                src = str(item.get("source", "fixed") or "fixed").lower()
-                if src not in _VALID_SOURCES:
-                    src = "fixed"
-                item["source"] = src
-                try:
-                    item["font_size"] = max(8, min(200, int(item.get("font_size", 24))))
-                except (TypeError, ValueError):
-                    item["font_size"] = 24
-                try:
-                    item["x"] = int(item.get("x", 50))
-                    item["y"] = int(item.get("y", 50))
-                except (TypeError, ValueError):
-                    item["x"], item["y"] = 50, 50
+                item["source"] = _enum(item.get("source"), _VALID_SOURCES, "fixed")
+                item["font_size"] = _integer(item.get("font_size", 24), 24, 8, 200)
+                item["x"] = _integer(item.get("x", 50), 50)
+                item["y"] = _integer(item.get("y", 50), 50)
+                item["box_width_unit"] = _enum(
+                    item.get("box_width_unit"), _VALID_WIDTH_UNITS, "percent"
+                )
+                width_max = 100 if item["box_width_unit"] == "percent" else 99999
+                item["box_width"] = _integer(item.get("box_width", 80), 80, 1, width_max)
+                item["box_height"] = _integer(item.get("box_height", 0), 0, 0, 99999)
+                item["auto_wrap"] = _boolean(item.get("auto_wrap", True))
+                item["h_align"] = _enum(item.get("h_align"), _VALID_H_ALIGN, "center")
+                item["v_align"] = _enum(item.get("v_align"), _VALID_V_ALIGN, "center")
+                item["auto_shrink"] = _boolean(item.get("auto_shrink", True))
+                item["min_font_size"] = _integer(
+                    item.get("min_font_size", 8), 8, 8, item["font_size"]
+                )
             else:
-                try:
-                    item["x"] = int(item.get("x", 100))
-                    item["y"] = int(item.get("y", 100))
-                    item["width"] = max(1, int(item.get("width", 200)))
-                    item["height"] = max(1, int(item.get("height", 200)))
-                except (TypeError, ValueError):
-                    item.update({"x": 100, "y": 100, "width": 200, "height": 200})
+                item["x"] = _integer(item.get("x", 100), 100)
+                item["y"] = _integer(item.get("y", 100), 100)
+                item["width"] = _integer(item.get("width", 200), 200, 1, 99999)
+                item["height"] = _integer(item.get("height", 200), 200, 1, 99999)
+                item["shrink_to_fit"] = _boolean(item.get("shrink_to_fit", True))
+                item["keep_aspect"] = _boolean(item.get("keep_aspect", True))
             elements_out.append(item)
 
         custom_fonts = raw_state.get("custom_fonts") or {}

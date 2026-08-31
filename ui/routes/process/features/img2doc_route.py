@@ -274,6 +274,91 @@ class Img2DocFeatureRoute(QWidget):
         l_row2.addStretch()
         l_lay.addLayout(l_row2)
 
+        # ── 统一比例排版（不同比例图先归一化再均匀排版，全程不变形）──
+        l_row3 = QHBoxLayout()
+        self.chk_uniform_ratio = QCheckBox("统一比例排版")
+        self.chk_uniform_ratio.setChecked(False)
+        self.chk_uniform_ratio.setToolTip(
+            "开启后所有图片先归一化到同一比例再排版：网格完全对齐、图片大小一致。\n"
+            "全程等比缩放，图片不会变形；空缺区域按下方填充方式补齐。\n"
+            "自动模式：透明底图片补透明（相当于从原图上补齐），不透明图片补纯色。"
+        )
+        l_row3.addWidget(self.chk_uniform_ratio)
+        l_row3.addWidget(QLabel("目标比例:"))
+        self.combo_uniform_ratio = QComboBox()
+        self.combo_uniform_ratio.addItem("自动（取多数图比例）", "auto")
+        self.combo_uniform_ratio.addItem("1:1", "1:1")
+        self.combo_uniform_ratio.addItem("4:3", "4:3")
+        self.combo_uniform_ratio.addItem("3:4", "3:4")
+        self.combo_uniform_ratio.addItem("16:9", "16:9")
+        self.combo_uniform_ratio.addItem("9:16", "9:16")
+        self.combo_uniform_ratio.addItem("自定义", "custom")
+        self.combo_uniform_ratio.setStyleSheet(config.COMBOBOX_STYLE)
+        l_row3.addWidget(self.combo_uniform_ratio)
+        self.lbl_ratio_w = QLabel("宽:")
+        l_row3.addWidget(self.lbl_ratio_w)
+        self.spin_ratio_w = QSpinBox()
+        self.spin_ratio_w.setRange(1, 10000)
+        self.spin_ratio_w.setValue(16)
+        self.spin_ratio_w.setMaximumWidth(70)
+        l_row3.addWidget(self.spin_ratio_w)
+        self.lbl_ratio_h = QLabel("高:")
+        l_row3.addWidget(self.lbl_ratio_h)
+        self.spin_ratio_h = QSpinBox()
+        self.spin_ratio_h.setRange(1, 10000)
+        self.spin_ratio_h.setValue(9)
+        self.spin_ratio_h.setMaximumWidth(70)
+        l_row3.addWidget(self.spin_ratio_h)
+        l_row3.addStretch()
+        l_lay.addLayout(l_row3)
+
+        l_row4 = QHBoxLayout()
+        l_row4.addWidget(QLabel("补齐填充:"))
+        self.combo_uniform_fill = QComboBox()
+        self.combo_uniform_fill.addItem("自动（透明底补透明，其余补纯色）", "auto")
+        self.combo_uniform_fill.addItem("纯色留白", "solid")
+        self.combo_uniform_fill.addItem("模糊背景", "blur")
+        self.combo_uniform_fill.addItem("透明填充", "transparent")
+        self.combo_uniform_fill.setStyleSheet(config.COMBOBOX_STYLE)
+        self.combo_uniform_fill.setToolTip(
+            "自动：透明底图片补透明底（从原图补齐），不透明图片补下方纯色\n"
+            "纯色留白：空缺区域填充所选颜色\n"
+            "模糊背景：原图放大铺满格子后高斯模糊垫底，视觉更完整\n"
+            "透明填充：空缺区域保持透明（PPTX/PDF 支持；压缩选 JPEG 时自动回退纯色白底）"
+        )
+        l_row4.addWidget(self.combo_uniform_fill)
+        self.lbl_fill_color = QLabel("填充颜色:")
+        l_row4.addWidget(self.lbl_fill_color)
+        self.btn_fill_color = QPushButton()
+        self.btn_fill_color.setFixedSize(36, 26)
+        self.btn_fill_color.setCursor(Qt.PointingHandCursor)
+        self.btn_fill_color.clicked.connect(self._pick_fill_color)
+        l_row4.addWidget(self.btn_fill_color)
+        self.lbl_fill_color_val = QLabel("#FFFFFF")
+        self.lbl_fill_color_val.setStyleSheet("color:#b0b8c8;font-size:12px;background:transparent;")
+        l_row4.addWidget(self.lbl_fill_color_val)
+        l_row4.addStretch()
+        l_lay.addLayout(l_row4)
+
+        def _on_uniform_toggled(checked):
+            self.combo_uniform_ratio.setEnabled(checked)
+            self.combo_uniform_fill.setEnabled(checked)
+            self._update_uniform_controls()
+
+        def _on_uniform_ratio_mode_changed():
+            custom = self.combo_uniform_ratio.currentData() == "custom"
+            self.lbl_ratio_w.setVisible(custom)
+            self.spin_ratio_w.setVisible(custom)
+            self.lbl_ratio_h.setVisible(custom)
+            self.spin_ratio_h.setVisible(custom)
+
+        self.chk_uniform_ratio.toggled.connect(_on_uniform_toggled)
+        self.combo_uniform_ratio.currentIndexChanged.connect(_on_uniform_ratio_mode_changed)
+        self.combo_uniform_fill.currentIndexChanged.connect(lambda _: self._update_uniform_controls())
+        _on_uniform_toggled(False)
+        _on_uniform_ratio_mode_changed()
+        self._refresh_fill_color_btn("#FFFFFF")
+
         root.addWidget(grp_layout)
 
         # ══ 4. 排序规则 ══
@@ -812,6 +897,30 @@ class Img2DocFeatureRoute(QWidget):
             f"QPushButton:hover{{border-color:#5b8af5;}}"
         )
 
+    def _pick_fill_color(self):
+        """选择统一比例补齐的填充颜色"""
+        current = self.lbl_fill_color_val.text()
+        c = QColorDialog.getColor(QColor(current), self, "选择填充颜色")
+        if c.isValid():
+            self.lbl_fill_color_val.setText(c.name().upper())
+            self._refresh_fill_color_btn(c.name())
+
+    def _refresh_fill_color_btn(self, color):
+        """刷新填充颜色按钮样式"""
+        self.btn_fill_color.setStyleSheet(
+            f"QPushButton{{background:{color};border:2px solid #5a5a6a;border-radius:6px;min-width:36px;min-height:24px;}}"
+            f"QPushButton:hover{{border-color:#5b8af5;}}"
+        )
+
+    def _update_uniform_controls(self):
+        """按开关与填充方式联动显示填充颜色控件"""
+        checked = self.chk_uniform_ratio.isChecked()
+        fill = self.combo_uniform_fill.currentData()
+        show_color = checked and fill in ("auto", "solid")
+        self.lbl_fill_color.setVisible(show_color)
+        self.btn_fill_color.setVisible(show_color)
+        self.lbl_fill_color_val.setVisible(show_color)
+
     def _collect_current_layer_options(self):
         """收集当前编辑元素的参数"""
         layer = getattr(self, '_current_layer', None)
@@ -1092,6 +1201,13 @@ class Img2DocFeatureRoute(QWidget):
             "compress_enabled": self.chk_compress.isChecked(),
             "compress_target_kb": self.spin_target_kb.value(),
             "compress_format": self.combo_compress_fmt.currentText(),
+            # 统一比例排版
+            "uniform_ratio_enabled": self.chk_uniform_ratio.isChecked(),
+            "uniform_ratio_mode": self.combo_uniform_ratio.currentData(),
+            "uniform_ratio_w": self.spin_ratio_w.value(),
+            "uniform_ratio_h": self.spin_ratio_h.value(),
+            "uniform_fill_mode": self.combo_uniform_fill.currentData(),
+            "uniform_fill_color": self.lbl_fill_color_val.text(),
             # 叠加层
             "overlay_layers": layers_data,
             "custom_fonts": custom_fonts,
@@ -1128,6 +1244,18 @@ class Img2DocFeatureRoute(QWidget):
         self.spin_target_kb.setValue(options.get("compress_target_kb", 500))
         ci = self.combo_compress_fmt.findText(options.get("compress_format", "JPEG"))
         if ci >= 0: self.combo_compress_fmt.setCurrentIndex(ci)
+
+        # 统一比例排版
+        self.chk_uniform_ratio.setChecked(options.get("uniform_ratio_enabled", False))
+        uidx = self.combo_uniform_ratio.findData(options.get("uniform_ratio_mode", "auto"))
+        if uidx >= 0: self.combo_uniform_ratio.setCurrentIndex(uidx)
+        self.spin_ratio_w.setValue(options.get("uniform_ratio_w", 16))
+        self.spin_ratio_h.setValue(options.get("uniform_ratio_h", 9))
+        fidx = self.combo_uniform_fill.findData(options.get("uniform_fill_mode", "auto"))
+        if fidx >= 0: self.combo_uniform_fill.setCurrentIndex(fidx)
+        fill_color = options.get("uniform_fill_color", "#FFFFFF")
+        self.lbl_fill_color_val.setText(fill_color)
+        self._refresh_fill_color_btn(fill_color)
 
         # 叠加层
         # 先收集当前编辑元素的参数

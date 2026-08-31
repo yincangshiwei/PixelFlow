@@ -1,6 +1,7 @@
 """Img2DocService —— 排版导出功能 Service（无 QWidget / Route 依赖）。"""
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 from services.contracts.feature_descriptor import FeatureDescriptor, InputKind
@@ -16,6 +17,8 @@ FEATURE_DESCRIPTION = "将多张图片按指定布局排版，导出为 PPT / PD
 _VALID_FORMATS = frozenset({"PPTX", "PDF", "DOCX"})
 _VALID_ALIGN = frozenset({"left", "center", "right"})
 _VALID_COMPRESS = frozenset({"JPEG", "WEBP"})
+_VALID_UNIFORM_MODES = frozenset({"auto", "custom", "1:1", "4:3", "3:4", "16:9", "9:16"})
+_VALID_FILL_MODES = frozenset({"auto", "solid", "blur", "transparent"})
 
 __all__ = [
     "FEATURE_ID", "FEATURE_NAME", "FEATURE_ICON", "FEATURE_DESCRIPTION",
@@ -109,6 +112,27 @@ class Img2DocService:
         if compress_format not in _VALID_COMPRESS:
             compress_format = "JPEG"
 
+        uniform_ratio_enabled = bool(raw_state.get(
+            "uniform_ratio_enabled", base["uniform_ratio_enabled"]
+        ))
+        uniform_ratio_mode = str(
+            raw_state.get("uniform_ratio_mode", base["uniform_ratio_mode"]) or "auto"
+        ).lower()
+        if uniform_ratio_mode not in _VALID_UNIFORM_MODES:
+            uniform_ratio_mode = "auto"
+        uniform_ratio_w = int(_num("uniform_ratio_w", base["uniform_ratio_w"], 1, 10000, int))
+        uniform_ratio_h = int(_num("uniform_ratio_h", base["uniform_ratio_h"], 1, 10000, int))
+        uniform_fill_mode = str(
+            raw_state.get("uniform_fill_mode", base["uniform_fill_mode"]) or "auto"
+        ).lower()
+        if uniform_fill_mode not in _VALID_FILL_MODES:
+            uniform_fill_mode = "auto"
+        uniform_fill_color = str(
+            raw_state.get("uniform_fill_color", base["uniform_fill_color"]) or "#FFFFFF"
+        )
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", uniform_fill_color):
+            uniform_fill_color = "#FFFFFF"
+
         layers = raw_state.get("overlay_layers") or []
         if not isinstance(layers, list):
             layers = []
@@ -135,6 +159,12 @@ class Img2DocService:
             "compress_enabled": compress_enabled,
             "compress_target_kb": compress_target_kb,
             "compress_format": compress_format,
+            "uniform_ratio_enabled": uniform_ratio_enabled,
+            "uniform_ratio_mode": uniform_ratio_mode,
+            "uniform_ratio_w": uniform_ratio_w,
+            "uniform_ratio_h": uniform_ratio_h,
+            "uniform_fill_mode": uniform_fill_mode,
+            "uniform_fill_color": uniform_fill_color,
             "overlay_layers": list(layers),
             "custom_fonts": dict(custom_fonts),
         })

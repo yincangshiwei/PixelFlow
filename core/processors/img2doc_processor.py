@@ -16,9 +16,10 @@ import json
 import re
 import traceback
 import ctypes
+from collections import Counter
 from functools import cmp_to_key
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 
 from core.base_processor import BaseProcessor, ProcessResult
 from core.image_processor import compress_to_target_size
@@ -81,6 +82,160 @@ def _excel_sort_key(value):
     return (0, 1, str(value).strip().casefold())
 
 
+# ── 统一比例排版辅助（纯函数，无 UI / 无导出器依赖）─────────────────────────
+
+EXIF_ORIENTATION_TAG = 274  # 0x0112
+
+
+def _image_size_exif(fpath) -> tuple[int, int]:
+    """读取图片尺寸（含 EXIF 方向修正，手机竖拍不判错比例）；失败返回 (1, 1)。"""
+    try:
+        with Image.open(fpath) as img:
+            w, h = img.size
+            try:
+                orientation = img.getexif().get(EXIF_ORIENTATION_TAG, 1)
+            except Exception:
+                orientation = 1
+            if orientation in (5, 6, 7, 8):
+                w, h = h, w
+            return int(w), int(h)
+    except Exception:
+        return 1, 1
+
+
+def image_has_transparency(img: Image.Image) -> bool:
+    """判断图片是否含有效透明像素（透明底）。"""
+    try:
+        if img.mode in ("RGBA", "LA"):
+            alpha = img.getchannel("A")
+            mn, _ = alpha.getextrema()
+            return mn < 250
+        if img.mode == "P":
+            if "transparency" not in img.info:
+                return False
+            alpha = img.convert("RGBA").getchannel("A")
+            mn, _ = alpha.getextrema()
+            return mn < 250
+    except Exception:
+        return False
+    return False
+
+
+def compute_uniform_ratio(sizes, mode="auto", custom_w=16, custom_h=9) -> float:
+    """计算统一排版目标比例（宽/高）。
+
+    mode: "auto"=取全部图片比例的众数（四舍五入到 0.01）；
+          "custom"=用 custom_w/custom_h；"W:H" 字符串=预设比例（如 "16:9"）。
+    """
+    m = str(mode or "auto").strip().lower()
+    if m == "custom":
+        try:
+            w, h = float(custom_w), float(custom_h)
+            if w > 0 and h > 0:
+                return w / h
+        except (TypeError, ValueError):
+            pass
+    elif ":" in m:
+        try:
+            w, h = (float(x) for x in m.split(":", 1))
+            if w > 0 and h > 0:
+                return w / h
+        except ValueError:
+            pass
+    ratios: list[float] = []
+    for size in sizes or []:
+        try:
+            w, h = float(size[0]), float(size[1])
+            if w > 0 and h > 0:
+                ratios.append(round(w / h, 2))
+        except (TypeError, ValueError, IndexError):
+            continue
+    if not ratios:
+        return 4.0 / 3.0
+    return Counter(ratios).most_common(1)[0][0]
+
+
+def _hex_to_rgb(color: str) -> tuple[int, int, int]:
+    c = str(color or "#FFFFFF").lstrip("#")
+    try:
+        return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+    except (ValueError, IndexError):
+        return 255, 255, 255
+
+
+def _cover_resize(img: Image.Image, cw: int, ch: int) -> Image.Image:
+    """等比放大到完全覆盖 (cw, ch) 后居中裁剪（模糊背景垫底用）。"""
+    iw, ih = img.size
+    scale = max(cw / iw, ch / ih)
+    nw = max(cw, round(iw * scale))
+    nh = max(ch, round(ih * scale))
+    out = img.resize((nw, nh), Image.LANCZOS)
+    left, top = (nw - cw) // 2, (nh - ch) // 2
+    return out.crop((left, top, left + cw, top + ch))
+
+
+def normalize_image_to_ratio(
+    img: Image.Image,
+    target_ratio: float,
+    fill_mode: str = "auto",
+    fill_color: str = "#FFFFFF",
+) -> Image.Image:
+    """把图片居中放到 target_ratio（宽/高）画布上，全程等比缩放不变形。
+
+    fill_mode:
+      auto       → 透明底图片补透明（保持 RGBA），不透明图补纯色
+      solid      → 纯色留白（fill_color）
+      blur       → 原图放大铺满格子 + 高斯模糊垫底
+      transparent→ 透明填充（RGBA 画布）
+    比例已一致时原样返回，不做重编码。
+    """
+    if target_ratio <= 0:
+        return img
+    try:
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    iw, ih = img.size
+    if iw <= 0 or ih <= 0:
+        return img
+    if abs(iw / ih - target_ratio) < 0.002:
+        return img
+
+    # 画布取"图片较大边保持不变"的方向，避免放大原图造成额外模糊
+    if iw / ih > target_ratio:
+        cw, ch = iw, max(1, round(iw / target_ratio))
+    else:
+        cw, ch = max(1, round(ih * target_ratio)), ih
+
+    mode = str(fill_mode or "auto").strip().lower()
+    if mode == "auto":
+        mode = "transparent" if image_has_transparency(img) else "solid"
+
+    has_alpha = img.mode in ("RGBA", "LA") or (
+        img.mode == "P" and "transparency" in img.info
+    )
+    src = img.convert("RGBA") if has_alpha else img
+    pos = ((cw - iw) // 2, (ch - ih) // 2)
+
+    if mode == "transparent":
+        canvas = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+        canvas.paste(src, pos, src if has_alpha else None)
+        return canvas
+
+    if mode == "blur":
+        canvas = _cover_resize(img.convert("RGB"), cw, ch)
+        radius = max(8, min(60, max(cw, ch) // 40))
+        canvas = canvas.filter(ImageFilter.GaussianBlur(radius))
+    else:  # solid
+        canvas = Image.new("RGB", (cw, ch), _hex_to_rgb(fill_color))
+
+    if has_alpha:
+        canvas.paste(src, pos, src)
+    else:
+        canvas.paste(src.convert("RGB"), pos)
+    return canvas
+
+
 
 class OverlayLayer:
     def __init__(self, layer_type, x_cm=0.0, y_cm=0.0, name="", placement="overlay"):
@@ -141,6 +296,12 @@ def default_img2doc_options() -> dict:
         "compress_enabled": False,
         "compress_target_kb": 500,
         "compress_format": "JPEG",
+        "uniform_ratio_enabled": False,
+        "uniform_ratio_mode": "auto",
+        "uniform_ratio_w": 16,
+        "uniform_ratio_h": 9,
+        "uniform_fill_mode": "auto",
+        "uniform_fill_color": "#FFFFFF",
         "overlay_layers": [],
         "custom_fonts": {},
     }
@@ -271,15 +432,72 @@ class Img2DocProcessor(BaseProcessor):
 
                 overlay_excel_data[layer_idx] = data_map
 
-        # 3. 图片压缩预处理
+        # 3. 预处理：统一比例归一化（可选）→ 图片压缩（可选）
         compress_enabled = options.get("compress_enabled", False)
         compress_target_kb = options.get("compress_target_kb", 500)
         compress_fmt = options.get("compress_format", "JPEG")
-        # 将压缩后的临时路径映射存起来
+        # 预处理结果缓存: original_path -> bytes (io.BytesIO)，导出器直接使用
         _compressed_cache = {}  # original_path -> compressed_bytes (io.BytesIO)
+        all_files = list(dict.fromkeys(f for _, grp in groups for f in grp))
 
-        if compress_enabled:
-            all_files = list(dict.fromkeys(f for _, grp in groups for f in grp))
+        uniform_enabled = bool(options.get("uniform_ratio_enabled", False))
+        if uniform_enabled:
+            # 3a. 统一比例：全部图先归一化到同一比例（等比缩放 + 画布补齐，不变形）。
+            # 归一化后所有图比例一致，_calc_layout 现有逻辑即输出完全对齐的均匀网格。
+            if progress_cb:
+                progress_cb(0, len(all_files), "统一比例: 读取图片尺寸…")
+            sizes = [_image_size_exif(f) for f in all_files]
+            target_ratio = compute_uniform_ratio(
+                sizes,
+                mode=options.get("uniform_ratio_mode", "auto"),
+                custom_w=options.get("uniform_ratio_w", 16),
+                custom_h=options.get("uniform_ratio_h", 9),
+            )
+            fill_mode = options.get("uniform_fill_mode", "auto")
+            fill_color = options.get("uniform_fill_color", "#FFFFFF")
+            if progress_cb:
+                progress_cb(
+                    0, len(all_files),
+                    f"统一比例: 目标比例 {target_ratio:.2f}:1 · 填充[{fill_mode}]，开始归一化…",
+                )
+
+            for fi, fpath in enumerate(all_files):
+                if progress_cb:
+                    progress_cb(fi, len(all_files), f"统一比例: {Path(fpath).name}")
+                try:
+                    with Image.open(fpath) as img:
+                        img.load()
+                        normalized = normalize_image_to_ratio(
+                            img, target_ratio, fill_mode, fill_color
+                        )
+                        has_alpha = normalized.mode == "RGBA"
+                        if compress_enabled:
+                            if has_alpha and compress_fmt.upper() in ("JPEG", "JPG"):
+                                # JPEG 不支持透明通道，回退 PNG 保存
+                                buf = io.BytesIO()
+                                normalized.save(buf, format="PNG")
+                            else:
+                                fmt_save = "WEBP" if compress_fmt.upper() == "WEBP" else "JPEG"
+                                _, quality, _ = compress_to_target_size(
+                                    normalized, compress_target_kb, fmt_save
+                                )
+                                buf = io.BytesIO()
+                                normalized.save(buf, format=fmt_save, quality=quality)
+                        elif has_alpha:
+                            buf = io.BytesIO()
+                            normalized.save(buf, format="PNG")
+                        else:
+                            buf = io.BytesIO()
+                            normalized.save(buf, format="JPEG", quality=92)
+                    buf.seek(0)
+                    _compressed_cache[fpath] = buf
+                except Exception as e:
+                    if progress_cb:
+                        progress_cb(
+                            fi, len(all_files),
+                            f"统一比例失败，使用原图: {Path(fpath).name} ({e})",
+                        )
+        elif compress_enabled:
             for fi, fpath in enumerate(all_files):
                 if progress_cb:
                     progress_cb(fi, len(all_files), f"压缩中: {Path(fpath).name}")
@@ -580,13 +798,20 @@ class Img2DocProcessor(BaseProcessor):
         else:  # fixed
             return layer.get("text", "")
 
+    def _cache_stream(self, fpath: str, compressed_cache: dict) -> io.BytesIO:
+        """取预处理缓存的独立字节流副本。
+
+        PIL 的 img.close() 会关闭传入的共享 BytesIO（Pillow 12.x 实测如此），
+        导出器内部也可能持有/关闭流。缓存本体只作数据源，每次使用取副本，
+        避免缓存被意外关闭后报 "I/O operation on closed file"。
+        """
+        return io.BytesIO(compressed_cache[fpath].getvalue())
+
     def _open_image_for_export(self, fpath: str, compressed_cache: dict):
-        """打开图片，优先使用压缩缓存。返回独立的 Image 对象（不持有文件句柄）"""
+        """打开图片，优先使用预处理缓存。返回独立的 Image 对象（不持有文件句柄）"""
         try:
             if fpath in compressed_cache:
-                buf = compressed_cache[fpath]
-                buf.seek(0)
-                img = Image.open(buf)
+                img = Image.open(self._cache_stream(fpath, compressed_cache))
                 img.load()  # 强制读入内存
                 return img
             img = Image.open(fpath)
@@ -638,8 +863,10 @@ class Img2DocProcessor(BaseProcessor):
                 bx, by, bw, bh = boxes[j]
                 # layout 已按实际比例计算精确尺寸，直接使用
                 if f in compressed_cache:
-                    compressed_cache[f].seek(0)
-                    slide.shapes.add_picture(compressed_cache[f], Cm(bx), Cm(by), Cm(bw), Cm(bh))
+                    slide.shapes.add_picture(
+                        self._cache_stream(f, compressed_cache),
+                        Cm(bx), Cm(by), Cm(bw), Cm(bh),
+                    )
                 else:
                     slide.shapes.add_picture(f, Cm(bx), Cm(by), Cm(bw), Cm(bh))
 
@@ -713,9 +940,8 @@ class Img2DocProcessor(BaseProcessor):
                 # PDF 坐标原点在左下角，y 需要翻转
                 pdf_y = h_cm - by - bh
                 if f in compressed_cache:
-                    compressed_cache[f].seek(0)
                     from reportlab.lib.utils import ImageReader
-                    reader = ImageReader(compressed_cache[f])
+                    reader = ImageReader(self._cache_stream(f, compressed_cache))
                     try:
                         c.drawImage(reader, bx * cm, pdf_y * cm, width=bw * cm, height=bh * cm)
                     finally:
@@ -797,8 +1023,10 @@ class Img2DocProcessor(BaseProcessor):
                 r = p.add_run()
                 bx, by, bw, bh = boxes[0]
                 if batch[0] in compressed_cache:
-                    compressed_cache[batch[0]].seek(0)
-                    r.add_picture(compressed_cache[batch[0]], width=Cm(bw), height=Cm(bh))
+                    r.add_picture(
+                        self._cache_stream(batch[0], compressed_cache),
+                        width=Cm(bw), height=Cm(bh),
+                    )
                 else:
                     r.add_picture(batch[0], width=Cm(bw), height=Cm(bh))
             else:
@@ -812,8 +1040,10 @@ class Img2DocProcessor(BaseProcessor):
                     r = p.add_run()
                     bx, by, bw, bh = boxes[j]
                     if f in compressed_cache:
-                        compressed_cache[f].seek(0)
-                        r.add_picture(compressed_cache[f], width=Cm(bw), height=Cm(bh))
+                        r.add_picture(
+                            self._cache_stream(f, compressed_cache),
+                            width=Cm(bw), height=Cm(bh),
+                        )
                     else:
                         r.add_picture(f, width=Cm(bw), height=Cm(bh))
 

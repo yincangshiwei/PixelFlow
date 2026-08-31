@@ -13,9 +13,11 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1216,6 +1218,38 @@ def _run(
         env=full_env,
         creationflags=creationflags,
     )
+
+
+def _rmtree_retry(path: Path, attempts: int = 5, delay: float = 0.8) -> bool:
+    """
+    稳健删除目录：Windows 下 venv 文件常被杀软实时扫描 / 残留子进程 /
+    资源管理器短暂占用，shutil.rmtree(ignore_errors=True) 会静默留下残目录，
+    导致后续 `uv venv` 报 "A directory already exists"。
+    这里多次重试并清除只读属性；全部失败返回 False（不抛异常）。
+    """
+    def _on_error(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:
+            pass
+
+    kwargs: dict = {}
+    if sys.version_info >= (3, 12):
+        kwargs["onexc"] = _on_error
+    else:
+        kwargs["onerror"] = _on_error
+
+    for i in range(max(1, attempts)):
+        try:
+            shutil.rmtree(path, **kwargs)
+        except Exception:
+            pass
+        if not path.exists():
+            return True
+        if i < attempts - 1:
+            time.sleep(delay)
+    return not path.exists()
 
 
 def _normalize_check_names(packages: list[str] | None) -> list[str]:
@@ -2827,7 +2861,17 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
             if need_recreate and venv_dir.exists():
                 if progress:
                     progress(model_id, 15, "删除旧环境…")
-                shutil.rmtree(venv_dir, ignore_errors=True)
+                # 常驻抠图 worker 可能仍持有旧 venv 的 python.exe/DLL，先尽量关闭
+                try:
+                    from core.matting.inference import shutdown_matting_workers
+                    shutdown_matting_workers()
+                except Exception:
+                    pass
+                if not _rmtree_retry(venv_dir):
+                    raise RuntimeError(
+                        f"旧环境目录删除失败（可能被杀毒软件/占用进程锁定）:\n{venv_dir}\n\n"
+                        "请关闭本软件后手动删除该目录，再重新创建环境。"
+                    )
 
             if not self.model_python(model_id):
                 # 优先按版本号创建：uv 可自动下载托管 CPython，避免误用本机 3.13/3.14
@@ -2850,7 +2894,9 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
                     # 托管下载可能较慢
                     timeout = 300 if py_spec == target_py else 180
                     r = _run(
-                        [uv.path, "venv", "--python", py_spec, str(venv_dir)],
+                        # --clear：残留/损坏的 .venv 目录直接替换，避免
+                        # "A directory already exists" 报错卡死重建流程
+                        [uv.path, "venv", "--clear", "--python", py_spec, str(venv_dir)],
                         timeout=timeout,
                         cwd=env_dir,
                     )
@@ -2860,7 +2906,7 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
                     last_err = _strip_ansi(r.stderr or r.stdout or "")
                     # 失败残留目录清理后再试下一种
                     if venv_dir.exists():
-                        shutil.rmtree(venv_dir, ignore_errors=True)
+                        _rmtree_retry(venv_dir)
 
                 if not created:
                     hint = (
@@ -2871,6 +2917,12 @@ sys.stdout.write('PF_TORCH_JSON=' + json.dumps(out, ensure_ascii=False) + '\n')
                         "https://www.python.org/downloads/\n"
                         "勿使用 3.13/3.14：当前 PyTorch 官方轮子无对应 ABI，会导致 CUDA 安装失败。"
                     )
+                    if venv_dir.exists():
+                        hint += (
+                            f"\n\n环境目录仍存在且无法自动清除（可能被杀毒软件/占用进程锁定）:\n"
+                            f"{venv_dir}\n"
+                            "请关闭本软件后手动删除该目录，再重新创建环境。"
+                        )
                     raise RuntimeError(
                         f"创建 venv 失败:\n{last_err}\n\n{hint}"
                     )

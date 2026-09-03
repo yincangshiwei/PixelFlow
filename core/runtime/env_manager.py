@@ -154,6 +154,28 @@ class ModelEnvStatus:
 
 
 @dataclass
+class NvidiaGpuEntry:
+    """单张 NVIDIA GPU 的探测结果（多卡机器逐张记录）。"""
+    index: int = 0
+    name: str = ""
+    driver_version: str = ""
+    compute_cap: str = ""
+    compute_major: int = 0
+    compute_minor: int = 0
+    memory_mb: int = 0
+
+    @property
+    def sm_tag(self) -> str:
+        if self.compute_major <= 0:
+            return ""
+        return f"sm_{self.compute_major}{self.compute_minor}"
+
+    @property
+    def memory_gb(self) -> float:
+        return round(self.memory_mb / 1024.0, 2) if self.memory_mb > 0 else 0.0
+
+
+@dataclass
 class NvidiaGpuInfo:
     """本机 NVIDIA 驱动/GPU 探测（不依赖 torch，供安装策略使用）。"""
     available: bool = False
@@ -164,14 +186,32 @@ class NvidiaGpuInfo:
     cuda_major: int = 0
     cuda_minor: int = 0
     # 计算能力，如 12.0 → Blackwell sm_120
+    # 注意：多卡机器上这是「能力最高的一张」，不是 nvidia-smi 的第一行
     compute_cap: str = ""
     compute_major: int = 0
     compute_minor: int = 0
     detail: str = ""
+    # 逐卡明细（多卡机器：核显+独显 / 新旧卡混插时用于正确判定能力）
+    gpus: list[NvidiaGpuEntry] = field(default_factory=list)
 
     @property
     def primary_name(self) -> str:
         return self.gpu_names[0] if self.gpu_names else ""
+
+    @property
+    def best_gpu(self) -> NvidiaGpuEntry | None:
+        """计算能力最高的一张卡（与 compute_cap 字段一致）。"""
+        best: NvidiaGpuEntry | None = None
+        for g in self.gpus:
+            if best is None or (g.compute_major, g.compute_minor) > (
+                best.compute_major, best.compute_minor
+            ):
+                best = g
+        return best
+
+    @property
+    def max_memory_mb(self) -> int:
+        return max((g.memory_mb for g in self.gpus), default=0)
 
     @property
     def sm_tag(self) -> str:
@@ -239,45 +279,66 @@ def detect_nvidia_gpu(*, force: bool = False) -> NvidiaGpuInfo:
             _nvidia_cache = info
         return info
 
-    # 查询 GPU 名称 + 驱动 + 计算能力
-    try:
-        r = _run(
-            [
-                smi,
-                "--query-gpu=name,driver_version,compute_cap",
-                "--format=csv,noheader,nounits",
-            ],
-            timeout=15,
-        )
-    except Exception as e:
-        info.detail = f"nvidia-smi 执行失败: {e}"
-        with _nvidia_cache_lock:
-            _nvidia_cache = info
-        return info
+    # 查询 GPU 名称 + 驱动 + 计算能力 + 显存
+    # 逐级降级：老驱动的 nvidia-smi 可能不支持 compute_cap / memory.total，
+    # 此时仍要拿到 GPU 名称，让上层可用名称正则兜底判定架构（高清放大门禁依赖此路径）
+    field_sets = (
+        "name,driver_version,compute_cap,memory.total",
+        "name,driver_version,compute_cap",
+        "name,driver_version",
+    )
+    r = None
+    last_err = ""
+    for fields in field_sets:
+        try:
+            cand = _run(
+                [smi, f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+                timeout=15,
+            )
+        except Exception as e:
+            info.detail = f"nvidia-smi 执行失败: {e}"
+            with _nvidia_cache_lock:
+                _nvidia_cache = info
+            return info
+        if cand.returncode == 0:
+            r = cand
+            break
+        last_err = _strip_ansi((cand.stderr or cand.stdout or "")[:300])
 
-    if r.returncode != 0:
-        err = _strip_ansi((r.stderr or r.stdout or "")[:300])
-        info.detail = f"nvidia-smi 返回错误: {err or r.returncode}"
+    if r is None:
+        info.detail = f"nvidia-smi 返回错误: {last_err or '未知'}"
         with _nvidia_cache_lock:
             _nvidia_cache = info
         return info
 
     names: list[str] = []
+    entries: list[NvidiaGpuEntry] = []
     driver = ""
-    compute_cap = ""
-    for line in (r.stdout or "").splitlines():
+    for idx, line in enumerate((r.stdout or "").splitlines()):
         line = line.strip()
         if not line:
             continue
         parts = [p.strip() for p in line.split(",")]
-        if not parts:
+        if not parts or not parts[0]:
             continue
-        if parts[0]:
-            names.append(parts[0])
-        if len(parts) > 1 and parts[1] and not driver:
-            driver = parts[1]
-        if len(parts) > 2 and parts[2] and not compute_cap:
-            compute_cap = parts[2]
+        entry = NvidiaGpuEntry(index=idx, name=parts[0])
+        if len(parts) > 1 and parts[1]:
+            entry.driver_version = parts[1]
+            if not driver:
+                driver = parts[1]
+        if len(parts) > 2 and parts[2]:
+            entry.compute_cap = parts[2]
+            m_cc = re.match(r"(\d+)\.(\d+)", parts[2])
+            if m_cc:
+                entry.compute_major = int(m_cc.group(1))
+                entry.compute_minor = int(m_cc.group(2))
+        if len(parts) > 3 and parts[3]:
+            try:
+                entry.memory_mb = int(float(parts[3]))
+            except (TypeError, ValueError):
+                entry.memory_mb = 0
+        names.append(entry.name)
+        entries.append(entry)
 
     if not names:
         info.detail = "nvidia-smi 未列出 GPU"
@@ -287,13 +348,21 @@ def detect_nvidia_gpu(*, force: bool = False) -> NvidiaGpuInfo:
 
     info.available = True
     info.gpu_names = names
+    info.gpus = entries
     info.driver_version = driver
-    if compute_cap:
-        info.compute_cap = compute_cap
-        m_cc = re.match(r"(\d+)\.(\d+)", compute_cap)
-        if m_cc:
-            info.compute_major = int(m_cc.group(1))
-            info.compute_minor = int(m_cc.group(2))
+
+    # 多卡机器（核显+独显 / 新旧卡混插）：以「计算能力最高的一张」为准，
+    # 否则第一张是旧卡时会把整机误判为旧架构（影响 CUDA 标签选择与高清放大门禁）
+    best: NvidiaGpuEntry | None = None
+    for g in entries:
+        if best is None or (g.compute_major, g.compute_minor) > (
+            best.compute_major, best.compute_minor
+        ):
+            best = g
+    if best is not None and best.compute_cap:
+        info.compute_cap = best.compute_cap
+        info.compute_major = best.compute_major
+        info.compute_minor = best.compute_minor
 
     # 头部 CUDA Version（驱动支持的最高 CUDA）
     try:

@@ -316,7 +316,8 @@ class MainWindow(QMainWindow):
             route.open_menu(int(pending))
 
     def open_settings(self, menu_row: int = 0):
-        """打开「配置」Tab，并切换到指定左侧菜单（0=开发环境，1=抠图模型）。"""
+        """打开「配置」Tab，并切换到指定左侧菜单
+        （0=开发环境，1=抠图模型，2=高清放大引擎）。"""
         self._pending_settings_menu = menu_row
         self._switch_tab(2)
         if self._settings_route is not None:

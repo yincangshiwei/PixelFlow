@@ -1,10 +1,11 @@
 """SettingsRoute —— 配置中心壳（P5：自 settings_panel 拆出）。
 
-左侧菜单（开发环境 → 抠图模型配置）+ 右侧内容栈；
-子页拆分为 DevEnvRoute / MattingModelRoute，本路由只做装配与跨页连线：
+左侧菜单（开发环境 → 抠图模型配置 → 高清放大引擎）+ 右侧内容栈；
+子页拆分为 DevEnvRoute / MattingModelRoute / UpscaleEngineRoute，
+本路由只做装配与跨页连线：
 - 开发环境状态变化 → 重估模型页门禁
 - 模型页跳转 / 安装 uv / 刷新开发页标签 → 委托开发环境页
-- 两个子页的后台日志信号统一转发给壳（写入「后台日志」页）
+- 各子页的后台日志信号统一转发给壳（写入「后台日志」页）
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from services.common.runtime_facade import get_runtime_facade
 
 from .dev_env_route import DevEnvRoute
 from .matting_model_route import MattingModelRoute
+from .upscale_engine_route import UpscaleEngineRoute
 
 
 class SettingsRoute(QWidget):
@@ -61,6 +63,7 @@ class SettingsRoute(QWidget):
         self.menu_list.setObjectName("settings_menu")
         self.menu_list.addItem(QListWidgetItem("🛠  开发环境"))
         self.menu_list.addItem(QListWidgetItem("✂  抠图模型配置"))
+        self.menu_list.addItem(QListWidgetItem("🔍  高清放大引擎"))
         self.menu_list.setCurrentRow(0)
         self.menu_list.currentRowChanged.connect(self._on_menu_changed)
         left_lay.addWidget(self.menu_list, 1)
@@ -70,10 +73,12 @@ class SettingsRoute(QWidget):
         self.matting_route = MattingModelRoute(
             facade=self._facade, service=self._service,
         )
+        self.upscale_route = UpscaleEngineRoute()
 
         self.content_stack = QStackedWidget()
         self.content_stack.addWidget(self.dev_route)        # 0
         self.content_stack.addWidget(self.matting_route)    # 1
+        self.content_stack.addWidget(self.upscale_route)    # 2
         root.addWidget(self.content_stack, 1)
 
     def _wire_sub_routes(self):
@@ -82,6 +87,8 @@ class SettingsRoute(QWidget):
         self.dev_route.log_line.connect(self.log_line)
         self.matting_route.log_begin.connect(self.log_begin)
         self.matting_route.log_line.connect(self.log_line)
+        self.upscale_route.log_begin.connect(self.log_begin)
+        self.upscale_route.log_line.connect(self.log_line)
 
         # 开发环境状态变化 → 模型页门禁重估
         self.dev_route.dev_state_changed.connect(self.matting_route.apply_gate)
@@ -121,12 +128,16 @@ class SettingsRoute(QWidget):
         elif row == 1:
             # 进入模型页前先确认开发环境是否就绪（门禁在内部处理）
             self.matting_route.on_page_entered()
+        elif row == 2:
+            # 高清放大引擎：首次进入时后台检测显卡架构与运行时完整性
+            self.upscale_route.on_page_entered()
 
     # ── 关闭协调（§5.4 规则 5：有界等待后台线程）──
 
     def request_shutdown(self, wait_ms: int = 3000) -> None:
         self.dev_route.wait_workers(wait_ms)
         self.matting_route.wait_workers(wait_ms)
+        self.upscale_route.wait_workers(wait_ms)
 
     def showEvent(self, event):
         super().showEvent(event)

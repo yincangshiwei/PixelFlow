@@ -82,6 +82,13 @@ PixelFlow/
 │   │   ├── model_manager.py    # 权重 / 就绪
 │   │   ├── hardware.py         # 硬件评估
 │   │   └── workers/            # 子进程脚本（在隔离 venv 中跑）
+│   ├── upscale/                # 高清放大（多引擎，见 §5.7）
+│   │   ├── engine_registry.py  # 引擎注册表 + ParamSpec 参数 schema（UI/Service 共用）
+│   │   ├── hardware_gate.py    # 显卡架构 / 系统门禁（DLSS5 需 RTX 40 系及以上）
+│   │   ├── runtime_bundle.py   # 外挂运行时定位、逐文件校验、PE 版本读取
+│   │   ├── upscale_settings.py # runtime/upscale_settings.json 读写
+│   │   ├── dlss5.py            # 尺寸规划 / 多趟放大 / 会话池 / Alpha 保留
+│   │   └── dlss5_session.py    # 原生 worker 的 stdin/stdout 二进制协议（纯标准库）
 │   └── runtime/
 │       ├── env_manager.py      # uv / Python / Git / 模型 venv / PATH 同步
 │       └── gpu_catalog.py      # 主流 GPU ↔ PyTorch CUDA 标签清单
@@ -98,7 +105,9 @@ PixelFlow/
 ├── runtime/                    # AI 运行时数据（gitignore）
 │   ├── uv/                     # 便携 uv.exe（可一键安装或手动放置）
 │   ├── envs/<id>/.venv/        # 每模型隔离环境（Python 严格 3.10–3.12）
-│   └── runtime_settings.json   # python_path / uv_path / pip_index_url / github_proxy
+│   ├── upscale/dlss5/          # DLSS5 外挂运行时（用户下载，禁止提交/打包）
+│   ├── runtime_settings.json   # python_path / uv_path / pip_index_url / github_proxy
+│   └── upscale_settings.json   # 放大引擎 / 运行时目录 / 应急开关
 ├── presets/<preset_id>/        # 用户预设
 ├── resources/                  # 图标、CHANGELOG、截图
 └── PixelFlow.spec              # 打包配置
@@ -109,10 +118,15 @@ PixelFlow/
 | 路径 | 含义 | Git |
 |------|------|-----|
 | `core/runtime/` | 运行时**源码**（`RuntimeManager`） | 必须提交 |
-| 根目录 `/runtime/` | 本机 AI 数据（uv、venv、设置） | **忽略**（`.gitignore` 写 `/runtime/`） |
+| `core/upscale/` | 高清放大**源码**（引擎注册表 / 门禁 / 协议） | 必须提交 |
+| 根目录 `/runtime/` | 本机 AI 数据（uv、venv、设置、DLSS5 运行时） | **忽略**（`.gitignore` 写 `/runtime/`） |
 | `models/matting/` | 权重文件 | 通常不提交大文件 |
 
 > 切勿把 ignore 写成 `runtime/`（无前导 `/`），会误伤 `core/runtime/`。
+
+> **DLSS5 二进制红线**：`runtime/upscale/dlss5/` 下的 `nvngx_dlssnr.dll` / `nvngx_dlss.dll`
+> 受 NVIDIA RTX SDK License 约束（§4.b 禁止独立再分发），`renodx-dlss5.addon64` 无独立再分发授权。
+> 只能由用户自行获取，**严禁提交仓库、严禁打进安装包或 exe**。
 
 ---
 
@@ -178,6 +192,7 @@ ActionBarRoute（开始处理）
 |------|--------|-----------------|------|
 | 透明图处理 | `transparent_processor.py` | `transparent_service` / `transparent_route` | 逐张 + AI 流水线 |
 | 基础处理 | `basic_processor.py` | `basic_service` / `basic_route` | 逐张（格式/压缩/DPI/重命名） |
+| 高清放大 | `upscale_processor.py` | `upscale_service` / `upscale_route` | 逐张 + 外挂 DLSS5 原生 worker（见 §5.7） |
 | 元数据编辑 | `metadata_processor.py` | `metadata_service` / `metadata_route` | `process_batch` 按路径写，保留 EXIF |
 | 图片叠加 | `overlay_processor.py` | `overlay_service` / `overlay_route` | 逐张 |
 | 图片排版导出 | `img2doc_processor.py` | `img2doc_service` / `img2doc_route` | `is_batch_processor`（PPT/PDF/Word） |
@@ -221,7 +236,7 @@ ActionBarRoute（开始处理）
 
 ---
 
-## 5. AI 抠图（透明图核心）
+## 5. AI 能力（抠图 / 高清放大）
 
 ### 5.1 设计目标
 
@@ -406,6 +421,106 @@ python <model>_worker.py --serve --device auto --weights-dir ...
 - 过程：batch 序号、文件范围、推理/后处理耗时  
 - 完成行：`抠图→ben2 · batch=2 · CUDA · mask · 流水线`
 
+### 5.7 高清放大（DLSS 5 神经渲染）
+
+与 AI 抠图同属「外挂运行时」能力，但**不需要 uv / venv**：协议用标准库 `struct` 实现，像素用 Pillow，运动矢量是全零字节串，因此主程序与打包产物零新增依赖。
+
+#### 5.7.1 引擎注册表（多引擎扩展点）
+
+`core/upscale/engine_registry.py` 是「选哪个引擎就显示哪套参数」的唯一权威来源：
+
+| 概念 | 说明 |
+|------|------|
+| `ParamSpec` | 单参数完整描述：`key/label/kind/default/group/row/choices/lo/hi/step/decimals/suffix/tooltip/advanced` |
+| `UpscaleEngineInfo` | 引擎描述：`id/name/platforms/min_gpu_generation/gpu_vendor/runtime_kind/params/max_output_*/min_input_side/license_note` |
+| `groups()` / `rows()` | UI 按 `group` 生成 GroupBox、按 `row` 横排（宽屏优先，单行 ≤4 组标签+控件） |
+| `coerce_params()` | Service 按 schema 统一校验/收敛，**不为任何引擎写死字段分支** |
+
+预设按引擎命名空间存放，切换引擎不丢参数：`{"engine":"dlss5","engines":{"dlss5":{...}},"output_format":"png","quality":95}`。新增引擎 = 注册表加一条 + `core/upscale/<engine>.py` 实现后端 + `UpscaleProcessor.process` 加分支，**UI 零改动**。
+
+#### 5.7.2 硬件门禁（RTX 40 系及以上）
+
+`hardware_gate.classify_gpu()` 判定优先级：`compute_cap` → 名称架构关键词 → GeForce `RTX x0xx` 数字 → 未知。
+
+| compute_cap | 架构 | 世代 | DLSS5 |
+|---|---|---|---|
+| 8.9 | Ada | 40 | 可用 |
+| 10.0 / 10.3 / 11.0 / 12.0 / 12.1 | Blackwell | 50 | 可用 |
+| 8.0 / 8.6 / 8.7 / 8.8 | Ampere | 30 | 阻断 |
+| 7.5 | Turing | 20 | 阻断 |
+| 9.0 | Hopper | — | 阻断（非 RTX） |
+
+- **阻断**：非 Windows / 非 64 位 / 无 NVIDIA 卡 / 非 RTX / 世代 <40 / 架构无法识别 / 运行时缺文件 / host 目录不可写
+- **警告**：Windows 10（上游要求 11）、显存 <6GB、40 系属非官方路径、DLSSNR 版本非 310.8.SF.0
+- 架构无法识别时可在配置页开「跳过显卡架构校验」应急放行（默认关）
+- 30 系阻断理由：官方 DLSS 5 未支持；上游 `runtime.py` 有专用 `0xC0000005` 崩溃诊断分支；上游 issue #12 即 3060 渲染失败
+
+> **多卡注意**：`env_manager.detect_nvidia_gpu()` 原先只取 nvidia-smi 第一行的 `compute_cap`，核显+独显或新旧卡混插会把整机判成旧架构。现已逐卡记录（`NvidiaGpuInfo.gpus`）并按**计算能力最高者**判定；`hardware_gate.pick_best_gpu()` 再按世代+显存挑最佳卡。查询字段也扩展为 `name,driver_version,compute_cap,memory.total`，并对老驱动逐级降级到 3 字段 / 2 字段。
+
+#### 5.7.3 外挂运行时（`runtime_bundle.py`）
+
+图片路径必需 5 个文件（不需要 ffmpeg / dlssg / 上游内置 Python）：
+
+```
+host/nvngx.dll              DLSS5 渲染入口（D3D12 feeder，以 DLL 命名的可执行文件）
+host/dxgi.dll               ReShade 6.8.0 完整 add-on 版
+host/renodx-dlss5.addon64   RenoDX DLSS5 add-on
+host/nvngx_dlssnr.dll       NVIDIA DLSSNR 310.8.SF.0（约 158 MB）
+dlss/nvngx_dlss.dll         NVIDIA DLSS 超分
+```
+
+- 支持两种布局：`upstream`（`<root>/bin/runtime/{host,dlss}`）与 `compact`（`<root>/{host,dlss}`）
+- **拒绝旧扁平布局**（与上游 `validate_runtime_files` 一致），避免半迁移目录静默混用不匹配组件
+- `host/` 必须**可写**：native worker 每次运行重写 `host/ReShade.ini`；装在 `C:\Program Files` 下会失败，配置页做前置检查
+- `read_pe_file_version()` 用 ctypes 读 PE 版本资源（不加载 DLL），识别 DLSSNR 是否为已验证的 310.8.SF.0（FileVersion 字符串；产品版本常写作 310.8.0.0）
+- SHA256 仅在用户点「校验文件哈希」时计算，且**不做硬锁**——上游 v5.0 已主动 unlock，硬锁会让用户无法升级
+
+> **许可红线**：`nvngx_dlssnr.dll` 是从游戏安装文件提取的泄露运行时；`nvngx_dlss.dll` 属 NVIDIA RTX SDK（§4.b 禁止作为独立产品分发，§4.a/§4.d 禁止逆向与绕过技术限制）；`renodx-dlss5.addon64` 无独立再分发授权。三者**严禁提交仓库、严禁打进安装包或 exe**。运行时包由维护者上传至**本项目 Releases**（`config.DLSS5_BUNDLE_RELEASE_URL`），`bundle_installer` 只在用户点击时下载并提取必需文件到 `runtime/upscale/dlss5/`（已被 `/runtime/` 忽略）。RTX 40 系能跑本身依赖社区 add-on 放开官方「仅 50 系」限制，属非官方路径，驱动更新后可能失效。
+
+#### 5.7.4 原生协议（`dlss5_session.py`）
+
+对齐上游 version-4 model-preset protocol，小端。四个 magic：`VIDEO 0x34563544` / `SETUP 0x34505553` / `FRAME 0x314D5246` / `OUT 0x3154554F`。
+
+- 会话头 `<14I4f`：magic, in_w, in_h, out_w, out_h, warmup, frame_count, perf_quality, dlss_model_preset, profile, preset, style, auto_mask, ui_correction, intensity, local_tone, local_structure, skin_structure
+- setup 回 `<12I`：magic, ok, ngx_result, render_w, render_h, nego_out_w/h, min_w/h, max_w/h, applied_model_preset
+- 帧头 `<4Iq`：magic, index, reset, 0, pts；随后 RGBA uint8（`render_w*render_h*4`）+ motion float16 全零（`render_w*render_h*4` 字节）
+- 帧回 `<5Iq`：magic, index, ok, byte_count, ngx_result（须 ==1）, pts；随后输出 RGBA（`out_w*out_h*4`）
+- 启动：`Popen([host/nvngx.dll, "--video"], cwd=host_dir, creationflags=CREATE_NO_WINDOW)`；图片与视频共用 `--video`，图片按单帧送、`reset=True`
+- `ReShade.ini` **不由 Python 侧写**：全部 NR 参数在会话头里，native worker 自己重写 ini
+- `SETUP_MAGIC` 不匹配即报「请下载上游 v5.0 便携包」，兜住协议漂移
+- **`verify_feature_18()` 必须保留**：校验 ReShade 日志三条证据（`signed DLSSNR 310.8.0 D3D12 runtime initialized` / `feature 18 created via the signed snippet` / `inline feature 18 evaluation succeeded`），否则 DLSS 未生效时会静默退化成普通缩放而用户无感
+- `classify_failure()` 把 `0xC0000005` 等原生崩溃翻译成可操作诊断，连同 worker stderr 尾部与 ReShade 日志写入后台日志
+
+#### 5.7.5 多趟放大与尺寸规划（`dlss5.py`）
+
+- 倍率与 DLSS 模式严格配对（1×↔DLAA/pq5、1.5×↔Quality/pq2、1.724×↔Balanced/pq1、2×↔Performance/pq0、3×↔Ultra/pq3），故 `render_size == 该趟输入尺寸`，**1:1 送入、无预缩放损失**（上游的 `resize_fit` 对图片实为空操作）
+- 上游最高只有 3×；`plan_passes()` 把目标倍数（1~8）拆成 ≤4 趟，择优：对数误差最小 → 趟数最少 → 达成倍数最大。4× = 2×+2×，8× = 2×+2×+2×，6× = 3×+2×
+- 趟次按倍率**降序**执行：① 触到 7680×4320 上限被截断时能保住更大的达成倍数（1080p 请求 6×，降序截断后仍有 3×/5760×3240，升序只剩 2×）；② 末趟是画质更好的 Performance 而非 Ultra Performance
+- 尺寸约束：输入宽高均 ≥64px；输出偶数对齐（`nearest_even`）且长边 ≤7680、短边 ≤4320；`apply_output_cap()` 逐趟推进，越界那趟及之后全部丢弃并回算实际倍数
+- `describe_plan_text()` 供 UI 实时提示：选中图片即显示「原尺寸 → 输出尺寸 · 实际倍数 · 趟数明细 · 是否被上限截断」，不再等到处理失败才报错
+- Alpha：DLSS 不处理透明通道，用**原图 Alpha** LANCZOS 放大到最终尺寸后覆盖输出 A 通道（与上游一致）；可选 `protect_transparent` 把 Alpha=0 区域 RGB 归零，避免 JPG/WEBP 透明边缘脏色
+- 会话池：key = `(worker路径, in_w, in_h, out_w, out_h, 参数指纹)`，同尺寸批量图复用一个原生 worker 进程，避免每张图重建 D3D12/NGX；单会话帧预算 256，用满即重建；空闲 180s 自动回收
+- `close()` 分两条路径：送满声明帧数 → 关 stdin 优雅退出；只送了部分帧（池复用/提前结束）→ 直接 terminate（与上游取消路径一致），避免 worker 等剩余帧而挂住
+- 取消：`request_cancel()` 置进程级 Event，由 `ProcessWorker.cancel()`（GUI 线程）调用；`ProcessWorker.run()` 的 finally 调 `shutdown_upscale_sessions()` + `clear_cancel()`，与抠图的 `shutdown_matting_workers()` 同一位置、同一约定
+
+#### 5.7.6 开发占位后端
+
+`runtime/upscale_settings.json` 的 `placeholder_backend`（配置页「应急与调试」可勾）开启后不加载 DLSS，改用 Pillow LANCZOS 放大，用于在没有运行时的机器上验证「面板 → Service → Worker → 输出」全链路。批处理详情会明确标注 `backend=placeholder(LANCZOS)` 并带 warning，**绝不静默冒充 DLSS 结果**；正式使用前须关闭。
+
+#### 5.7.7 一键安装（`bundle_installer.py`）
+
+从**本项目 Releases**下载运行时包并只提取必需文件：
+
+1. **固定直链优先**：`config.DLSS5_BUNDLE_DOWNLOAD_URL`（维护者上传后在 config 写死，如 `releases/download/DISS5/DLSS5.Runtime.v5.0.zip`，约 147 MB）——零 API 请求直接开始下载；直链缺失时按 tag 调 GitHub API（`DLSS5_BUNDLE_API_TAG` = `/releases/tags/<tag>`）→ `_pick_asset` 按「文件名含 dlss 的 zip 优先，否则唯一 zip」挑选兜底
+2. 下载 zip 到临时目录（大文件，`get_runtime_manager().rewrite_github_url` 走 GitHub 代理，失败回退直连）
+3. `match_entries(names)` 把 zip 条目映射到 5 个必需文件：规则 1「条目含 `bin/runtime/` 段且其后部分等于 rel」（完整便携包结构，可带顶层目录前缀）→ 规则 2「条目以 `/rel` 结尾」（自制精简 zip 顶层即 host/ + dlss/，当前 Releases 上传的就是这种）
+4. `extract_required` 逐文件读 zip 条目内容写到目标路径（不经 `ZipFile.extract` 的目录树展开，规避路径穿越）；若上传的是完整便携包（459 MB），ffmpeg / 内置 Python / 帧生成等无关内容全部跳过
+5. 落到 `runtime/upscale/dlss5/`（compact 布局）→ `inspect_bundle` 校验 → 清理临时目录
+
+**更新运行时包的流程**：同 tag（`DLSS5_BUNDLE_TAG`）替换 asset → 若文件名变化则同步改 `DLSS5_BUNDLE_ASSET_NAME`；`config.py` 是下载地址的唯一信源。
+
+纯函数（`match_entries` / `extract_required` / `_pick_asset`）可离线单测；网络部分与 `env_manager` 安装 uv 的模式一致（代理改写 + 回退序列 + `ProgressCb(stage, percent, message)`）。UI 侧 `_InstallWorker(QThread)` 后台执行，`cancel()` 置标记后下一个进度回调抛 `BundleInstallErrorCancelled` 中止，`wait_workers` 纳入有界等待。
+
 ---
 
 ## 6. 元数据编辑要点
@@ -441,9 +556,11 @@ python <model>_worker.py --serve --device auto --weights-dir ...
 | 2 | 配置 |
 | 3 | 版本日志 |
 
-配置子菜单：开发环境 (0) → 抠图模型配置 (1)。  
-`MainWindow.open_settings(row)` 支持从透明图链接跳转：  
-`pixelflow://settings/dev` / `pixelflow://settings/matting`。
+配置子菜单：开发环境 (0) → 抠图模型配置 (1) → 高清放大引擎 (2)。  
+`MainWindow.open_settings(row)` 支持从功能页链接跳转：  
+`pixelflow://settings/dev` / `pixelflow://settings/matting` / `pixelflow://settings/upscale`。
+
+**高清放大引擎页（`UpscaleEngineRoute`）：** 引擎选择 + 硬件/系统检测（显卡、架构世代、驱动、显存、Windows 版本、门禁结论）+ DLSS5 运行时目录管理（浏览 / 打开 / 恢复默认 / 逐文件校验 / DLSSNR 版本 / SHA256 比对）+ 应急与调试开关（跳过显卡架构校验、开发占位后端）+ 许可与免责说明。检测在 `_GateWorker(QThread)` 中执行，`wait_workers()` 纳入 `SettingsRoute.request_shutdown` 的有界等待。
 
 **开发环境门禁（进入抠图模型配置页）：**
 
@@ -504,13 +621,24 @@ python <model>_worker.py --serve --device auto --weights-dir ...
 - 不可排除被间接依赖的模块，例如：  
   - `http` / `email` / `xml` — python-pptx、python-docx、openpyxl 等需要  
 - 打包需包含 `core/matting/workers/`。  
+- 高清放大：`hiddenimports` 已补 `core.processors.upscale_processor` 与 `core.upscale.*`（`dlss5` / `dlss5_session` 在 `process()` 内延迟 import）。  
+- **严禁**把 DLSS5 运行时二进制（`nvngx_dlssnr.dll` / `nvngx_dlss.dll` / `renodx-dlss5.addon64` / `dxgi.dll` / `nvngx.dll`）加入 `datas` 或安装包：许可禁止再分发，且单个 DLSSNR 就 158 MB。二进制只放**本项目 Releases**（维护者上传），用户经配置页「一键安装」下载提取到 `runtime/upscale/dlss5/`（已被 `/runtime/` 忽略），或手动指定目录。  
+- 高清放大不引入任何新第三方依赖（协议用 `struct`/`subprocess`，像素用 Pillow），打包体积不变。  
 - 不确定时 **宁可保留、不排除**，避免运行时 `ModuleNotFoundError`。
 
 ---
 
-## 10. 扩展 AI 模型清单
+## 10. 扩展 AI 模型 / 放大引擎清单
 
-新增抠图模型时：
+**新增放大引擎时（如 Real-ESRGAN / SwinIR）：**
+
+1. 在 `core/upscale/engine_registry.py` 加一条 `UpscaleEngineInfo`：`id`、`platforms`、`min_gpu_generation`、`runtime_kind`（`builtin` 或 `external_bundle`）、以及该引擎**自己的一套** `ParamSpec`（分组 `group` + 同行 `row`，UI 会自动渲染）。  
+2. 实现 `core/upscale/<engine>.py`，暴露与 `dlss5.upscale_image(img, options) -> (Image, detail)` 同签名的入口。  
+3. 在 `UpscaleProcessor.process` 的引擎分派里加一个分支。  
+4. 若需外挂运行时，在 `runtime_bundle.py` 补文件清单，并在 `hardware_gate.check_engine` 里按 `runtime_kind` 走校验。  
+5. **UI 与 Service 无需改动**：面板由 schema 生成，校验由 `coerce_params` 统一处理，预设自动按引擎命名空间隔离。
+
+**新增抠图模型时：**
 
 1. 在 `model_registry.py` 注册：`id`、依赖、`python_version`（建议 `"3.12"`，勿超 3.12）、`worker_script`、权重文件名、硬件建议。  
 2. `env_packages` 中的 `torch`/`torchvision` 由 `RuntimeManager` 按 GPU 选 CUDA/CPU 索引安装，勿写死 `+cuXXX` 到普通 PyPI 规格。  
@@ -541,6 +669,22 @@ python <model>_worker.py --serve --device auto --weights-dir ...
 | `refresh_process_path()` | `env_manager.py` | 注册表 PATH → 当前进程 |
 | `ensure_exe_dir_on_path(exe)` | `env_manager.py` | 可执行目录注入 PATH |
 | `plan_torch_install()` / `match_gpu(...)` | `env_manager` / `gpu_catalog` | CUDA/CPU 安装方案 |
+| `detect_nvidia_gpu(force=)` | `env_manager.py` | nvidia-smi 探测（含逐卡 `gpus` 明细，按最高计算能力判定） |
+| `list_engines()` / `get_engine(id)` | `upscale/engine_registry.py` | 放大引擎注册表 |
+| `coerce_params(engine, raw, strict)` | `upscale/engine_registry.py` | 按 ParamSpec schema 校验/收敛 |
+| `check_engine(id, force=)` | `upscale/hardware_gate.py` | 显卡/系统/运行时门禁判定 |
+| `classify_gpu(name, cc)` | `upscale/hardware_gate.py` | 架构与世代分类（纯函数） |
+| `inspect_bundle(root)` | `upscale/runtime_bundle.py` | DLSS5 运行时逐文件校验 |
+| `plan_passes(target)` | `upscale/dlss5.py` | 目标倍数 → 多趟档位（降序） |
+| `resolve_plan(w, h, params)` | `upscale/dlss5.py` | 趟数 + 输出尺寸 + 上限截断 |
+| `upscale_image(img, options)` | `upscale/dlss5.py` | 单张放大 → (Image, detail) |
+| `describe_plan_text(w, h, params)` | `upscale/dlss5.py` | UI 实时预计输出提示 |
+| `shutdown_upscale_sessions()` | `upscale/dlss5.py` | 关闭全部渲染会话 |
+| `request_cancel()` / `clear_cancel()` | `upscale/dlss5.py` | 进程级取消标记 |
+| `DLSS5Session` / `verify_feature_18()` | `upscale/dlss5_session.py` | 原生协议会话与生效校验 |
+| `install_bundle(progress=)` | `upscale/bundle_installer.py` | 一键安装：Release 查询 → 下载 → 提取 → 校验 |
+| `find_release_asset()` | `upscale/bundle_installer.py` | 查询本项目 Releases 的运行时包 |
+| `match_entries(names)` / `extract_required(...)` | `upscale/bundle_installer.py` | zip 条目匹配与选择性提取（纯函数） |
 
 ---
 
@@ -564,4 +708,4 @@ python <model>_worker.py --serve --device auto --weights-dir ...
 2. 更新 `resources/CHANGELOG.md`  
 3. 同步修订本节相关章节  
 
-*文档对应实现阶段：处理器插件架构 · 批处理续跑 · AI 抠图阶段 1/2/3 · 元数据与透明图布局。*
+*文档对应实现阶段：处理器插件架构 · 批处理续跑 · AI 抠图阶段 1/2/3 · 元数据与透明图布局 · 高清放大（DLSS5）。*

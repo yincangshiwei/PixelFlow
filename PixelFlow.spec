@@ -88,8 +88,19 @@ a = Analysis(
         'core.processors.img2doc_processor',
         'core.processors.overlay_processor',
         'core.processors.metadata_processor',
+        'core.processors.upscale_processor',
         'core.runtime.env_manager',
         'core.matting.inference',
+        # 高清放大（DLSS5）：dlss5 / dlss5_session 在 UpscaleProcessor.process 内延迟 import，
+        # 需显式收集。注意：不打包任何 DLSS / ReShade / RenoDX 二进制（许可禁止再分发），
+        # 运行时由用户在「配置 → 高清放大引擎」下载或指定目录。
+        'core.upscale.engine_registry',
+        'core.upscale.hardware_gate',
+        'core.upscale.runtime_bundle',
+        'core.upscale.upscale_settings',
+        'core.upscale.dlss5',
+        'core.upscale.dlss5_session',
+        'core.upscale.bundle_installer',
         'openpyxl',
         'openpyxl.cell',
         'openpyxl.utils',
@@ -107,7 +118,7 @@ a = Analysis(
         # settings）及 ui.shell 均由 app.py → ui.shell.main_window 静态引用，
         # modulefinder 可自动收集，无需 hiddenimports
         # 各 FeatureService 在 create_processor 时延迟导入 processor，
-        # 打包时请确认五功能 processor 均在分析图中
+        # 打包时请确认六功能 processor 均在分析图中
         # HTML 抽图 / 粘贴（services.common.importing）：import html、html.parser
         'html',
         'html.parser',

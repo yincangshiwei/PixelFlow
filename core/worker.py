@@ -105,6 +105,13 @@ class ProcessWorker(QThread):
         # 只设置取消标记。常驻抠图进程由 run() 所在线程统一关闭，
         # 避免 GUI 线程与正在读写管道的工作线程并发销毁子进程。
         self._cancelled = True
+        # 高清放大：置位进程级取消标记，让正在进行的 DLSS5 渲染在帧边界中断
+        if getattr(self.processor, "preset_id", "") == "upscale":
+            try:
+                from core.upscale.dlss5 import request_cancel
+                request_cancel()
+            except Exception:
+                pass
 
     @property
     def current_path(self) -> str | None:
@@ -132,6 +139,23 @@ class ProcessWorker(QThread):
             except Exception as e:
                 try:
                     self.debug.emit(f"AI 抠图: 卸载时异常（可忽略）: {e}")
+                except Exception:
+                    pass
+
+            # 高清放大：关闭常驻 DLSS5 渲染会话（释放 D3D12/NGX 与显存）并复位取消标记。
+            # 与抠图同理，必须在 QThread 发出 finished 之前完成。
+            try:
+                from core.upscale.dlss5 import clear_cancel, shutdown_upscale_sessions
+                is_upscale = getattr(self.processor, "preset_id", "") == "upscale"
+                if is_upscale:
+                    self.debug.emit("高清放大: 正在关闭 DLSS5 渲染会话…")
+                shutdown_upscale_sessions()
+                clear_cancel()
+                if is_upscale:
+                    self.debug.emit("高清放大: 渲染会话已关闭")
+            except Exception as e:
+                try:
+                    self.debug.emit(f"高清放大: 关闭渲染会话时异常（可忽略）: {e}")
                 except Exception:
                     pass
 

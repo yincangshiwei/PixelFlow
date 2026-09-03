@@ -92,11 +92,13 @@ class TestFeatureDescriptor(unittest.TestCase):
             FeatureDescriptor(id="x", name="  ")
 
     def test_ids_unique_across_current_features(self):
-        """现有五功能 + 描述符 id 唯一性（P2 注册表的基线约束）。"""
+        """现有六功能 + 描述符 id 唯一性（P2 注册表的基线约束）。"""
         feats = [
             FeatureDescriptor(id="transparent_image", name="透明图处理",
                               input_kind=InputKind.IMAGE),
             FeatureDescriptor(id="basic_process", name="基础处理",
+                              input_kind=InputKind.IMAGE),
+            FeatureDescriptor(id="upscale", name="高清放大",
                               input_kind=InputKind.IMAGE),
             FeatureDescriptor(id="img2doc", name="图片排版导出",
                               input_kind=InputKind.BATCH_MERGED,

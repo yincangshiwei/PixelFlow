@@ -63,7 +63,7 @@
 |--------|------|
 | **图像处理** | 功能下拉菜单 + 预设管理栏 + 参数面板 |
 | **后台日志** | 日志占满整个区域，底部有清空日志按钮 |
-| **配置** | 左侧菜单：**开发环境**（Python / uv / Git / 镜像与代理）→ **抠图模型配置**（每模型独立环境、权重下载、硬件检测） |
+| **配置** | 左侧菜单：**开发环境**（Python / uv / Git / 镜像与代理）→ **抠图模型配置**（每模型独立环境、权重下载、硬件检测）→ **高清放大引擎**（显卡门禁、DLSS5 运行时校验） |
 | **版本日志** | 渲染 `resources/CHANGELOG.md`，支持 Markdown 格式展示，记录每次更新内容 |
 
 Tab 下方始终可见的固定区域：
@@ -151,7 +151,7 @@ presets/
 项目采用 **Route → Service → core** 的单向依赖分层（详见 [TECHNICAL.md](TECHNICAL.md)）：
 
 - **`ui/`（表现层）** — 壳层 `ui/shell/main_window.py` 只负责装配与连线；页面逻辑在 `ui/routes/`（文件列表 / 处理 / 配置 / 日志 / 版本日志），每个功能的参数面板是一个 FeatureRoute（`ui/routes/process/features/`）。Route 不直接读写 core，只与 Service 交互
-- **`services/`（服务层）** — 不依赖任何 QWidget。`services/features/` 是五功能的 FeatureService 与 catalog（功能注册的唯一权威入口，菜单顺序、预设、编排都读它）；`services/common/` 提供批处理编排（`BatchOrchestrator`）、预设、输出路径、导入等公共服务；`services/contracts/` 定义跨层契约（`ImportEntry` / `FeatureDescriptor` / `RunRequest` / `JobEvent` 等）
+- **`services/`（服务层）** — 不依赖任何 QWidget。`services/features/` 是六功能的 FeatureService 与 catalog（功能注册的唯一权威入口，菜单顺序、预设、编排都读它）；`services/common/` 提供批处理编排（`BatchOrchestrator`）、预设、输出路径、导入等公共服务；`services/contracts/` 定义跨层契约（`ImportEntry` / `FeatureDescriptor` / `RunRequest` / `JobEvent` 等）
 - **`core/`（处理核心）** — 纯处理逻辑，不 import ui。处理器只做 `process` / `process_batch`，不含任何控件代码
 
 **核心设计：**
@@ -225,6 +225,22 @@ presets/
 
 **推荐准备顺序：** 开发环境检测 Python → 安装 uv → 确认 Git（BEN2）/ 按需配置 GitHub 代理 → 抠图模型「创建/修复环境」→ 下载权重 → 透明图处理勾选 AI 抠图。
 
+#### 高清放大引擎
+
+| 能力 | 说明 |
+|------|------|
+| **引擎选择** | 当前仅 DLSS 5 神经渲染；下拉直接标注该引擎在本机的可用性状态 |
+| **硬件与系统检测** | 显卡名称 / 架构与世代 / 驱动 / 显存 / Windows 版本与位数 / 门禁结论（多卡机器按计算能力最高者判定） |
+| **运行时目录管理** | 浏览、打开目录、恢复默认；支持便携包原始布局 `<目录>/bin/runtime/` 与精简布局 `<目录>/` 两种 |
+| **完整性校验** | 5 个必需文件逐项 ✓/✗ + 体积 + PE 版本号（识别 DLSSNR 是否为已验证的 310.8.SF.0）+ `host/` 可写性；可选计算 SHA256 与已测试构建参考值比对 |
+| **一键安装** | 从本项目 Releases 自动下载运行时包（走「开发环境」配置的 GitHub 代理，失败逐级回退直连），只提取图片放大所需 5 个文件到 `runtime/upscale/dlss5/`，安装完自动校验；支持取消 |
+| **应急与调试** | 「跳过显卡架构校验」（nvidia-smi 未报 compute_cap 时应急）；「开发占位后端」（不加载 DLSS，用 LANCZOS 验证处理链路，日志明确标注） |
+| **许可与免责** | 明示 NVIDIA / ReShade / RenoDX 各自的许可约束与获取渠道 |
+
+**推荐准备顺序：** 确认显卡为 RTX 40 系及以上 → 「配置 → 高清放大引擎」点「一键安装 DLSS5 运行时」→ 自动下载并校验 → 图像处理选「高清放大」。也可手动下载运行时包 zip、解压到**可写**目录（勿放 `C:\Program Files`）后在配置页指定目录。
+
+> 高清放大**不需要**安装 uv、也不需要创建 Python 环境：渲染协议以标准库实现，像素处理沿用 Pillow，主程序与打包产物零新增依赖。
+
 ### ⚙ 基础处理
 
 通用图片批量处理流水线，各步骤均可独立启用，支持任意组合：
@@ -237,6 +253,44 @@ presets/
 | **批量重命名** | 前缀模式、前缀文本、起始序号、位数 | 自定义前缀或保留原文件名，序号自动补零 |
 
 **典型使用场景：** 电商图批量转 JPG + 压缩到 100KB 以内 + 按 `product_001` 格式重命名；印刷稿统一改为 300 DPI 而不缩放像素。
+
+---
+
+### 🔍 高清放大
+
+AI 高清放大，首期接入 **NVIDIA DLSS 5 神经渲染 + DLSS 超分**。
+
+放大引擎采用**注册表驱动的动态参数面板**：每个引擎有自己独立的一套参数，切换引擎即整体切换下方参数区，各引擎参数在预设中分别保存、互不覆盖。将来接入其它放大技术（Real-ESRGAN / SwinIR 等）时 UI 无需改动。
+
+| 参数组 | 参数 | 说明 |
+|--------|------|------|
+| **放大倍率** | 放大档位 | 1× DLAA（仅增强不放大）/ 1.5× Quality / 1.724× Balanced / **2× Performance（默认）** / 3× Ultra Performance |
+| | 多趟放大 + 目标倍数 | 上游最高只有 3×；本功能可设 1~8× 目标，自动拆成多趟原生档位（4× = 2× 跑两趟，8× = 三趟）。每趟送入 DLSS 的渲染尺寸都与该趟输入 1:1，比单次 3× Ultra Performance 更保细节 |
+| **神经渲染 (DLSS 5 NR)** | NR 风格 / NR 强度 / NR Preset / Automatic Mask | 风格 Default·Natural·Cinematic；强度 0~2（默认 1.00，0 = 只超分不改观感）；Preset 为实验性原生模型提示 |
+| **细节与色调** | 局部结构 / 局部色调 / 皮肤结构 | 前两项 0~2（默认 1.00）；皮肤结构 -1~2，-1 = 跟随原生默认，人像可试 0~1.2 |
+| **DLSS 模型预设** | Default / J / K / L / M | Default = 由 NVIDIA 按模式自选（推荐）。J/K 属 DLSS 4，L/M 是 DLSS 4.5 第二代 Transformer 预设；静态图想手动挑可先试 L，过度锐化再回退 K |
+| **输出** | 格式 / 质量 | PNG（无损，默认）/ JPG / WEBP；有损格式可调质量 1~100 |
+| **高级** | 预热帧数 / 透明区保护 / AI 处理显卡 | 透明区保护：把 Alpha=0 区域 RGB 归零，避免 JPG/WEBP 透明边缘脏色 |
+
+**硬件与运行时门禁（不满足则功能不可用，并给出具体原因）：**
+
+| 项 | 要求 |
+|----|------|
+| 显卡 | **NVIDIA RTX 40 系（Ada）及以上**；RTX 30 系及以下、非 RTX 卡一律阻断 |
+| 系统 | 64 位 Windows 11 + Direct3D 12（Windows 10 仅警告，可能无法初始化） |
+| 运行时 | DLSS5 便携包中图片路径必需的 5 个文件齐全，且 `host/` 目录可写 |
+| 输入 | 宽高均 ≥ 64 像素 |
+| 输出 | 偶数对齐，长边 ≤ 7680、短边 ≤ 4320；超出时自动截断多趟趟数并提示 |
+
+选中左侧图片即实时显示「原尺寸 → 预计输出尺寸 · 实际倍数 · 趟数明细 · 是否触顶截断」，不必等到处理失败才知道超限。
+
+**效果预期：** NVIDIA 官方将 DLSS 5 定义为**生成式神经渲染**（单步像素空间扩散模型），依据学习到的真实世界外观先验重构画面（如皮肤次表面散射、植被透光），而非像素级忠实还原。静态图片没有运动矢量与时序信息，本质是单帧生成式增强 —— 人像、自然场景收益明显；线稿、文字截图、纯色电商图建议先把「NR 强度」调低再批量，或改用 1× DLAA 只做轻度增强。
+
+**运行时获取（重要）：** DLSS 5 依赖 NVIDIA 专有运行时（`nvngx_dlssnr.dll` 约 158 MB、`nvngx_dlss.dll`，受 NVIDIA RTX SDK License 约束**禁止再分发**）、ReShade（BSD-3-Clause）与 RenoDX DLSS5 add-on。因此这些文件**不随 PixelFlow 源码仓库分发**，运行时包由维护者上传至[本项目 Releases](https://github.com/yincangshiwei/PixelFlow/releases)，在「配置 → 高清放大引擎」点**一键安装**即可自动下载 `DLSS5.Runtime.v5.0.zip`（约 147 MB，仅含图片放大所需的 5 个文件）并解压到 `runtime/upscale/dlss5/`；也可手动下载 zip 后在配置页指定目录。
+
+> 本功能为独立实现，与 NVIDIA、ReShade、RenoDX 均无关联、未获背书。RTX 40 系可运行依赖社区 add-on 放开官方「仅 50 系」限制，属非官方路径，驱动更新后可能失效。
+
+**典型使用场景：** 老照片与低清素材放大 2×/4× 并补回细节；电商主图从 800×800 放大到 3200×3200 用于大幅面详情页或印刷；截图与插画在保持线条干净的前提下提升分辨率（建议先调低 NR 强度）。
 
 ---
 
@@ -399,6 +453,7 @@ PixelFlow/
 ├── presets/                            # 预设文件目录（运行时自动生成）
 │   ├── transparent_image/
 │   ├── basic_process/
+│   ├── upscale/
 │   ├── img2doc/
 │   ├── image_overlay/
 │   └── metadata_edit/
@@ -420,9 +475,17 @@ PixelFlow/
 │   │   ├── inference.py
 │   │   └── workers/                    # 在模型 venv 中运行的脚本
 │   │       └── ben2_worker.py
-│   └── processors/                     # 五功能处理器（插件，纯处理）
+│   ├── upscale/                        # 高清放大（多引擎，纯逻辑）
+│   │   ├── engine_registry.py          # 引擎注册表 + ParamSpec 参数 schema
+│   │   ├── hardware_gate.py            # 显卡架构 / 系统门禁（RTX 40 系及以上）
+│   │   ├── runtime_bundle.py           # 外挂运行时定位与逐文件校验
+│   │   ├── upscale_settings.py         # runtime/upscale_settings.json
+│   │   ├── dlss5.py                    # 尺寸规划 / 多趟放大 / 会话池 / Alpha 保留
+│   │   └── dlss5_session.py            # 原生 worker 二进制协议（纯标准库）
+│   └── processors/                     # 六功能处理器（插件，纯处理）
 │       ├── transparent_processor.py    # 透明图处理器（含 AI 抠图步骤）
 │       ├── basic_processor.py          # 基础处理器
+│       ├── upscale_processor.py        # 高清放大处理器（按引擎分派）
 │       ├── img2doc_processor.py        # 图片排版导出处理器
 │       ├── overlay_processor.py        # 图片叠加处理器
 │       └── metadata_processor.py       # 元数据编辑处理器
@@ -432,6 +495,7 @@ PixelFlow/
 │   │   ├── catalog.py                  # 统一构建 FeatureRegistry（菜单顺序 / 预设 / 编排读取）
 │   │   ├── registry.py                 # FeatureRegistry
 │   │   ├── basic_service.py            # 基础处理 Service
+│   │   ├── upscale_service.py          # 高清放大 Service（按引擎 schema 校验）
 │   │   ├── transparent_service.py      # 透明图处理 Service
 │   │   ├── img2doc_service.py          # 图片排版导出 Service
 │   │   ├── overlay_service.py          # 图片叠加 Service
@@ -455,8 +519,8 @@ PixelFlow/
     │   │   ├── process_tab_route.py    # 处理 Tab（功能切换 / 面板栈 / 预设连线）
     │   │   ├── output_settings_route.py# 输出设置
     │   │   ├── action_bar_route.py     # 底部操作栏（进度 / 开始 / 取消）
-    │   │   └── features/               # 五功能参数面板（FeatureRoute）
-    │   ├── settings/                   # 配置中心（开发环境 / 抠图模型）
+    │   │   └── features/               # 六功能参数面板（FeatureRoute）
+    │   ├── settings/                   # 配置中心（开发环境 / 抠图模型 / 高清放大引擎）
     │   ├── log/                        # 后台日志页
     │   └── changelog/                  # 版本日志页
     ├── widgets/                        # 通用控件（标签芯片编辑器等）
@@ -474,8 +538,9 @@ PixelFlow/
 - python-docx >= 1.1（图片排版导出 Word）
 - openpyxl >= 3.1（Excel 排序功能）
 - **AI 抠图（可选）**：需本机 Python 3.10–3.12（64 位）+ 软件内安装的 **uv**；依赖由配置页自动装入 `runtime/envs/`，无需写入主程序 `requirements.txt`
+- **高清放大（可选，仅 Windows）**：需 64 位 Windows 11 + Direct3D 12 + **NVIDIA RTX 40 系及以上**显卡 + 用户自行获取的 DLSS5 外挂运行时（约 200 MB，落在 `runtime/upscale/dlss5/`）。**不需要** uv，也不需要创建 Python 环境，主程序零新增依赖
 
-> 主程序依赖均为跨平台库。核心图像处理、排版导出、叠加、元数据、AI 抠图（子进程 + uv 隔离环境）在 macOS 上均可使用。个别体验差异见下文「macOS 说明」。
+> 主程序依赖均为跨平台库。核心图像处理、排版导出、叠加、元数据、AI 抠图（子进程 + uv 隔离环境）在 macOS 上均可使用；**高清放大（DLSS 5）为 Windows 专属**，在 macOS 上引擎会被门禁阻断并说明原因。个别体验差异见下文「macOS 说明」。
 
 ## 安装与运行
 
@@ -504,6 +569,7 @@ python app.py
 | 解释器 | 推荐官方 python.org 或 Homebrew 的 Python 3.12；配置页选择解释器时选 `python3`（不是 `python.exe`） |
 | AI 抠图 | 与 Windows 相同：配置 → 开发环境（检测 Python / 安装 uv）→ 抠图模型配置（创建环境、下载权重） |
 | GPU | macOS 无 CUDA；抠图设备选「自动 / CPU」即可（视 PyTorch 与机型而定，可能使用 MPS/CPU） |
+| 高清放大 | **不可用**。DLSS 5 依赖 Windows 的 Direct3D 12 与 NVIDIA 专有运行时，配置页与功能面板会明确标注不可用原因；其余功能不受影响 |
 | 桌面路径 | 界面默认「桌面」按 `~/Desktop` 解析；若系统桌面文件夹名为「桌面」且路径异常，可改用「自定义路径」 |
 | 中文字体 | 图片叠加内置字体名偏 Windows（如微软雅黑）；可用「加载外部字体」选择 `.ttf/.otf/.ttc`，或依赖自动回退 |
 | 元数据「标记」 | 写入的是文件内 EXIF/PNG 字段；Finder 展示方式可能与 Windows 资源管理器不同 |
@@ -706,6 +772,17 @@ class MyProcessor(BaseProcessor):
 4. **注册到 catalog**（`services/features/catalog.py`）— 在 `_SERVICE_TYPES` 与 `EXPECTED_FEATURE_ORDER` 中加入新功能（菜单顺序以 catalog 为准），并在 `ProcessTabRoute` 的 route 工厂映射中注入 Route
 
 完成后重启应用，新功能即出现在功能下拉菜单中，预设系统自动可用。打包时记得在 `PixelFlow.spec` 的 `hiddenimports` 中补充新处理器模块。
+
+### 扩展新的放大引擎
+
+「高清放大」的参数面板与校验**完全由引擎注册表驱动**，新增放大技术（Real-ESRGAN / SwinIR 等）不需要改任何 UI 代码：
+
+1. 在 `core/upscale/engine_registry.py` 加一条 `UpscaleEngineInfo`，声明 `platforms`、`min_gpu_generation`、`runtime_kind`，以及该引擎**自己的一套** `ParamSpec`（`group` 决定分组、`row` 决定同行横排）
+2. 实现 `core/upscale/<engine>.py`，入口签名与 `dlss5.upscale_image(img, options) -> (Image, detail)` 一致
+3. 在 `UpscaleProcessor.process` 的引擎分派里加一个分支
+4. 若需外挂运行时，在 `runtime_bundle.py` 补文件清单
+
+面板会自动按 schema 渲染新引擎的参数组，预设自动按引擎命名空间隔离（切换引擎不丢参数），`coerce_params` 自动完成校验与收敛。
 
 ## License
 

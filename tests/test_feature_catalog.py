@@ -1,4 +1,4 @@
-"""FeatureRegistry / catalog（五功能统一契约，无 QWidget 路径）。"""
+"""FeatureRegistry / catalog（六功能统一契约，无 QWidget 路径）。"""
 import unittest
 
 from services.contracts.feature_descriptor import InputKind
@@ -16,6 +16,7 @@ from services.features.transparent_service import (
     TransparentService,
     FEATURE_ID as TRANSPARENT_ID,
 )
+from services.features.upscale_service import UpscaleService, FEATURE_ID as UPSCALE_ID
 
 
 class TestFeatureRegistry(unittest.TestCase):
@@ -50,6 +51,7 @@ class TestCatalog(unittest.TestCase):
         self.assertIsInstance(services[OVERLAY_ID], OverlayService)
         self.assertIsInstance(services[IMG2DOC_ID], Img2DocService)
         self.assertIsInstance(services[TRANSPARENT_ID], TransparentService)
+        self.assertIsInstance(services[UPSCALE_ID], UpscaleService)
 
     def test_batch_merged_resume_flags(self):
         reg, _ = build_feature_registry()

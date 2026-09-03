@@ -33,11 +33,13 @@ from services.features.metadata_service import FEATURE_ID as METADATA_ID
 from services.features.overlay_service import FEATURE_ID as OVERLAY_ID
 from services.features.img2doc_service import FEATURE_ID as IMG2DOC_ID
 from services.features.transparent_service import FEATURE_ID as TRANSPARENT_ID
+from services.features.upscale_service import FEATURE_ID as UPSCALE_ID
 from ui.routes.process.features.basic_route import BasicFeatureRoute
 from ui.routes.process.features.metadata_route import MetadataFeatureRoute
 from ui.routes.process.features.overlay_route import OverlayFeatureRoute
 from ui.routes.process.features.img2doc_route import Img2DocFeatureRoute
 from ui.routes.process.features.transparent_route import TransparentFeatureRoute
+from ui.routes.process.features.upscale_route import UpscaleFeatureRoute
 
 
 def _default_route_factories() -> dict[str, callable]:
@@ -47,6 +49,7 @@ def _default_route_factories() -> dict[str, callable]:
         OVERLAY_ID: OverlayFeatureRoute,
         IMG2DOC_ID: Img2DocFeatureRoute,
         TRANSPARENT_ID: TransparentFeatureRoute,
+        UPSCALE_ID: UpscaleFeatureRoute,
     }
 
 
@@ -369,13 +372,16 @@ class ProcessTabRoute(QWidget):
         return getattr(tr, "matting_group", None) or getattr(tr, "_grp_matting", None)
 
     def set_base_image_size(self, w: int, h: int) -> None:
-        """同步底图尺寸给叠加 Route / Processor。"""
+        """同步底图尺寸给叠加 Route / Processor 与高清放大 Route（预计输出提示）。"""
         route = self._route_by_id.get(OVERLAY_ID)
         if route is not None and hasattr(route, "set_base_image_size"):
             route.set_base_image_size(w, h)
         proc = self._processor_by_id.get(OVERLAY_ID)
         if proc is not None and hasattr(proc, "set_base_image_size"):
             proc.set_base_image_size(w, h)
+        up_route = self._route_by_id.get(UPSCALE_ID)
+        if up_route is not None and hasattr(up_route, "set_base_image_size"):
+            up_route.set_base_image_size(w, h)
 
     # ── 功能切换 ──
 

@@ -2,7 +2,7 @@
 
 不再存在 @register_processor 装饰器注册表；功能的唯一权威注册是
 FeatureDescriptor（catalog.build_feature_registry）。这里校验：
-  1. 五个功能全部在册、preset_id 与处理器类一致；
+  1. 六个功能全部在册、preset_id 与处理器类一致；
   2. 菜单顺序稳定；
   3. id / preset_id 唯一；
   4. 处理器类元数据（name/description/icon/preset_id）完整；
@@ -18,9 +18,10 @@ class TestFeatureRegistry(unittest.TestCase):
     def setUp(self):
         self.reg, self.services = build_feature_registry()
 
-    def test_all_five_registered(self):
+    def test_all_features_registered(self):
         self.assertEqual(self.reg.ids(), EXPECTED_FEATURE_ORDER)
-        self.assertEqual(len(self.reg.ids()), 5)
+        self.assertEqual(len(self.reg.ids()), 6)
+        self.assertIn("upscale", self.reg.ids())
 
     def test_preset_id_matches_processor(self):
         # FeatureDescriptor.id 即 preset_id（全局唯一）

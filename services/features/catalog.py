@@ -1,9 +1,9 @@
 """功能目录 —— 统一构建 FeatureRegistry（权威注册入口，纯逻辑无 Qt/ui）。
 
-顺序与历史菜单一致：
-  transparent_image → basic_process → img2doc → image_overlay → metadata_edit
+顺序与历史菜单一致（高清放大插在基础处理之后）：
+  transparent_image → basic_process → upscale → img2doc → image_overlay → metadata_edit
 
-五功能均走独立 FeatureService；route_factory 由 UI 层注入。
+六功能均走独立 FeatureService；route_factory 由 UI 层注入。
 """
 from __future__ import annotations
 
@@ -15,12 +15,14 @@ from .metadata_service import MetadataService, FEATURE_ID as METADATA_ID
 from .overlay_service import OverlayService, FEATURE_ID as OVERLAY_ID
 from .img2doc_service import Img2DocService, FEATURE_ID as IMG2DOC_ID
 from .transparent_service import TransparentService, FEATURE_ID as TRANSPARENT_ID
+from .upscale_service import UpscaleService, FEATURE_ID as UPSCALE_ID
 from .registry import FeatureRegistry
 
 # 完整菜单顺序 —— 测试与菜单基线
 EXPECTED_FEATURE_ORDER = [
     TRANSPARENT_ID,
     BASIC_ID,
+    UPSCALE_ID,
     IMG2DOC_ID,
     OVERLAY_ID,
     METADATA_ID,
@@ -30,6 +32,7 @@ EXPECTED_FEATURE_ORDER = [
 _SERVICE_TYPES: list[tuple[str, type]] = [
     (TRANSPARENT_ID, TransparentService),
     (BASIC_ID, BasicService),
+    (UPSCALE_ID, UpscaleService),
     (IMG2DOC_ID, Img2DocService),
     (OVERLAY_ID, OverlayService),
     (METADATA_ID, MetadataService),

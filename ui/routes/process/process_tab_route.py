@@ -430,9 +430,19 @@ class ProcessTabRoute(QWidget):
             svc = self._services.get(fid)
             default_data = svc.default_state() if svc else {}
             self._preset_service.ensure_default(fid, default_data)
-            result = self._preset_service.load_default(fid)
-            if result.ok and result.data is not None:
-                self._apply_state_to_feature(fid, result.data)
+            # 优先恢复上次选中的预设；无记忆或已失效时回落 default
+            data = None
+            name = self._preset_service.last_selected(fid)
+            if name and name != "default":
+                result = self._preset_service.load_preset(fid, name)
+                if result.ok and result.data is not None:
+                    data = result.data
+            if data is None:
+                result = self._preset_service.load_default(fid)
+                if result.ok and result.data is not None:
+                    data = result.data
+            if data is not None:
+                self._apply_state_to_feature(fid, data)
         self._refresh_preset_list()
 
     def _apply_state_to_feature(self, feature_id: str, data: dict) -> None:
@@ -449,9 +459,18 @@ class ProcessTabRoute(QWidget):
         if not fid:
             self.combo_preset.blockSignals(False)
             return
-        for name in self._preset_service.list_presets(fid):
+        names = self._preset_service.list_presets(fid)
+        for name in names:
             display = f"[默认] {name}" if name == "default" else name
             self.combo_preset.addItem(display, name)
+        # 选中上次使用的预设（无记忆/已失效时回落 default）
+        target = self._preset_service.last_selected(fid) or "default"
+        if target not in names:
+            target = "default"
+        for i in range(self.combo_preset.count()):
+            if self.combo_preset.itemData(i) == target:
+                self.combo_preset.setCurrentIndex(i)
+                break
         self.combo_preset.blockSignals(False)
 
     def _select_preset_in_combo(self, name: str) -> None:
@@ -460,7 +479,16 @@ class ProcessTabRoute(QWidget):
                 self.combo_preset.blockSignals(True)
                 self.combo_preset.setCurrentIndex(i)
                 self.combo_preset.blockSignals(False)
+                self._remember_preset(name)
                 break
+
+    def _remember_preset(self, name: str) -> None:
+        fid = self._current_feature_id
+        if fid and name:
+            try:
+                self._preset_service.remember_selected(fid, name)
+            except Exception:
+                pass
 
     def _on_preset_selected(self, _combo_idx: int) -> None:
         fid = self._current_feature_id
@@ -473,6 +501,7 @@ class ProcessTabRoute(QWidget):
         if not result.ok or result.data is None:
             return
         self.apply_state_to_current(result.data)
+        self._remember_preset(name)
         display = "默认" if name == "default" else name
         self.log_message.emit(f"已加载预设: {display}")
 
@@ -602,6 +631,9 @@ class ProcessTabRoute(QWidget):
             return
         result = self._preset_service.delete_preset(fid, name)
         if result.ok:
+            # 删除的正是记忆中的预设时清除记忆，回落 default
+            if self._preset_service.last_selected(fid) == name:
+                self._preset_service.forget_selected(fid)
             self._refresh_preset_list()
             self.log_message.emit(result.message)
 

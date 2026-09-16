@@ -203,7 +203,9 @@ class OverlayFeatureRoute(QWidget):
         left_layout.setSpacing(6)
 
         self._list_widget = QListWidget()
-        self._list_widget.setMinimumHeight(140)
+        # 固定高度：避免左侧列表被右侧配置内容撑高，操作按钮始终紧跟列表下方；
+        # 元素较多时列表自身出滚动条
+        self._list_widget.setFixedHeight(240)
         self._list_widget.currentRowChanged.connect(self._on_element_selected)
         left_layout.addWidget(self._list_widget)
 
@@ -243,6 +245,8 @@ class OverlayFeatureRoute(QWidget):
 
         btn_layout.addStretch()
         left_layout.addLayout(btn_layout)
+        # 多余空间留在按钮行之后：左侧面板被拉伸时按钮不被推远、不变形
+        left_layout.addStretch()
 
         elem_layout.addWidget(left_panel, stretch=2)
 

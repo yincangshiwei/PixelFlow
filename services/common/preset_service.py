@@ -4,6 +4,7 @@
 - 按 feature_id 缓存管理器
 - 经 FeatureService.normalize_preset 做兼容迁移
 - 外部文件导入的重名决策（返回结果，UI 弹窗由 Route 完成）
+- 各功能「上次选中预设」的持久化记忆（runtime/preset_state.json）
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from core.preset_manager import PresetManager
+from config import PRESET_STATE_PATH
 
 
 class PresetConflictAction(Enum):
@@ -54,6 +56,9 @@ class PresetService:
         """
         self._resolver = service_resolver
         self._managers: dict[str, PresetManager] = {}
+        # 上次选中预设记忆（feature_id -> preset_name）；惰性加载
+        self._state_path: Path = Path(PRESET_STATE_PATH)
+        self._last_selected: Optional[dict[str, str]] = None
 
     def set_service_resolver(self, resolver: Callable[[str], Any] | None) -> None:
         self._resolver = resolver
@@ -96,6 +101,59 @@ class PresetService:
         mgr = self.manager_for(feature_id)
         data = default_data if default_data is not None else self._default_state(feature_id)
         mgr.ensure_default(dict(data or {}))
+
+    # ── 上次选中预设记忆 ──
+
+    def last_selected(self, feature_id: str) -> Optional[str]:
+        """某功能上次选中的预设名；无记忆或预设已不存在时返回 None。"""
+        self._ensure_state_loaded()
+        name = (self._last_selected or {}).get(feature_id)
+        if not name:
+            return None
+        if name != "default" and name not in self.list_presets(feature_id):
+            return None
+        return name
+
+    def remember_selected(self, feature_id: str, name: str) -> None:
+        """记录某功能上次选中的预设并持久化。"""
+        self._ensure_state_loaded()
+        if self._last_selected.get(feature_id) == name:
+            return
+        self._last_selected[feature_id] = name
+        self._save_state()
+
+    def forget_selected(self, feature_id: str) -> None:
+        """清除某功能的选中记忆（删除预设后回落 default）。"""
+        self._ensure_state_loaded()
+        if feature_id in self._last_selected:
+            del self._last_selected[feature_id]
+            self._save_state()
+
+    def _ensure_state_loaded(self) -> None:
+        if self._last_selected is not None:
+            return
+        state: dict[str, str] = {}
+        try:
+            if self._state_path.exists():
+                raw = json.loads(self._state_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    state = {
+                        k: v for k, v in raw.items()
+                        if isinstance(k, str) and isinstance(v, str) and v
+                    }
+        except Exception:
+            state = {}
+        self._last_selected = state
+
+    def _save_state(self) -> None:
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._state_path.write_text(
+                json.dumps(self._last_selected, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass  # 记忆持久化失败不影响预设主流程
 
     def load_preset(self, feature_id: str, name: str) -> PresetOpResult:
         mgr = self.manager_for(feature_id)

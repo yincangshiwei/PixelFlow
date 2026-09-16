@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 import core.preset_manager as pm
+import services.common.preset_service as ps_mod
 from services.common.preset_service import (
     PresetConflictAction,
     PresetService,
@@ -84,6 +85,62 @@ class TestPresetService(unittest.TestCase):
         )
         self.assertTrue(r.ok)
         self.assertEqual(self.svc.load_preset("basic_process", "ext").data["quality"], 99)
+
+
+class TestPresetSelectionMemory(unittest.TestCase):
+    """上次选中预设记忆：持久化 / 失效回落 / 容错。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._patchers = [
+            mock.patch.object(pm, "PRESETS_DIR", self.root / "presets"),
+            mock.patch.object(ps_mod, "PRESET_STATE_PATH", self.root / "state.json"),
+        ]
+        for p in self._patchers:
+            p.start()
+        self.basic = BasicService()
+        self.svc = PresetService(
+            service_resolver=lambda fid: self.basic if fid == "basic_process" else None
+        )
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+        self._tmp.cleanup()
+
+    def test_no_memory_returns_none(self):
+        self.assertIsNone(self.svc.last_selected("basic_process"))
+
+    def test_remember_and_reload(self):
+        self.svc.ensure_default("basic_process")
+        self.svc.save_preset("basic_process", "电商", {"quality": 70})
+        self.svc.remember_selected("basic_process", "电商")
+        self.assertEqual(self.svc.last_selected("basic_process"), "电商")
+        # 新实例（模拟重启）从状态文件恢复
+        svc2 = PresetService(service_resolver=lambda fid: self.basic)
+        self.assertEqual(svc2.last_selected("basic_process"), "电商")
+
+    def test_stale_memory_returns_none(self):
+        self.svc.ensure_default("basic_process")
+        self.svc.save_preset("basic_process", "电商", {"quality": 70})
+        self.svc.remember_selected("basic_process", "电商")
+        self.svc.delete_preset("basic_process", "电商")
+        self.assertIsNone(self.svc.last_selected("basic_process"))
+
+    def test_forget_selected(self):
+        self.svc.ensure_default("basic_process")
+        self.svc.remember_selected("basic_process", "default")
+        self.svc.forget_selected("basic_process")
+        self.assertIsNone(self.svc.last_selected("basic_process"))
+
+    def test_corrupted_state_file_tolerated(self):
+        (self.root / "state.json").write_text("{not json", encoding="utf-8")
+        svc = PresetService(service_resolver=lambda fid: self.basic)
+        self.assertIsNone(svc.last_selected("basic_process"))
+        # 损坏后仍可正常写入新记忆
+        svc.remember_selected("basic_process", "default")
+        self.assertEqual(svc.last_selected("basic_process"), "default")
 
 
 if __name__ == "__main__":

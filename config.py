@@ -8,7 +8,7 @@ from pathlib import Path
 # ─── 应用基本信息 ───
 APP_NAME = "PixelFlow"
 APP_TITLE = "PixelFlow - 图像处理工作台"
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
 APP_DESCRIPTION = "图像处理工作台"
 APP_PUBLISHER = "PixelFlow"
 
@@ -60,6 +60,9 @@ RUNTIME_UV_DIR = RUNTIME_DIR / "uv"
 UPSCALE_RUNTIME_DIR = RUNTIME_DIR / "upscale"
 DLSS5_RUNTIME_DIR = UPSCALE_RUNTIME_DIR / "dlss5"
 UPSCALE_SETTINGS_PATH = RUNTIME_DIR / "upscale_settings.json"
+
+# 预设选中状态记忆（记录每个功能上次选中的预设名，启动时恢复）
+PRESET_STATE_PATH = RUNTIME_DIR / "preset_state.json"
 
 # ─── UI 样式常量 ───
 # 全局下拉框样式（QComboBox），确保背景色不透明，字体清晰可见

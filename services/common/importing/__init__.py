@@ -12,10 +12,13 @@ from .constants import (
     HTML_EXTS,
     IMAGE_EXTS,
     IMPORT_EXTS,
+    RAW_EXTS,
     VALID_EXTS,
     _IMAGE_PATH_EXTS,
     _IMG_MAGIC,
     _MIN_EXTRACTED_IMAGE_BYTES,
+    image_dialog_filter,
+    image_only_dialog_filter,
 )
 from .container import _extract_images_from_container, run_extract_jobs
 from .docx_extractor import _extract_images_from_docx
@@ -65,8 +68,9 @@ from .temp_store import (
 
 __all__ = [
     # constants
-    "IMAGE_EXTS", "DOC_EXTS", "HTML_EXTS", "EXTRACT_EXTS", "VALID_EXTS",
+    "IMAGE_EXTS", "RAW_EXTS", "DOC_EXTS", "HTML_EXTS", "EXTRACT_EXTS", "VALID_EXTS",
     "IMPORT_EXTS", "_IMAGE_PATH_EXTS", "_MIN_EXTRACTED_IMAGE_BYTES", "_IMG_MAGIC",
+    "image_dialog_filter", "image_only_dialog_filter",
     # scanner
     "_normalize_local_path", "_scan_folder_images", "_scan_folder_extract_files",
     "_collect_import_groups", "_collect_extract_files",

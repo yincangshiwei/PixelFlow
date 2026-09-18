@@ -16,6 +16,13 @@ from typing import Any
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
+from core.image_io import (
+    coerce_writable_format,
+    is_raw_ext,
+    is_raw_path,
+    load_image,
+)
+
 # ── EXIF / Windows XP 标签 ──
 TAG_IMAGE_DESCRIPTION = 0x010E  # 270  描述
 TAG_ARTIST = 0x013B             # 315  作者
@@ -135,10 +142,14 @@ def ext_of_format(fmt: str) -> str:
 def detect_true_format(path: str | Path) -> str:
     """
     检测图片真实格式（不依赖扩展名）。
-    优先 Pillow format；失败时回退文件魔数。
-    返回规范化短名，如 jpg / png / mpo / webp；无法识别返回 ""。
+    优先 Pillow format；失败时回退文件魔数；相机 RAW 按扩展名识别。
+    返回规范化短名，如 jpg / png / mpo / webp / cr2；无法识别返回 ""。
     """
     path = Path(path)
+    # 0) 相机 RAW：Pillow 通常无法识别，按扩展名返回短名
+    if is_raw_path(path):
+        return path.suffix.lower().lstrip(".") or "raw"
+
     # 1) Pillow
     try:
         with Image.open(str(path)) as img:
@@ -174,6 +185,7 @@ def detect_true_format(path: str | Path) -> str:
     if head.startswith((b"GIF87a", b"GIF89a")):
         return "gif"
     if head.startswith((b"II*\x00", b"MM\x00*")):
+        # DNG 也常以 TIFF 头开头；若扩展名是 RAW 已在上方返回
         return "tiff"
     return ""
 
@@ -199,6 +211,9 @@ def formats_equivalent_for_skip(true_fmt: str, target_fmt: str) -> bool:
     # mpo 永不与 jpg 等价
     if a == "mpo":
         return b == "mpo"
+    # RAW 永不与可写格式等价（禁止 copy 当成功 / 跳过重编码）
+    if is_raw_ext(a) or is_raw_ext(b):
+        return a == b and is_raw_ext(a)
     return a == b
 
 
@@ -243,9 +258,14 @@ def read_image_metadata(path: str | Path) -> dict[str, Any]:
         result["supported"] = False
         return result
 
+    # RAW：解码后无原容器元数据可写字段，标记为不支持面板回填
+    if is_raw_ext(true_fmt) or is_raw_ext(ext_fmt):
+        result["supported"] = False
+        result["true_format"] = true_fmt or ext_fmt
+        return result
+
     try:
-        img = Image.open(str(path))
-        img.load()
+        img = load_image(path)
     except Exception:
         result["supported"] = False
         return result
@@ -658,6 +678,12 @@ def write_image_metadata(
             out_fmt = "jpg"
             details["warning"] = "检测到 MPO，未开转换时按 JPEG 容器写回；建议启用格式转换"
             details["converted"] = True
+        if is_raw_ext(out_fmt) or is_raw_path(src):
+            # RAW 不可写回：强制为可写格式（默认 png）
+            out_fmt = coerce_writable_format("", src)
+            details["converted"] = True
+            details["output_format"] = out_fmt
+            details["format_note"] = f"源为 RAW，已输出为 {out_fmt.upper()}"
         if not out_fmt:
             details["skipped"] = True
             details["skip_reason"] = "无法识别图片格式"
@@ -694,12 +720,13 @@ def write_image_metadata(
             shutil.copy2(str(src), str(dst))
         return details
 
-    img = Image.open(str(src))
-    img.load()
+    img = load_image(src)
     # 多帧 MPO/GIF：取第一帧
     try:
         img.seek(0)
     except EOFError:
+        pass
+    except Exception:
         pass
 
     dst.parent.mkdir(parents=True, exist_ok=True)

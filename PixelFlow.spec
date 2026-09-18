@@ -89,6 +89,8 @@ a = Analysis(
         'core.processors.overlay_processor',
         'core.processors.metadata_processor',
         'core.processors.upscale_processor',
+        'core.image_io',
+        'rawpy',
         'core.runtime.env_manager',
         'core.matting.inference',
         # 高清放大（DLSS5）：dlss5 / dlss5_session 在 UpscaleProcessor.process 内延迟 import，

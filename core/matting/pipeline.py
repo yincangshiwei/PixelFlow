@@ -21,6 +21,8 @@ from typing import Any, Callable
 
 from PIL import Image
 
+from core.image_io import load_image
+
 
 @dataclass
 class _LoadedItem:
@@ -124,8 +126,7 @@ def run_matting_pipeline(
                         list_i=list_i, fpath=fpath, src=src, order=order
                     )
                     try:
-                        img = Image.open(fpath)
-                        img.load()
+                        img = load_image(fpath)
                         opts = dict(options)
                         opts["_image_index"] = order - 1
                         opts["_current_image_path"] = fpath

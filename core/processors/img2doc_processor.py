@@ -22,6 +22,7 @@ from pathlib import Path
 from PIL import Image, ImageOps, ImageFilter
 
 from core.base_processor import BaseProcessor, ProcessResult
+from core.image_io import load_image
 from core.image_processor import compress_to_target_size
 
 
@@ -84,21 +85,15 @@ def _excel_sort_key(value):
 
 # ── 统一比例排版辅助（纯函数，无 UI / 无导出器依赖）─────────────────────────
 
-EXIF_ORIENTATION_TAG = 274  # 0x0112
-
-
 def _image_size_exif(fpath) -> tuple[int, int]:
     """读取图片尺寸（含 EXIF 方向修正，手机竖拍不判错比例）；失败返回 (1, 1)。"""
     try:
-        with Image.open(fpath) as img:
+        img = load_image(fpath, apply_exif_transpose=True)
+        try:
             w, h = img.size
-            try:
-                orientation = img.getexif().get(EXIF_ORIENTATION_TAG, 1)
-            except Exception:
-                orientation = 1
-            if orientation in (5, 6, 7, 8):
-                w, h = h, w
             return int(w), int(h)
+        finally:
+            img.close()
     except Exception:
         return 1, 1
 
@@ -465,8 +460,8 @@ class Img2DocProcessor(BaseProcessor):
                 if progress_cb:
                     progress_cb(fi, len(all_files), f"统一比例: {Path(fpath).name}")
                 try:
-                    with Image.open(fpath) as img:
-                        img.load()
+                    img = load_image(fpath)
+                    try:
                         normalized = normalize_image_to_ratio(
                             img, target_ratio, fill_mode, fill_color
                         )
@@ -489,6 +484,8 @@ class Img2DocProcessor(BaseProcessor):
                         else:
                             buf = io.BytesIO()
                             normalized.save(buf, format="JPEG", quality=92)
+                    finally:
+                        img.close()
                     buf.seek(0)
                     _compressed_cache[fpath] = buf
                 except Exception as e:
@@ -502,7 +499,8 @@ class Img2DocProcessor(BaseProcessor):
                 if progress_cb:
                     progress_cb(fi, len(all_files), f"压缩中: {Path(fpath).name}")
                 try:
-                    with Image.open(fpath) as img:
+                    img = load_image(fpath)
+                    try:
                         if compress_fmt.upper() in ("JPEG", "JPG"):
                             img_conv = img.convert("RGB")
                             fmt_save = "JPEG"
@@ -514,6 +512,8 @@ class Img2DocProcessor(BaseProcessor):
                         img_conv.save(buf, format=fmt_save, quality=quality)
                         buf.seek(0)
                         _compressed_cache[fpath] = buf
+                    finally:
+                        img.close()
                 except Exception as e:
                     if progress_cb:
                         progress_cb(fi, len(all_files), f"压缩失败，使用原图: {Path(fpath).name} ({e})")
@@ -814,9 +814,7 @@ class Img2DocProcessor(BaseProcessor):
                 img = Image.open(self._cache_stream(fpath, compressed_cache))
                 img.load()  # 强制读入内存
                 return img
-            img = Image.open(fpath)
-            img.load()
-            return img
+            return load_image(fpath)
         except Exception:
             # 兜底：返回一个 1x1 的占位图
             return Image.new("RGB", (1, 1), (128, 128, 128))

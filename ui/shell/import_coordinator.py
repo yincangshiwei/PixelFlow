@@ -23,6 +23,7 @@ from services.common.importing import (
     ACTION_IMPORT_PATHS,
     ACTION_SAVE_IMAGE,
     ImportPlan,
+    image_dialog_filter,
     run_extract_jobs,
 )
 from ui.adapters.clipboard_adapter import (
@@ -87,9 +88,7 @@ class ImportCoordinator:
         desktop_path = _get_desktop_path()
         files, _ = QFileDialog.getOpenFileNames(
             self._window, "选择文件", desktop_path,
-            "支持的文件 (*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.tif *.gif *.docx *.pdf *.html *.htm);;"
-            "图片文件 (*.png *.jpg *.jpeg *.webp *.bmp *.tiff *.tif *.gif);;"
-            "从文档抽图 (*.docx *.pdf *.html *.htm *.xhtml)"
+            image_dialog_filter(),
         )
         if files:
             # 图片直接入库；HTML/DOCX/PDF 自动抽图

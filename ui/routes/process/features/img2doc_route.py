@@ -830,9 +830,11 @@ class Img2DocFeatureRoute(QWidget):
 
     def _browse_overlay_image(self):
         """浏览选择叠加图片"""
+        from services.common.importing import image_only_dialog_filter
+
         file_path, _ = QFileDialog.getOpenFileName(
             self, "选择图片文件", str(Path.home() / "Desktop"),
-            "Image Files (*.png *.jpg *.jpeg *.webp)"
+            image_only_dialog_filter(),
         )
         if file_path:
             self._image_file_input.setText(file_path)

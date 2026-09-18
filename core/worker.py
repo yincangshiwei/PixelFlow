@@ -5,10 +5,10 @@ PixelFlow 通用工作线程
 import traceback
 
 from PySide6.QtCore import QThread, Signal
-from PIL import Image
 from pathlib import Path
 
 from core.base_processor import BaseProcessor, ProcessResult
+from core.image_io import coerce_writable_format, is_raw_ext, is_raw_path, load_image
 from core.image_processor import compress_to_target_size
 
 
@@ -195,8 +195,16 @@ class ProcessWorker(QThread):
 
         # 输出格式由 GUI 线程在启动前快照，工作线程不得读取 QComboBox 等 UI 控件。
         fmt = str(self.options.get("_output_format", "") or "").lower()
-        # fmt 为空串时保留原始格式
-        ext_map = {"png": ".png", "jpg": ".jpg", "webp": ".webp", "bmp": ".bmp"}
+        # fmt 为空串时保留原始格式；RAW 源在 _save_processed_image 内强制为可写格式
+        ext_map = {
+            "png": ".png",
+            "jpg": ".jpg",
+            "jpeg": ".jpg",
+            "webp": ".webp",
+            "bmp": ".bmp",
+            "tif": ".tiff",
+            "tiff": ".tiff",
+        }
 
         # micro-batch：仅当处理器提供 preferred_matting_batch_size / process_many
         batch_size = 1
@@ -364,7 +372,7 @@ class ProcessWorker(QThread):
 
                 result = ProcessResult(input_path=fpath)
                 try:
-                    img = Image.open(fpath)
+                    img = load_image(fpath)
                     process_options = dict(self.options)
                     process_options["_image_index"] = order - 1
                     process_options["_current_image_path"] = fpath
@@ -407,8 +415,7 @@ class ProcessWorker(QThread):
                 order = int(self.file_index_map.get(fpath, list_i + 1) or (list_i + 1))
                 self.progress.emit(list_i + 1, total, src.name)
                 try:
-                    img = Image.open(fpath)
-                    img.load()
+                    img = load_image(fpath)
                     process_options = dict(self.options)
                     process_options["_image_index"] = order - 1
                     process_options["_current_image_path"] = fpath
@@ -527,12 +534,14 @@ class ProcessWorker(QThread):
         result: ProcessResult,
     ) -> None:
         """将 process 结果写入磁盘并填充 ProcessResult。"""
-        # 确定实际输出格式
-        actual_fmt = fmt if fmt else src.suffix.lstrip(".").lower()
-        # 规范化：jpeg → jpg
-        if actual_fmt == "jpeg":
-            actual_fmt = "jpg"
-        ext = ext_map.get(actual_fmt, src.suffix.lower() or ".png")
+        # 确定实际输出格式；RAW 不可写回，空格式或 RAW 后缀强制为可写格式（默认 png）
+        actual_fmt = coerce_writable_format(fmt, src)
+        ext = ext_map.get(actual_fmt, f".{actual_fmt}" if actual_fmt else ".png")
+        if is_raw_path(src) and (not fmt or is_raw_ext(fmt)):
+            details.setdefault(
+                "format_note",
+                f"源为 RAW（{src.suffix}），已输出为 {actual_fmt.upper()}",
+            )
 
         # 构建输出文件名（支持重命名）；按相对路径落到对应子目录
         file_out_dir = resolve_file_out_dir(out_dir, fpath, self.rel_path_map)
@@ -585,8 +594,10 @@ class ProcessWorker(QThread):
             save_img = img.convert("RGB") if img.mode in ("RGBA", "LA", "P") else img
             # BMP：Pillow 将 dpi 写入文件头 XPelsPerMeter / YPelsPerMeter
             save_img.save(str(out_path), "BMP", **_dpi_kw())
+        elif actual_fmt in ("tif", "tiff"):
+            img.save(str(out_path), "TIFF", **_dpi_kw())
         else:
-            # PNG：dpi 写入 pHYs 块，像素数据仍为 PNG 无损编码
+            # PNG：dpi 写入 pHYs 块；RAW 未指定格式时也落在此分支
             img.save(str(out_path), "PNG", **_dpi_kw())
 
         # 额外保留抠图透明图：在主输出最终 stem 后追加 _matted（含 _1/_2 情况）

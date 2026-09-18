@@ -11,6 +11,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 from core.base_processor import BaseProcessor
+from core.image_io import load_image
 from core.image_processor import hex_to_rgba
 
 
@@ -502,7 +503,7 @@ class OverlayProcessor(BaseProcessor):
                     overlay_w = elem_data['width']
                     overlay_h = elem_data['height']
 
-                    overlay_img = Image.open(overlay_path).convert("RGBA")
+                    overlay_img = load_image(overlay_path).convert("RGBA")
                     if elem_data.get('layout_mode', 'free') == 'anchor':
                         margin = elem_data.get('margin', 0)
                         available_w = max(1, img_width - 2 * margin)

@@ -333,6 +333,20 @@ class FileListRoute(QWidget):
         path = entry.path
         pixmap = QPixmap(path)
         if pixmap.isNull():
+            # Qt 不解 RAW 等格式：走统一解码
+            try:
+                from core.image_io import load_image_for_preview
+                from ui.routes.file_list.thumbnail_loader import _pil_to_qimage
+
+                pil = load_image_for_preview(path)
+                try:
+                    qimg = _pil_to_qimage(pil)
+                    pixmap = QPixmap.fromImage(qimg)
+                finally:
+                    pil.close()
+            except Exception:
+                pixmap = QPixmap()
+        if pixmap.isNull():
             self.preview_label.setText("无法加载预览")
             self.lbl_preview_info.setText("")
             self.current_changed.emit(path, None)

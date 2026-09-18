@@ -591,7 +591,8 @@ def process_single_image(input_path: str, output_path: str, options: ProcessOpti
     result = ProcessResult(input_path=input_path, output_path=output_path)
 
     try:
-        img = Image.open(input_path).convert("RGBA")
+        from core.image_io import load_image
+        img = load_image(input_path).convert("RGBA")
         result.original_size = img.size
 
         # 步骤1：裁透明边

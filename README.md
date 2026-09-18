@@ -428,6 +428,7 @@ AI 高清放大，首期接入 **NVIDIA DLSS 5 神经渲染 + DLSS 超分**。
 - **实时预览** — 点击文件列表即可预览原图及尺寸信息
 - **预设管理** — 按功能保存/加载/恢复参数预设，下拉选择即自动应用，支持从外部文件导入预设，启动自动加载默认预设
 - **多格式输出** — PNG、WebP、JPG
+- **相机 RAW** — 支持 CR2/CR3、NEF、ARW、DNG、RAF 等常见 RAW 导入与处理（需 rawpy）；不可写回 RAW，未指定格式时默认输出 PNG
 - **后台日志** — 独立 Tab 页占满区域显示完整日志，支持清空
 
 ---
@@ -461,6 +462,7 @@ PixelFlow/
 │   ├── base_processor.py               # 图片处理器基类（纯处理，无 UI）
 │   ├── base_file_processor.py          # 文件处理器基类（预留）
 │   ├── image_processor.py              # 底层图像处理函数（含二分法最优压缩算法）
+│   ├── image_io.py                     # 统一读图（Pillow + rawpy 解码相机 RAW）
 │   ├── metadata_utils.py               # 图片元数据读写（EXIF / PNG tEXt / 标记）
 │   ├── preset_manager.py               # 预设文件读写（JSON）
 │   ├── worker.py                       # 后台批量处理线程（支持单图和批量合并路由）
@@ -533,6 +535,7 @@ PixelFlow/
 - Python 3.12+（开发运行）；AI 抠图另需本机可调用的 CPython 3.10–3.12（64 位）
 - PySide6 < 6.9
 - Pillow >= 10.0
+- rawpy >= 0.21（相机 RAW 解码，依赖 LibRaw）
 - python-pptx >= 0.6（图片排版导出 PPT）
 - reportlab >= 4.0（图片排版导出 PDF）
 - python-docx >= 1.1（图片排版导出 Word）

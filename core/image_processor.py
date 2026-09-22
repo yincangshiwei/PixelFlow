@@ -3,6 +3,7 @@ PixelFlow 核心图像处理模块
 支持灵活的步骤组合：裁透明边 / 缩放 / 放置到画布
 """
 from PIL import Image, ImageFilter
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 import io
@@ -249,6 +250,57 @@ def _significant_run_span(
     return left, right
 
 
+def _has_substantial_edge_content(flags: np.ndarray, bridge_gap: int) -> bool:
+    """边缘是否有至少 3px 的连续可信内容；不对最长短段做回退。"""
+    runs = _iter_true_runs(_bridge_short_gaps(flags, bridge_gap))
+    return any(end - start + 1 >= 3 for start, end in runs)
+
+
+def _edge_connects_to_seeds(
+    content: np.ndarray, seeds: np.ndarray, side: str
+) -> bool:
+    """边缘内容能否通过 8 邻域内容像素连接到显著可信主体。"""
+    h, w = content.shape
+    if side == "left":
+        starts = zip(np.flatnonzero(content[:, 0]).tolist(), [0] * h)
+    elif side == "right":
+        starts = zip(np.flatnonzero(content[:, -1]).tolist(), [w - 1] * h)
+    elif side == "top":
+        starts = zip([0] * w, np.flatnonzero(content[0, :]).tolist())
+    elif side == "bottom":
+        starts = zip([h - 1] * w, np.flatnonzero(content[-1, :]).tolist())
+    else:
+        raise ValueError(f"未知边缘方向: {side}")
+
+    visited = np.zeros_like(content, dtype=bool)
+    queue = deque()
+    for y, x in starts:
+        if visited[y, x]:
+            continue
+        if seeds[y, x]:
+            return True
+        visited[y, x] = True
+        queue.append((y, x))
+
+    while queue:
+        y, x = queue.popleft()
+        for dy in (-1, 0, 1):
+            ny = y + dy
+            if ny < 0 or ny >= h:
+                continue
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                nx = x + dx
+                if nx < 0 or nx >= w or visited[ny, nx] or not content[ny, nx]:
+                    continue
+                if seeds[ny, nx]:
+                    return True
+                visited[ny, nx] = True
+                queue.append((ny, nx))
+    return False
+
+
 def trim_transparent(img: Image.Image, alpha_threshold: int = 0):
     """
     裁掉四周透明区域。
@@ -283,9 +335,9 @@ def trim_transparent(img: Image.Image, alpha_threshold: int = 0):
     left, right = col_run
     top, bottom = row_run
 
-    # 四条边必须独立判断：一侧真实主体贴边（例如顶部挂绳）不能阻止另一侧过滤
-    # Alpha 1~几十的抠图残留。可信投影仍通过 _significant_run_span 保留所有
-    # 显著连续段的并集，不退回只保留最长段的旧逻辑。
+    # 四条边独立判断。高 Alpha 只用于定位可信主体，不作为硬裁切阈值：边缘的
+    # 低 Alpha 像素若能以 8 邻域回接到显著可信主体，就视为毛发、毛线等延伸；
+    # 只有与主体断开的边缘组件才作为抠图残留过滤。
     if trusted_content.any():
         trusted_col_run = _significant_run_span(
             trusted_content.any(axis=0), bridge_gap=bridge
@@ -293,17 +345,38 @@ def trim_transparent(img: Image.Image, alpha_threshold: int = 0):
         trusted_row_run = _significant_run_span(
             trusted_content.any(axis=1), bridge_gap=bridge
         )
-        if trusted_col_run is not None:
+        if trusted_col_run is not None and trusted_row_run is not None:
             trusted_left, trusted_right = trusted_col_run
-            if bool(content[:, 0].any()) and not bool(trusted_content[:, 0].any()):
-                left = max(0, trusted_left - bridge)
-            if bool(content[:, -1].any()) and not bool(trusted_content[:, -1].any()):
-                right = min(w - 1, trusted_right + bridge)
-        if trusted_row_run is not None:
             trusted_top, trusted_bottom = trusted_row_run
-            if bool(content[0, :].any()) and not bool(trusted_content[0, :].any()):
+            seeds = trusted_content.copy()
+            seeds[:, :trusted_left] = False
+            seeds[:, trusted_right + 1:] = False
+            seeds[:trusted_top, :] = False
+            seeds[trusted_bottom + 1:, :] = False
+
+            # 连通判断采用很低的滞后阈值，不用 Alpha 64 硬裁：正常半透明毛发
+            # 可回接主体，而 Alpha 1~8 的缩放底噪不能伪造一条连接路径。
+            connective_content = alpha > max(thr, 8)
+            left_is_subject = _has_substantial_edge_content(
+                trusted_content[:, 0], bridge
+            ) or _edge_connects_to_seeds(connective_content, seeds, "left")
+            right_is_subject = _has_substantial_edge_content(
+                trusted_content[:, -1], bridge
+            ) or _edge_connects_to_seeds(connective_content, seeds, "right")
+            top_is_subject = _has_substantial_edge_content(
+                trusted_content[0, :], bridge
+            ) or _edge_connects_to_seeds(connective_content, seeds, "top")
+            bottom_is_subject = _has_substantial_edge_content(
+                trusted_content[-1, :], bridge
+            ) or _edge_connects_to_seeds(connective_content, seeds, "bottom")
+
+            if bool(content[:, 0].any()) and not left_is_subject:
+                left = max(0, trusted_left - bridge)
+            if bool(content[:, -1].any()) and not right_is_subject:
+                right = min(w - 1, trusted_right + bridge)
+            if bool(content[0, :].any()) and not top_is_subject:
                 top = max(0, trusted_top - bridge)
-            if bool(content[-1, :].any()) and not bool(trusted_content[-1, :].any()):
+            if bool(content[-1, :].any()) and not bottom_is_subject:
                 bottom = min(h - 1, trusted_bottom + bridge)
 
     # 在主体投影带内再收紧到真实像素（去掉投影带内局部全透明边）

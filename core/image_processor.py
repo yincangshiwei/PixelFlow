@@ -272,30 +272,39 @@ def trim_transparent(img: Image.Image, alpha_threshold: int = 0):
     # 短空隙桥接：约 0.15% 边长，最少 1px、最多 8px，避免主体 antialias 细缝拆段
     bridge = max(1, min(8, int(round(min(w, h) * 0.0015))))
 
-    projection_content = content
-    preserve_margin = 0
-    border_alpha = np.concatenate((alpha[0, :], alpha[-1, :], alpha[1:-1, 0], alpha[1:-1, -1]))
-    touches_border = bool((border_alpha > thr).any())
     confidence_thr = max(thr, 64)
     trusted_content = alpha > confidence_thr
-    # AI 遮罩缩放后可能让 Alpha 1~几十的底噪铺到整条边。只有边界没有可信内容时
-    # 才启用可信掩码，避免影响本来就应贴边的实体；可信掩码仍保留所有显著段。
-    if touches_border and not bool((border_alpha > confidence_thr).any()) and trusted_content.any():
-        projection_content = trusted_content
-        preserve_margin = bridge
 
-    col_run = _significant_run_span(projection_content.any(axis=0), bridge_gap=bridge)
-    row_run = _significant_run_span(projection_content.any(axis=1), bridge_gap=bridge)
+    col_run = _significant_run_span(content.any(axis=0), bridge_gap=bridge)
+    row_run = _significant_run_span(content.any(axis=1), bridge_gap=bridge)
     if col_run is None or row_run is None:
         raise ValueError("图片内容为空：整张图都是透明的")
 
     left, right = col_run
     top, bottom = row_run
-    if preserve_margin:
-        left = max(0, left - preserve_margin)
-        right = min(w - 1, right + preserve_margin)
-        top = max(0, top - preserve_margin)
-        bottom = min(h - 1, bottom + preserve_margin)
+
+    # 四条边必须独立判断：一侧真实主体贴边（例如顶部挂绳）不能阻止另一侧过滤
+    # Alpha 1~几十的抠图残留。可信投影仍通过 _significant_run_span 保留所有
+    # 显著连续段的并集，不退回只保留最长段的旧逻辑。
+    if trusted_content.any():
+        trusted_col_run = _significant_run_span(
+            trusted_content.any(axis=0), bridge_gap=bridge
+        )
+        trusted_row_run = _significant_run_span(
+            trusted_content.any(axis=1), bridge_gap=bridge
+        )
+        if trusted_col_run is not None:
+            trusted_left, trusted_right = trusted_col_run
+            if bool(content[:, 0].any()) and not bool(trusted_content[:, 0].any()):
+                left = max(0, trusted_left - bridge)
+            if bool(content[:, -1].any()) and not bool(trusted_content[:, -1].any()):
+                right = min(w - 1, trusted_right + bridge)
+        if trusted_row_run is not None:
+            trusted_top, trusted_bottom = trusted_row_run
+            if bool(content[0, :].any()) and not bool(trusted_content[0, :].any()):
+                top = max(0, trusted_top - bridge)
+            if bool(content[-1, :].any()) and not bool(trusted_content[-1, :].any()):
+                bottom = min(h - 1, trusted_bottom + bridge)
 
     # 在主体投影带内再收紧到真实像素（去掉投影带内局部全透明边）
     sub = content[top : bottom + 1, left : right + 1]
